@@ -1,0 +1,11 @@
+name: speak
+title: 发声
+when: 需要把一段文字读出来（回复转语音、念提示、语音条）时
+not_when: 只要文字，或需要自然拟人的音色（SAPI 很机械）时
+entry:
+  type: cmd
+  name: speak/start-server.cmd
+cost: 低
+readme: README.md
+version: 0.1.0
+scope: server

@@ -28,6 +28,8 @@ const IO_BASE = process.env.DSH_IO_URL || 'http://127.0.0.1:8765';
 const MEMORY_BASE = process.env.DSH_MEMORY_URL || 'http://127.0.0.1:8767';
 const SEPARATOR_BASE = process.env.DSH_SEPARATOR_URL || 'http://127.0.0.1:8768';
 const VIDEO_BASE = process.env.DSH_VIDEO_URL || 'http://127.0.0.1:8769';
+const SPEAK_BASE = process.env.DSH_SPEAK_URL || 'http://127.0.0.1:8770';
+const LISTEN_BASE = process.env.DSH_LISTEN_URL || 'http://127.0.0.1:8771';
 const ROOT = __dirname;
 const MAX_BODY = 1024 * 1024;
 
@@ -173,7 +175,8 @@ function bearer(req) {
 /** 面板自己的用户态闸门：没带 token 的请求不往 io/记忆服务转发。 */
 function protectedPath(pathname) {
   return pathname === '/api/input' || pathname === '/api/persona' ||
-    pathname.startsWith('/api/memory/') || pathname.startsWith('/api/video');
+    pathname.startsWith('/api/memory/') || pathname.startsWith('/api/video') ||
+    pathname === '/api/tts' || pathname === '/api/asr';
 }
 
 /** 服务间直连 POST（视频模块 / io）：不走 req 透传，因为要拿回结果再二次加工。 */
@@ -381,6 +384,47 @@ const server = http.createServer(async (req, res) => {
         ioOk: Boolean(io.data && io.data.ok),
         tokens: (io.data && io.data.tokens) || null,
       });
+    }
+
+    // 发声：把 wav 原样吐给浏览器，<audio> 直接用
+    if (req.method === 'POST' && url.pathname === '/api/tts') {
+      const rawTts = await readBody(req);
+      const target = new URL('/v1/speak', SPEAK_BASE);
+      const upstream = http.request(target, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'content-length': rawTts.length },
+        timeout: 120000,
+      }, (reply) => {
+        const ct = String(reply.headers['content-type'] || '');
+        if (!ct.startsWith('audio/')) {
+          const chunks = [];
+          reply.on('data', (c) => chunks.push(c));
+          reply.on('end', () => {
+            res.writeHead(reply.statusCode || 502, { 'content-type': 'application/json; charset=utf-8' });
+            res.end(Buffer.concat(chunks));
+          });
+          return;
+        }
+        res.writeHead(200, { 'content-type': ct, 'cache-control': 'no-store' });
+        reply.pipe(res);
+      });
+      upstream.on('timeout', () => upstream.destroy(new Error('speak timeout')));
+      upstream.on('error', (err) => {
+        if (!res.headersSent) sendJson(res, 502, { ok: false, error: `speak unreachable: ${err.message}` });
+      });
+      upstream.write(rawTts);
+      upstream.end();
+      return;
+    }
+
+    // 听力：浏览器录音（webm/wav base64）→ 文本
+    if (req.method === 'POST' && url.pathname === '/api/asr') {
+      const rawAsr = await readBody(req);
+      let payload = {};
+      try { payload = JSON.parse(rawAsr.toString('utf8')) || {}; } catch { }
+      const r = await postJson(LISTEN_BASE, '/v1/transcribe', payload, {}, 120000);
+      if (!r.data) return sendJson(res, 502, { ok: false, error: `listen module HTTP ${r.status}` });
+      return sendJson(res, r.status || 200, r.data);
     }
 
     if (req.method === 'GET' || req.method === 'HEAD') {

@@ -297,10 +297,127 @@ function usageNote(usage) {
   }
   return parts.length ? ' · ' + parts.join(' · ') : '';
 }
+// ---------------------------------------------------------------- 听力 ----
+
+const micBtn = document.getElementById('mic');
+let recorder = null;
+let recordChunks = [];
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const s = String(reader.result || '');
+      resolve(s.slice(s.indexOf(',') + 1));
+    };
+    reader.onerror = () => reject(new Error('读不到录音'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function startRecording() {
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    micBtn.title = '这个浏览器不支持录音';
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : '';
+    recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+    recordChunks = [];
+    recorder.ondataavailable = (e) => { if (e.data && e.data.size) recordChunks.push(e.data); };
+    recorder.onstop = async () => {
+      stream.getTracks().forEach((t) => t.stop());
+      micBtn.classList.remove('recording');
+      micBtn.textContent = '…';
+      const blob = new Blob(recordChunks, { type: recorder.mimeType || 'audio/webm' });
+      recorder = null;
+      try {
+        const audioBase64 = await blobToBase64(blob);
+        const r = await apiJson('/api/asr', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ audioBase64, mime: blob.type || 'audio/webm' }),
+        });
+        if (r && r.ok && r.text) {
+          inputEl.value = (inputEl.value ? inputEl.value + ' ' : '') + r.text;
+          autoGrow();
+          inputEl.focus();
+          micBtn.title = `识别用时 ${r.ms || '?'}ms`;
+        } else {
+          micBtn.title = '没听清：' + ((r && r.error) || '未知');
+        }
+      } catch (err) {
+        micBtn.title = '听写出错：' + (err && err.message || err);
+      } finally {
+        micBtn.textContent = '🎤';
+      }
+    };
+    recorder.start();
+    micBtn.classList.add('recording');
+    micBtn.textContent = '⏺';
+    micBtn.title = '正在录音，点一下结束';
+  } catch (err) {
+    micBtn.title = '拿不到麦克风：' + (err && err.message || err);
+  }
+}
+
+if (micBtn) {
+  micBtn.addEventListener('click', () => {
+    if (recorder && recorder.state === 'recording') {
+      recorder.stop();
+    } else {
+      startRecording();
+    }
+  });
+}
+
 function formatClock(ts) {
   if (!ts) return '';
   const d = new Date(ts);
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+let currentAudio = null;
+
+/** 把一段回复读出来：后端 SAPI 合成 wav，前端直接播。 */
+async function speakText(text, btn) {
+  if (!text) return;
+  if (currentAudio) {
+    try { currentAudio.pause(); } catch { }
+    currentAudio = null;
+  }
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    const res = await apiFetch('/api/tts', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const ct = res.headers.get('content-type') || '';
+    if (!ct.startsWith('audio/')) {
+      const detail = await res.text().catch(() => '');
+      throw new Error(detail.slice(0, 120) || '不是音频');
+    }
+    const url = URL.createObjectURL(await res.blob());
+    const audio = new Audio(url);
+    currentAudio = audio;
+    audio.onended = () => {
+      URL.revokeObjectURL(url);
+      btn.textContent = original;
+      btn.disabled = false;
+      if (currentAudio === audio) currentAudio = null;
+    };
+    await audio.play();
+    btn.textContent = '⏹';
+  } catch (err) {
+    btn.textContent = '🔇';
+    btn.title = '读不出来：' + (err && err.message || err);
+    setTimeout(() => { btn.textContent = original; btn.disabled = false; }, 1400);
+  }
 }
 
 function addMessage(role, text, meta) {
@@ -323,6 +440,20 @@ function addMessage(role, text, meta) {
   }
 
   wrap.appendChild(bubble);
+
+  // 每条回复都可以点「读出来」（本地 SAPI 合成，不花 API 钱）
+  if (role === 'assistant' && text) {
+    const tools = document.createElement('div');
+    tools.className = 'msg-tools';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'iconbtn';
+    btn.title = '读出来';
+    btn.textContent = '🔊';
+    btn.addEventListener('click', () => speakText(text, btn));
+    tools.appendChild(btn);
+    wrap.appendChild(tools);
+  }
 
   if (meta) {
     const metaEl = document.createElement('div');

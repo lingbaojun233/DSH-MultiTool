@@ -475,3 +475,15 @@ button.stat.active { border-color: var(--accent); background: #1b2130; }
 
 details#videoDetails { margin-top: 6px; }
 details#videoDetails summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+/* ------------------------------------------------------------- 发声 / 听力 -- */
+.msg-tools { display: flex; gap: 4px; margin-top: 3px; }
+.msg.user .msg-tools { justify-content: flex-end; }
+.iconbtn {
+  background: none; border: 1px solid var(--border); color: var(--muted);
+  border-radius: 6px; padding: 1px 6px; font-size: 12px; cursor: pointer; line-height: 1.5;
+}
+.iconbtn:hover { color: var(--text); border-color: var(--accent); }
+.iconbtn:disabled { opacity: .6; cursor: default; }
+.iconbtn.recording { color: var(--err); border-color: var(--err); }.iconbtn.mic { padding: 2px 9px; font-size: 13px; margin-right: auto; }
+.iconbtn.mic.recording { color: var(--err); border-color: var(--err); animation: pulse 1s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }

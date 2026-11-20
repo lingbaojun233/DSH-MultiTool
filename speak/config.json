@@ -1,0 +1,10 @@
+{
+  "port": 8770,
+  "provider": "windows",
+  "voice": "",
+  "rate": -1,
+  "maxChars": 300,
+  "gateway": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+  "qwenModel": "qwen-audio-3.0-tts-plus",
+  "requestTimeoutMs": 60000
+}
