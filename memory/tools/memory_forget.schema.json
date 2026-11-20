@@ -1,0 +1,14 @@
+{
+  "name": "memory_forget",
+  "description": "Soft-delete one memory (event:<id>). Unsearchable immediately; undo restores it. Every forget is audited.",
+  "parameters": {
+    "type": "object",
+    "required": ["id"],
+    "properties": {
+      "id": { "type": "string", "description": "event:123 or 123" },
+      "reason": { "type": "string" },
+      "undo": { "type": "boolean", "default": false },
+      "tombstone_id": { "type": "integer" }
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "memory_remember",
+  "description": "Persist one event. Evidence is mandatory: source+locator, e.g. chat:g123#m456. Chitchat is rejected on purpose.",
+  "parameters": {
+    "type": "object",
+    "required": ["content", "evidence"],
+    "properties": {
+      "content": { "type": "string" },
+      "evidence": { "type": "string", "description": "source:locator" },
+      "kind": { "enum": ["msg", "video", "action", "commitment"], "default": "msg" },
+      "speaker": { "type": "string" },
+      "salience": { "type": "integer", "minimum": 0, "maximum": 100 }
+    }
+  }
+}

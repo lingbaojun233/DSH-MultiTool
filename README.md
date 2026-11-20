@@ -63,7 +63,7 @@ DSH-MultiTool/
 | core | 已部署并验证 | dsh 0.1.1-rc.2 + Node v22.23.5 |
 | io | 已部署、开机自启（SYSTEM 计划任务） | CLI + HTTP 均通过 |
 | panel | 已部署、开机自启（SYSTEM 计划任务） | 本地经 SSH 隧道访问，端到端 3.5 s |
-| memory | 已部署、开机自启（SYSTEM 计划任务），P0 | 证据闸门 + 双预算召回，已实测 |
+| memory | 已部署、开机自启 + 每日 03:00 巩固，v0.2 | SQLite+FTS5，10 万条下 p95 0.7ms，验收 7/7 |
 
 服务器侧基础设施：OpenSSH Server（仅公钥登录）、WinRM（控制通道）、
 计划任务 `DSH-MultiTool IO`（开机拉起 `io\server.js`）。

@@ -2,28 +2,37 @@
 'use strict';
 
 /**
- * DSH-MultiTool :: memory module (P0)
+ * DSH-MultiTool :: memory 服务
  *
- * Cross-session memory with mandatory evidence, three layers, and a dual
- * (count + token) recall budget. P0 covers: evidence gate, append-only store,
- * inverted index, recall. Consolidation, conflicts and forget arrive later.
+ * 对外只暴露三个工具：
+ *   memory_remember  POST /v1/tools/memory_remember
+ *   memory_search    POST /v1/tools/memory_search
+ *   memory_forget    POST /v1/tools/memory_forget
+ * 另有内部运维接口：proactive / nightly / persona / undo / stats / health。
  *
- * Bound to loopback: 127.0.0.1:8767
+ * 监听 127.0.0.1:8767（回环，不对外）。
  */
 
 const http = require('node:http');
-const fs = require('node:fs');
 const path = require('node:path');
+const fs = require('node:fs');
 
-const gate = require('./lib/gate.js');
-const store = require('./lib/store.js');
-const indexer = require('./lib/indexer.js');
-const { recall, renderBlock } = require('./lib/recall.js');
+const { open } = require('./db/open.js');
+const { fail, toResponse, MemoryError } = require('./lib/errors.js');
+const { remember } = require('./lib/remember.js');
+const { search } = require('./lib/search.js');
+const { nightly, forget, undoForget } = require('./lib/maintenance.js');
+const { proactiveRecall, addToBlacklist } = require('./lib/proactive.js');
+const persona = require('./lib/persona.js');
 
 const HOST = process.env.DSH_MEMORY_HOST || '127.0.0.1';
 const PORT = Number(process.env.DSH_MEMORY_PORT || 8767);
 const MAX_BODY = 256 * 1024;
-const AUDIT_DIR = path.join(store.DATA_DIR, 'audits');
+const DATA_DIR = path.join(__dirname, '..', 'data', 'memory');
+const AUDIT_DIR = path.join(DATA_DIR, 'audits');
+
+const db = open();
+persona.initPersona(db);
 
 function log(message) {
   process.stdout.write(`[memory] ${new Date().toISOString()} ${message}\n`);
@@ -34,7 +43,7 @@ function audit(kind, payload) {
     fs.mkdirSync(AUDIT_DIR, { recursive: true });
     fs.appendFileSync(path.join(AUDIT_DIR, `${kind}.jsonl`), `${JSON.stringify(payload)}\n`, 'utf8');
   } catch (err) {
-    log(`audit write failed: ${err.message}`);
+    log(`audit failed: ${err.message}`);
   }
 }
 
@@ -55,7 +64,7 @@ function readBody(req) {
     req.on('data', (chunk) => {
       size += chunk.length;
       if (size > MAX_BODY) {
-        reject(new Error('request body too large'));
+        reject(new MemoryError('E_BAD_REQUEST', 'body too large', '单次请求不超过 256KB'));
         req.destroy();
         return;
       }
@@ -66,95 +75,145 @@ function readBody(req) {
   });
 }
 
-function parseJson(raw) {
+function parseBody(raw) {
   try {
     return JSON.parse(raw);
   } catch {
-    return null;
+    throw new MemoryError('E_BAD_REQUEST', 'body is not valid JSON', '请求体必须是 JSON 对象');
   }
 }
 
+const ROUTES = {
+  'POST /v1/tools/memory_remember': async (body) => {
+    if (!body || typeof body !== 'object') throw new MemoryError('E_BAD_REQUEST');
+    const result = remember(db, body);
+    audit('remember', { ts: new Date().toISOString(), stored: result.stored, reason: result.reason, eventId: result.eventId || null });
+
+    // 无证据是硬错误（约束 1），必须给结构化错误，而不是 ok:true + stored:false
+    if (!result.stored && result.reason === 'no_evidence') {
+      return {
+        status: 400,
+        payload: fail('E_NO_EVIDENCE', result.detail || '缺少证据定位', '每条记忆必须带 evidence: "source:locator"'),
+      };
+    }
+    return { status: result.stored ? 201 : 200, payload: { ok: true, ...result } };
+  },
+
+  'POST /v1/tools/memory_search': async (body) => {
+    const result = search(db, {
+      query: String((body && body.query) || ''),
+      context: (body && body.context) || {},
+      budget: (body && body.budget) || {},
+    });
+    audit('search', {
+      ts: new Date().toISOString(),
+      query: String((body && body.query) || ''),
+      ids: result.items.map((item) => item.id),
+      used: result.used,
+      reranked: result.reranked || false,
+    });
+    return { status: 200, payload: { ok: true, ...result } };
+  },
+
+  'POST /v1/tools/memory_forget': async (body) => {
+    // undo 只需要 tombstoneId，不要求 id/target —— 否则撤销路径永远 400。
+    if (body && body.undo) {
+      const tombstoneId = Number(body.tombstoneId || body.tombstone_id || body.id);
+      if (!Number.isFinite(tombstoneId) || tombstoneId <= 0) {
+        throw new MemoryError('E_BAD_REQUEST', 'tombstoneId is required when undo=true', '传 {undo:true, tombstoneId: 3}');
+      }
+      const undone = undoForget(db, tombstoneId);
+      audit('forget', { ts: new Date().toISOString(), undo: true, tombstoneId });
+      return { status: 200, payload: { ok: true, ...undone } };
+    }
+
+    const target = body && (body.id || body.target);
+    if (!target) throw new MemoryError('E_BAD_REQUEST', 'id is required', '传 "event:123" 或 123');
+    const result = forget(db, target, body.reason || 'user_request');
+    audit('forget', { ts: new Date().toISOString(), target: String(target), tombstoneId: result.tombstoneId });
+    return { status: 200, payload: { ok: true, ...result } };
+  },
+
+  'POST /v1/proactive': async (body) => {
+    const result = proactiveRecall(db, {
+      turn: Number((body && body.turn) || 0),
+      sessionId: (body && body.sessionId) || 'default',
+      cues: (body && body.cues) || {},
+    });
+    if (body && body.blacklist) addToBlacklist(body.blacklist);
+    return { status: 200, payload: { ok: true, ...result } };
+  },
+
+  'POST /v1/nightly': async (body) => {
+    const dryRun = Boolean(body && body.dryRun);
+    const maintenance = nightly(db, { dryRun });
+    const personaDiff = persona.consolidate(db, { dryRun });
+    audit('nightly', { ts: new Date().toISOString(), dryRun, maintenance, persona: { changed: Boolean(personaDiff && personaDiff.changed) } });
+    return { status: 200, payload: { ok: true, maintenance, persona: personaDiff } };
+  },
+
+  'GET /v1/persona': async () => {
+    const current = persona.getPersona(db);
+    return { status: 200, payload: { ok: true, ...current, block: persona.render(db) } };
+  },
+};
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || HOST}`);
+  const key = `${req.method} ${url.pathname}`;
 
   try {
-    if (req.method === 'GET' && url.pathname === '/v1/health') {
-      return sendJson(res, 200, { ok: true, index: indexer.snapshot(), stats: store.stats() });
+    if (key === 'GET /v1/health') {
+      const counts = {
+        events: db.prepare('SELECT COUNT(*) c FROM events WHERE deleted = 0').get().c,
+        facts: db.prepare('SELECT COUNT(*) c FROM facts WHERE deleted = 0').get().c,
+        entities: db.prepare('SELECT COUNT(*) c FROM entities').get().c,
+        tombstones: db.prepare('SELECT COUNT(*) c FROM tombstones').get().c,
+      };
+      return sendJson(res, 200, { ok: true, counts, version: process.version });
     }
 
-    if (req.method === 'GET' && url.pathname === '/v1/stats') {
-      return sendJson(res, 200, { ok: true, ...store.stats(), index: indexer.snapshot() });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/v1/events') {
-      const input = parseJson(await readBody(req));
-      if (!input) return sendJson(res, 400, { ok: false, errors: ['body is not valid JSON'] });
-
-      const verdict = gate.validateEvent(input);
-      if (!verdict.ok) {
-        store.appendRejected({ ts: new Date().toISOString(), errors: verdict.errors, input });
-        audit('write', { ts: new Date().toISOString(), ok: false, errors: verdict.errors, evidence: input.evidence || null });
-        log(`rejected: ${verdict.errors.join('; ')}`);
-        return sendJson(res, 400, { ok: false, rejected: true, errors: verdict.errors });
-      }
-
-      const written = store.appendEvent(verdict.event);
-      indexer.add(verdict.event);
-      audit('write', {
-        ts: new Date().toISOString(),
+    if (key === 'GET /v1/stats') {
+      return sendJson(res, 200, {
         ok: true,
-        id: verdict.event.id,
-        evidence: verdict.event.evidence,
-        bytes: written.bytes,
+        dataDir: DATA_DIR,
+        counts: {
+          events: db.prepare('SELECT COUNT(*) c FROM events WHERE deleted = 0').get().c,
+          deletedEvents: db.prepare('SELECT COUNT(*) c FROM events WHERE deleted = 1').get().c,
+          facts: db.prepare('SELECT COUNT(*) c FROM facts WHERE deleted = 0').get().c,
+          conflicts: db.prepare("SELECT COUNT(*) c FROM facts WHERE status = 'conflict'").get().c,
+          entities: db.prepare('SELECT COUNT(*) c FROM entities').get().c,
+        },
       });
-      log(`stored ${verdict.event.id} (${verdict.event.evidence.source}:${verdict.event.evidence.locator})`);
-      return sendJson(res, 201, { ok: true, id: verdict.event.id, storedAt: written.file, bytes: written.bytes });
     }
 
-    if (req.method === 'GET' && url.pathname === '/v1/events') {
-      const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit') || 50)));
-      const events = store.readAllEvents().slice(-limit);
-      return sendJson(res, 200, { ok: true, count: events.length, events });
-    }
+    const handler = ROUTES[key];
+    if (!handler) return sendJson(res, 404, fail('E_NOT_FOUND', `no route: ${key}`));
 
-    if (req.method === 'POST' && url.pathname === '/v1/recall') {
-      const body = parseJson(await readBody(req)) || {};
-      const result = recall(String(body.query || ''), body.budget || {});
-      const payload = { ok: true, ...result };
-      if (body.render) payload.block = renderBlock(result);
-      audit('recall', {
-        ts: new Date().toISOString(),
-        query: body.query || '',
-        items: result.items.map((item) => item.id),
-        used: result.used,
-        truncated: result.truncated,
-        sessionId: body.sessionId || null,
-      });
-      log(`recall "${String(body.query || '').slice(0, 40)}" -> ${result.used.count} item(s), ${result.used.tokens} token(s)`);
-      return sendJson(res, 200, payload);
-    }
-
-    if (req.method === 'POST' && url.pathname === '/v1/reindex') {
-      indexer.rebuild();
-      return sendJson(res, 200, { ok: true, index: indexer.snapshot() });
-    }
-
-    return sendJson(res, 404, { ok: false, error: 'not found' });
+    const body = req.method === 'POST' ? parseBody(await readBody(req)) : {};
+    const { status, payload } = await handler(body);
+    return sendJson(res, status, payload);
   } catch (err) {
-    log(`error: ${err.message}`);
-    return sendJson(res, 500, { ok: false, error: err.message });
+    const payload = toResponse(err);
+    log(`error ${key}: ${payload.code} ${payload.message}`);
+    return sendJson(res, payload.code === 'E_BAD_REQUEST' ? 400 : 500, payload);
   }
 });
 
-store.ensureDirs();
-indexer.rebuild();
 server.listen(PORT, HOST, () => {
-  log(`listening on http://${HOST}:${PORT}  data=${store.DATA_DIR}  ${indexer.snapshot().events} event(s) indexed`);
+  log(`listening on http://${HOST}:${PORT}  db=${require('./db/open.js').DB_FILE}`);
 });
 
 function shutdown(signal) {
   log(`shutting down (${signal})`);
-  server.close(() => process.exit(0));
+  server.close(() => {
+    try {
+      db.close();
+    } catch {
+      /* ignore */
+    }
+    process.exit(0);
+  });
 }
 
 process.on('SIGINT', () => shutdown('SIGINT'));
