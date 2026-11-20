@@ -122,6 +122,22 @@ try {
     }
 
     case 'persona': {
+      // persona install <file>：显式更换宪法（管理操作，写 changelog，可回滚）
+      if (positional[0] === 'install') {
+        const file = positional[1] || flags.file;
+        if (!file) {
+          print({ ok: false, code: 'E_USAGE', message: '用法：persona install <file>' }, true);
+          process.exitCode = 2;
+          break;
+        }
+        const text = fs.readFileSync(path.resolve(file), 'utf8').replace(/^\uFEFF/, '');
+        const result = persona.installConstitution(db, text, {
+          reason: flags.reason || 'constitution_install',
+          resetTraits: Boolean(flags['reset-traits']),
+        });
+        print(result, asJson);
+        break;
+      }
       print(asJson ? persona.getPersona(db) : persona.render(db), asJson);
       break;
     }

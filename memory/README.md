@@ -94,10 +94,11 @@ score = relevance × (0.5 + salience/200) × exp(-ageDays/30) × confidence × n
 
 ## 人格（persona）
 
-- 宪法不可变：任何自动写入都被拒绝。
-- traits 五项 0-100：单次 ±3、每日 ≤2 次、每周向 50 回归 1。
+- 宪法正文的唯一来源是 [`persona/constitution.md`](persona/constitution.md)（由「大肥鱼人设卡 · 私聊版」压缩而来，980 token）。
+- 宪法不可变：任何自动写入都被拒绝；只有 `node cli.js persona install persona/constitution.md [--reset-traits]`
+  能替换，且会写 changelog、版本 +1、可回滚。
+- traits 五项 0-100，初始值与每周回归目标来自 `DEFAULT_TRAITS`（人设卡基线：65/88/55/80/60）。
 - 自传 ≤15 条，每条必须挂真实事件 id；不合规条目被丢弃并记录。
-- 每晚生成最小 diff，经速率（≤3 条/夜）与证据校验后才落库；写 changelog，可回滚。
 - `render()` 输出 ≤1500 token 的常驻块，**同输入逐字节一致**（利于前缀缓存）。
 
 ## 夜间维护与遗忘
