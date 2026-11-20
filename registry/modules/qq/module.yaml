@@ -1,0 +1,11 @@
+name: qq
+title: QQ 桌面代读代发
+when: 需要看 QQ 聊天内容、替用户拟一句回复、或在 QQ 里把拟好的话发出去时
+not_when: 需要无人值守群发、或不在解锁的 Windows 桌面会话里时
+entry:
+  type: cmd
+  name: ../qq-tool/qq.cmd
+cost: 中
+readme: README.md
+version: 0.1.0
+scope: local
