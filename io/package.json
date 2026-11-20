@@ -1,0 +1,13 @@
+{
+  "name": "@dsh-multitool/io",
+  "version": "0.1.0",
+  "private": true,
+  "description": "IO module: feed tasks into the DSH core and read the answers back",
+  "main": "io.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

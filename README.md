@@ -2,35 +2,66 @@
 
 以 **DeepSeek Harness（DSH）** 为核心的 AI 多功能工具集。
 
-> 状态：早期骨架阶段。当前仓库只包含目录约定与开发规则，功能随迭代补充。
+## 架构
 
-## 定位
+一个核心 + 多个模块。核心与每个模块在程序文件夹下**各占一个目录**：
 
-把日常高频需求（文本处理、文件批处理、资料整理、自动化脚本、Office/文档生成等）收敛到一个
-DSH 驱动的统一入口，用自然语言调用，而不是散落一堆一次性脚本。
+```text
+程序文件夹（服务器上 C:\Apps\DSH-MultiTool\）
+├── core\     核心 = DSH 本体：便携 Node、@deepseek-ai/dsh、headless profile、DSH_HOME
+└── io\       IO 模块：向核心喂输入、从核心取输出的唯一通道
+```
+
+模块不直接调用模型，只通过 IO 模块与核心交互；核心的模型、工具、安全默认值都来自 DSH 本体，
+模块不重复实现。
+
+## 数据流
+
+```text
+调用方 ──(HTTP POST /v1/input 或 CLI send)──> io 模块
+                                                │ 以位置参数传入任务
+                                                ▼
+                                        dsh --profile headless "<task>"
+                                                │ 模型推理 + 工具执行
+                                                ▼
+                                        stdout = 最终答案
+                                                │
+调用方 <──(JSON {ok, answer, exitCode, ms})──────┘
+```
 
 ## 仓库结构
 
 ```text
 DSH-MultiTool/
-├── README.md          # 本文件
-├── .gitignore         # 忽略规则（含密钥类文件，双保险）
-├── docs/              # 设计文档、需求记录
-└── src/               # 源码
+├── core/
+│   ├── bootstrap.ps1            在 Windows 上安装/修复核心（幂等）
+│   ├── start-core.ps1           用 WMI 后台拉起安装（脱离 WinRM 管道）
+│   ├── start-bootstrap.cmd      同上，cmd 入口
+│   └── profile/headless/        headless profile 模板
+├── io/
+│   ├── io.js                    CLI + 库：调用核心并取回答案
+│   ├── server.js                HTTP 接口（默认 127.0.0.1:8765）
+│   └── smoke-test.ps1           端到端冒烟测试
+└── docs/
 ```
 
-## 开发约定
+## 部署状态
 
-1. **本仓库只放开发内容**：源码、文档、无敏感值的配置模板。
-2. **敏感信息不进仓库**：Token、API Key、私钥统一放在仓库之外的 `../secrets/`，
-   代码里只通过环境变量读取，禁止硬编码。
-3. **提交信息**使用 Conventional Commits：`feat:` / `fix:` / `docs:` / `chore:` / `refactor:`。
-4. **分支**：`main` 保持可用；新功能走 `feat/<主题>` 分支，合入前自查。
+| 组件 | 状态 | 版本 |
+| --- | --- | --- |
+| core | 已部署并验证 | dsh 0.1.1-rc.2 + Node v22.23.5 |
+| io | 已部署并验证 | CLI + HTTP 均通过 |
 
-## 路线图
+验证记录（服务器实测）：`io send` → 3.4 s 返回；HTTP `/v1/input` → 3.2 s 返回；中文任务往返正常。
 
-- [ ] 需求梳理与功能拆解（哪些功能值得做、优先级）
-- [ ] 技术选型：DSH 插件 / 独立 CLI / MCP 工具 / 本地 Web 面板
-- [ ] 最小可用原型（1～2 个高价值功能跑通）
-- [ ] 配置与密钥管理方案落地
-- [ ] 打包与分发方式
+## 关键约束（0.1.1-rc.2 实测）
+
+- `dsh --profile headless "<task>"`：**任务只能作为位置参数**。
+- 不支持 `-`（stdin 标记）、`--json`、`--session-id` —— 文档里这些是更新版本的能力；
+  传 `-` 会被当成任务文本原样回复。
+- 凭据读取顺序：启动环境变量 → 当前目录 `.env` → `$DSH_HOME/.env`；headless 不读图形界面凭据库。
+
+## 安全
+
+- 凭据、Token 一律不进本仓库；服务器上的 Key 放在 `core\home\.env`（已在仓库外）。
+- 详见 `../secrets/README.md`。
