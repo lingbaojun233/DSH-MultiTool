@@ -64,3 +64,32 @@ powershell -NoProfile -File io\smoke-test.ps1
 - 不支持 `--json` / `--session-id`，因此没有事件流与会话续接；
   当前 `parseStream()` 仍兼容 NDJSON，升级核心后自动生效。
 - 单次调用一个任务，进程退出；多轮会话需要等核心升级或自行维护上下文。
+
+## 开机自启（服务器上已配置）
+
+`server.js` 以计划任务方式常驻：
+
+| 项 | 值 |
+| --- | --- |
+| 任务名 | `DSH-MultiTool IO` |
+| 触发器 | 开机（AtStartup） |
+| 运行身份 | `SYSTEM`（无需登录、无需密码） |
+| 入口 | `start-server.cmd` |
+| 日志 | `io\service.log`（追加写） |
+| 失败策略 | 每 1 分钟重试，最多 3 次；不设运行时长上限 |
+
+运维命令（管理员）：
+
+```powershell
+Start-ScheduledTask   -TaskName 'DSH-MultiTool IO'
+Stop-ScheduledTask    -TaskName 'DSH-MultiTool IO'
+Get-ScheduledTaskInfo -TaskName 'DSH-MultiTool IO'   # LastTaskResult 267009 = 正在运行
+```
+
+注意：任务的工作目录是 `io\`，所以核心进程的 cwd 就是这里；日志长期追加，需要时手工清理。
+
+## 安全
+
+- 服务器 SSH 已改为**仅公钥登录**：`PasswordAuthentication no` + `KbdInteractiveAuthentication no`。
+- HTTP 接口默认只监听 `127.0.0.1`；如果需要对外开放，先设 `DSH_IO_TOKEN`，再改 `DSH_IO_HOST`。
+

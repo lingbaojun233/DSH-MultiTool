@@ -50,7 +50,10 @@ DSH-MultiTool/
 | 组件 | 状态 | 版本 |
 | --- | --- | --- |
 | core | 已部署并验证 | dsh 0.1.1-rc.2 + Node v22.23.5 |
-| io | 已部署并验证 | CLI + HTTP 均通过 |
+| io | 已部署、开机自启（SYSTEM 计划任务） | CLI + HTTP 均通过 |
+
+服务器侧基础设施：OpenSSH Server（仅公钥登录）、WinRM（控制通道）、
+计划任务 `DSH-MultiTool IO`（开机拉起 `io\server.js`）。
 
 验证记录（服务器实测）：`io send` → 3.4 s 返回；HTTP `/v1/input` → 3.2 s 返回；中文任务往返正常。
 
