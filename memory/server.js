@@ -187,6 +187,29 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // 审计查询：面板用它在每轮结束后统计"这一轮用了几条记忆、写入了几条事件"
+    if (key === 'GET /v1/audits') {
+      const kind = (url.searchParams.get('kind') || 'search').replace(/[^a-z]/g, '');
+      const since = url.searchParams.get('since') || '';
+      const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit') || 100)));
+      const file = path.join(AUDIT_DIR, `${kind}.jsonl`);
+      let items = [];
+      try {
+        const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+        items = lines.slice(-limit).map((line) => {
+          try {
+            return JSON.parse(line);
+          } catch {
+            return null;
+          }
+        }).filter(Boolean);
+      } catch {
+        items = [];
+      }
+      if (since) items = items.filter((item) => String(item.ts || '') >= since);
+      return sendJson(res, 200, { ok: true, kind, since, count: items.length, items });
+    }
+
     const handler = ROUTES[key];
     if (!handler) return sendJson(res, 404, fail('E_NOT_FOUND', `no route: ${key}`));
 

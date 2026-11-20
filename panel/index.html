@@ -14,6 +14,7 @@
       <span class="muted">IO 面板</span>
     </div>
     <div class="topbar-right">
+      <button id="mem" class="ghost" title="查看记忆与人格">记忆</button>
       <button id="clear" class="ghost" title="清空当前对话">清空</button>
       <div id="status" class="status offline">
         <span class="dot"></span>
@@ -21,6 +22,28 @@
       </div>
     </div>
   </header>
+
+  <aside id="drawer" class="drawer hidden">
+    <div class="drawer-head">
+      <span>记忆与人格</span>
+      <button id="drawerClose" class="ghost">关闭</button>
+    </div>
+    <div class="drawer-body">
+      <section class="card">
+        <h3>人格 <span id="personaVersion" class="muted"></span></h3>
+        <div id="personaTraits" class="traits"></div>
+        <pre id="personaBlock" class="block"></pre>
+      </section>
+      <section class="card">
+        <h3>记忆库</h3>
+        <div id="memStats" class="stats"></div>
+      </section>
+      <section class="card">
+        <h3>最近事件</h3>
+        <ul id="memEvents" class="events"></ul>
+      </section>
+    </div>
+  </aside>
 
   <main id="log" class="log" aria-live="polite">
     <div class="empty" id="empty">

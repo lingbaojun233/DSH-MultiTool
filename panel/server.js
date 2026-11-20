@@ -24,6 +24,7 @@ const path = require('node:path');
 const HOST = process.env.DSH_PANEL_HOST || '127.0.0.1';
 const PORT = Number(process.env.DSH_PANEL_PORT || 8766);
 const IO_BASE = process.env.DSH_IO_URL || 'http://127.0.0.1:8765';
+const MEMORY_BASE = process.env.DSH_MEMORY_URL || 'http://127.0.0.1:8767';
 const ROOT = __dirname;
 const MAX_BODY = 1024 * 1024;
 
@@ -159,8 +160,8 @@ function readBody(req) {
   });
 }
 
-function proxy(req, res, ioPath, body, onDone) {
-  const target = new URL(ioPath, IO_BASE);
+function proxy(req, res, ioPath, body, onDone, base) {
+  const target = new URL(ioPath, base || IO_BASE);
   const headers = { 'content-type': req.headers['content-type'] || 'application/json' };
   if (req.headers.authorization) headers.authorization = req.headers.authorization;
 
@@ -202,6 +203,15 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || HOST}`);
 
   try {
+    // 面板的记忆/人格视图：透传到记忆服务，浏览器只走这一个口
+    if (req.method === 'GET' && url.pathname === '/api/persona') {
+      return proxy(req, res, '/v1/persona', null, null, MEMORY_BASE);
+    }
+    if (req.method === 'GET' && url.pathname.startsWith('/api/memory/')) {
+      const rest = url.pathname.slice('/api/memory'.length);
+      return proxy(req, res, '/v1' + rest + url.search, null, null, MEMORY_BASE);
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/health') {
       return proxy(req, res, '/v1/health');
     }
@@ -235,7 +245,7 @@ const server = http.createServer(async (req, res) => {
           /* not json */
         }
         if (data && data.ok) {
-          appendHistory({ role: 'assistant', text: data.answer || '', ms: data.ms, ts: Date.now() });
+          appendHistory({ role: 'assistant', text: data.answer || '', ms: data.ms, usage: data.usage || null, ts: Date.now() });
         } else {
           const reason = (data && (data.error || data.code)) || `HTTP ${status}`;
           appendHistory({ role: 'error', text: String(reason), ts: Date.now() });

@@ -75,6 +75,53 @@ async function postJson(url, body, timeoutMs = 8000) {
   }
 }
 
+/** 记忆库快照（只读）；服务不可用时返回 null。 */
+async function memoryStats() {
+  try {
+    const res = await fetch(`${MEMORY_URL}/v1/stats`, { signal: AbortSignal.timeout(3000) });
+    const data = await res.json();
+    return data && data.ok ? data.counts : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 本轮（since 之后）模型自己触发的检索审计。 */
+async function memoryAuditsSince(since) {
+  try {
+    const res = await fetch(
+      `${MEMORY_URL}/v1/audits?kind=search&since=${encodeURIComponent(since)}&limit=200`,
+      { signal: AbortSignal.timeout(3000) },
+    );
+    const data = await res.json();
+    return data && data.ok ? data.items || [] : [];
+  } catch {
+    return [];
+  }
+}
+
+/** 汇总一轮的用量：用了多少条记忆、写了什么。 */
+function buildUsage(before, after, audits) {
+  const usedIds = new Set();
+  let usedItems = 0;
+  for (const audit of audits) {
+    usedItems += Number(audit && audit.used && audit.used.count) || 0;
+    for (const id of (audit && audit.ids) || []) usedIds.add(id);
+  }
+  const delta = before && after
+    ? {
+      events: (after.events || 0) - (before.events || 0),
+      facts: (after.facts || 0) - (before.facts || 0),
+      entities: (after.entities || 0) - (before.entities || 0),
+      conflicts: (after.conflicts || 0) - (before.conflicts || 0),
+    }
+    : null;
+  return {
+    memory: { used: usedItems, ids: [...usedIds].slice(0, 20), searches: audits.length },
+    delta,
+  };
+}
+
 /**
  * 人格常驻块：这是"按人格要求回答"的唯一依据。
  * 60 秒缓存——人格变更低频，但也不能永远拿到陈旧版本。
@@ -245,8 +292,10 @@ async function run(task, options = {}) {
     history: options.history,
     task,
   });
-
   const timeoutMs = Number(options.timeoutMs || process.env.DSH_IO_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
+  // 本轮起点 + 记忆库基线：结束时用差值算出"用了什么、写了什么"
+  const turnStartedAt = new Date().toISOString();
+  const beforeStats = await memoryStats();
   const args = [p.bin, '--profile', 'headless', promptText];
   const env = Object.assign({}, process.env, { DSH_HOME: p.home });
 
@@ -321,10 +370,19 @@ async function run(task, options = {}) {
     }
   });
 
-  // 落事件：不阻塞返回，失败也不影响对话
-  setImmediate(() => {
-    recordTurn(task, result.answer, options).catch(() => {});
-  });
+  // 落事件后再统计增量，保证 usage 里能看到这一轮写了什么（多花约 15ms）
+  try {
+    await recordTurn(task, result.answer, options);
+  } catch {
+    /* 记忆不可用不影响对话 */
+  }
+
+  try {
+    const [afterStats, audits] = await Promise.all([memoryStats(), memoryAuditsSince(turnStartedAt)]);
+    result.usage = buildUsage(beforeStats, afterStats, audits);
+  } catch {
+    /* 统计失败不影响对话 */
+  }
 
   return result;
 }

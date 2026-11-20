@@ -7,6 +7,9 @@ const sendBtn = document.getElementById('send');
 const clearBtn = document.getElementById('clear');
 const statusEl = document.getElementById('status');
 const statusText = document.getElementById('statusText');
+const memBtn = document.getElementById('mem');
+const drawer = document.getElementById('drawer');
+const drawerClose = document.getElementById('drawerClose');
 
 const hasMarkdown = typeof window.marked !== 'undefined' && typeof window.DOMPurify !== 'undefined';
 
@@ -58,6 +61,22 @@ function renderMarkdown(text) {
   }
 }
 
+/** 把 io 返回的 usage 变成一句人话：用了多少记忆、写了什么。 */
+/** 把 io 返回的 usage 变成一句人话：用了多少记忆、写了什么。 */
+function usageNote(usage) {
+  if (!usage) return '';
+  const parts = [];
+  const used = usage.memory && usage.memory.used;
+  if (used) parts.push('记忆 ' + used + ' 条');
+  const d = usage.delta;
+  if (d) {
+    const bits = [];
+    if (d.events) bits.push('事件 +' + d.events);
+    if (d.facts) bits.push('事实 +' + d.facts);
+    if (bits.length) parts.push(bits.join(' '));
+  }
+  return parts.length ? ' · ' + parts.join(' · ') : '';
+}
 function formatClock(ts) {
   if (!ts) return '';
   const d = new Date(ts);
@@ -125,7 +144,7 @@ async function loadHistory() {
     for (const m of messages) {
       if (m.role === 'assistant') {
         const meta = typeof m.ms === 'number' ? `${(m.ms / 1000).toFixed(1)} 秒 · ${formatClock(m.ts)}` : formatClock(m.ts);
-        addMessage('assistant', m.text || '', meta);
+        addMessage('assistant', m.text || '', meta + usageNote(m.usage));
       } else if (m.role === 'user') {
         addMessage('user', m.text || '', formatClock(m.ts));
       } else {
@@ -186,7 +205,7 @@ async function send() {
       const ms = typeof data.ms === 'number' ? data.ms : Math.round(performance.now() - started);
       recentTurns.push({ role: 'assistant', text: data.answer || '' });
       if (recentTurns.length > 12) recentTurns.splice(0, recentTurns.length - 12);
-      addMessage('assistant', data.answer || '（空答案）', `${(ms / 1000).toFixed(1)} 秒 · ${formatClock(Date.now())}`);
+      addMessage('assistant', data.answer || '（空答案）', `${(ms / 1000).toFixed(1)} 秒${usageNote(data.usage)} · ${formatClock(Date.now())}`);
     } else {
       const detail = data.exitCode != null ? `exit=${data.exitCode}` : '';
       addMessage('error', data.error || data.code || '请求失败', detail);
@@ -228,6 +247,63 @@ inputEl.addEventListener('keydown', (event) => {
   }
 });
 
+function escapeHtml(value) {
+  const div = document.createElement('div');
+  div.textContent = value == null ? '' : String(value);
+  return div.innerHTML;
+}
+
+/** 抽屉：人格 + 记忆库统计 + 最近事件。打开时现拉，不常驻轮询。 */
+async function loadDrawer() {
+  try {
+    const p = await (await fetch('/api/persona', { cache: 'no-store' })).json();
+    if (p && p.ok) {
+      document.getElementById('personaVersion').textContent = 'v' + p.version;
+      const traits = p.traits || {};
+      document.getElementById('personaTraits').innerHTML = Object.keys(traits)
+        .map((k) => '<span class="trait">' + k + ' ' + traits[k] + '</span>')
+        .join('');
+      document.getElementById('personaBlock').textContent = p.block || '';
+    }
+  } catch (err) {
+    /* 记忆服务可能没起 */
+  }
+
+  try {
+    const s = await (await fetch('/api/memory/stats', { cache: 'no-store' })).json();
+    if (s && s.ok) {
+      const c = s.counts || {};
+      const rows = [
+        ['事件', c.events], ['事实', c.facts], ['冲突', c.conflicts],
+        ['实体', c.entities], ['已删', c.deletedEvents],
+      ];
+      document.getElementById('memStats').innerHTML = rows
+        .map(([k, v]) => '<div class="stat"><b>' + (v == null ? 0 : v) + '</b><span>' + k + '</span></div>')
+        .join('');
+    }
+  } catch (err) {
+    /* 忽略 */
+  }
+
+  try {
+    const e = await (await fetch('/api/memory/events?limit=20', { cache: 'no-store' })).json();
+    if (e && e.ok) {
+      const list = (e.events || []).slice().reverse();
+      document.getElementById('memEvents').innerHTML = list
+        .map((ev) => '<li><div>' + escapeHtml(ev.content) + '</div><div class="ev-meta">'
+          + escapeHtml(ev.actor) + ' · ' + escapeHtml(ev.ts) + ' · ' + escapeHtml(ev.evidence) + '</div></li>')
+        .join('') || '<li class="ev-meta">（暂无事件）</li>';
+    }
+  } catch (err) {
+    /* 忽略 */
+  }
+}
+
+memBtn.addEventListener('click', () => {
+  drawer.classList.remove('hidden');
+  loadDrawer();
+});
+drawerClose.addEventListener('click', () => drawer.classList.add('hidden'));
 refreshHealth();
 setInterval(refreshHealth, 15000);
 loadHistory();
