@@ -34,6 +34,8 @@ const CFG = Object.assign({
   requestTimeoutMs: 180000,
   ffmpeg: 'C:\\Apps\\DSH-MultiTool\\tools\\ffmpeg\\bin\\ffmpeg.exe',
   ytdlp: 'C:\\Apps\\DSH-MultiTool\\tools\\yt-dlp.exe',
+  listenUrl: 'http://127.0.0.1:8771',
+  hearAudio: true,
 }, readJson(path.join(DIR, 'config.json'), {}));
 
 const SECRETS = readJson(path.join(DIR, 'secrets.json'), {});
@@ -95,7 +97,10 @@ function buildVideoPrompt(frameTimes, userText) {
     stamps,
     userText ? `\n看视频的人说：${userText}` : '',
     '',
-    '请先如实描述画面，再回答看的人关心的问题。看不清就说不确定，不要编。',
+    // 这条很关键：不给它音轨，它却会自作主张说"没有声音"，等于用画面冒充听觉。
+    '注意：你只拿到了画面帧，没有拿到音频。音轨由另一个模块单独处理。',
+    '所以不要对"有没有声音""听没听到"下任何结论，也不要猜音效或配乐；只描述看得见的东西。',
+    '看不清就说不确定，不要编。',
     '只输出 JSON：',
     '{"synopsis":"这段视频在讲什么，三句以内",',
     ' "timeline":[{"t":"时间点","what":"这一帧发生了什么"}],',
@@ -262,6 +267,32 @@ async function downloadVideo(url) {
   return { ok: true, file, dir };
 }
 
+/** 让听力模块听一遍这条音轨：转写 + 声音事件（响动/静音/持续背景声）。 */
+async function hearAudio(file) {
+  if (!CFG.hearAudio || !CFG.listenUrl) return null;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 240000);
+  try {
+    const res = await fetch(`${CFG.listenUrl}/v1/hear`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ filePath: file }),
+      signal: ctrl.signal,
+    });
+    const data = await res.json().catch(() => null);
+    if (!data || !data.ok) {
+      log('hear failed: ' + ((data && data.error) || res.status));
+      return null;
+    }
+    return data;
+  } catch (err) {
+    log('hear error: ' + (err && err.message || err));
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ------------------------------------------------------------------ routes --
 
 const server = http.createServer(async (req, res) => {
@@ -302,11 +333,14 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { ok: false, error: dl.error });
       }
       const grab = await extractFrames(dl.file, body.frames || 8);
+      // 删除临时文件之前先让听力模块听一遍音轨（说话、响动、静音都算"听到"）
+      const audio = await hearAudio(dl.file);
       try { fs.rmSync(dl.dir, { recursive: true, force: true }); } catch { }
       if (!grab.ok) return json(res, 200, { ok: false, error: grab.error });
 
       const result = await analyzeFrames(grab.frames, body.text || '');
       result.duration = grab.duration;
+      result.audio = audio;
       result.ms = Date.now() - t0;
       log(`analyze-url ok=${result.ok} frames=${grab.frames.length} ms=${result.ms}`);
       return json(res, 200, result);

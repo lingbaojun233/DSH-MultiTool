@@ -8,5 +8,8 @@
   "recognizer": "",
   "timeoutMs": 60000,
   "maxAudioBytes": 33554432,
-  "sampleRate": 16000
+  "sampleRate": 16000,
+  "maxHearSeconds": 180,
+  "hearTimeoutMs": 180000,
+  "hearWindowSec": 0.25
 }

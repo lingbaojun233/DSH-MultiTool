@@ -19,6 +19,29 @@ POST /v1/transcribe { audioBase64, mime }
 
 `asr.ps1` 纯 ASCII 是硬要求：PS 5.1 把无 BOM 的 UTF-8 当 ANSI 读，中文注释会乱码。
 
+## 听声音，不只是听人话
+
+视频里的"声音"不只是台词：还有配乐、撞击、环境音。所以除了 `/v1/transcribe`（纯转写），还有 `/v1/hear`：
+
+```text
+POST /v1/hear  { filePath }             服务器上的音/视频文件
+            或 { audioBase64, mime }    直接给字节
+← { ok, duration, transcript, events[], summary, levels[], truncated }
+```
+
+它做三件事：
+
+1. **抽音轨**：ffmpeg `-vn -ac 1 -ar 16000`，视频直接能吃；超过 `maxHearSeconds`（默认 180）截断并标记 `truncated`
+2. **算能量曲线**：从 ffmpeg 管道拿 8k 单声道 PCM，按 `hearWindowSec`（默认 0.25s）逐窗口算 RMS → dBFS。
+   这里**必须用二进制接 stdout**，`toString('utf8')` 会把样本毁掉。
+3. **翻译成"听到了什么"**：静音段、突然的响动（跳升 ≥12dB 且 >-18dBFS）、持续有声段，再和 ASR 文本合并成一句话。
+
+`levels` 是抽稀到 2 秒一个点的曲线，前端可以画波形。
+
+### 为什么自己算能量而不是问模型
+
+因为这个网关**没有可用的音频理解模型** —— 拿不到"第 12 秒是爆炸声"这种语义。既然拿不到语义，就给物理量：哪几秒静音、哪里音量突变、整体吵不吵。所有推断性结论都带"像"字，不装成事实。
+
 ## 接口
 
 ### GET /v1/health

@@ -79,7 +79,7 @@ function readBody(req, limit) {
 }
 
 /** spawn + 收集输出 + 超时杀进程。超时用 timedOut 标记，调用方据此报 TIMEOUT。 */
-function run(cmd, args, timeoutMs) {
+function run(cmd, args, timeoutMs, binary) {
   return new Promise((resolve) => {
     let child;
     try {
@@ -88,7 +88,8 @@ function run(cmd, args, timeoutMs) {
       resolve({ code: -1, stdout: '', stderr: String(err && err.message || err), timedOut: false });
       return;
     }
-    let out = '';
+    // binary=true 时 stdout 是 PCM 字节流，绝不能用 toString('utf8') 接（会毁掉样本）
+    let out = binary ? [] : '';
     let err = '';
     let timedOut = false;
     let settled = false;
@@ -103,12 +104,13 @@ function run(cmd, args, timeoutMs) {
       // Windows 上 SIGKILL 落到 TerminateProcess，powershell 一定被杀掉。
       try { child.kill('SIGKILL'); } catch { }
       // 兜底：某些情况下 close 迟迟不来，自己也收敛。
-      setTimeout(() => finish({ code: -1, stdout: out, stderr: err, timedOut }), 2000);
+      setTimeout(() => finish({ code: -1, stdout: binary ? Buffer.concat(out) : out, stderr: err, timedOut }), 2000);
     }, Math.max(0, timeoutMs));
-    child.stdout.on('data', (d) => { out += d.toString('utf8'); });
+    child.stdout.on('data', (d) => { if (binary) out.push(d); else out += d.toString('utf8'); });
     child.stderr.on('data', (d) => { err += d.toString('utf8'); });
-    child.on('error', (e) => finish({ code: -1, stdout: out, stderr: String(e && e.message || e), timedOut }));
-    child.on('close', (code) => finish({ code, stdout: out, stderr: err, timedOut }));
+    const payload = () => (binary ? Buffer.concat(out) : out);
+    child.on('error', (e) => finish({ code: -1, stdout: payload(), stderr: String(e && e.message || e), timedOut }));
+    child.on('close', (code) => finish({ code, stdout: payload(), stderr: err, timedOut }));
   });
 }
 
@@ -352,6 +354,133 @@ async function transcribe(buf, mime) {
   }
 }
 
+// ---------------------------------------------------------------- hear ------
+// "听"不只是转写：视频里的声音还包括音乐、撞击、环境音。这里用 ffmpeg 抽音轨，
+// 按窗口算能量（dBFS），把静音段/突然的响动/持续背景声找出来，再和 ASR 文本合并。
+
+function fmtSec(sec) {
+  const s = Math.max(0, Math.round(Number(sec) || 0));
+  return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+
+async function extractAudio(inputFile, outWav, deadline, maxSeconds) {
+  const ff = ffmpegPath();
+  if (!ff) return { ok: false, error: 'FFMPEG_MISSING' };
+  const args = ['-hide_banner', '-loglevel', 'error', '-y', '-i', inputFile, '-vn'];
+  if (maxSeconds > 0) args.push('-t', String(maxSeconds));
+  args.push('-ac', '1', '-ar', '16000', '-acodec', 'pcm_s16le', outWav);
+  const r = await run(ff, args, Math.max(5000, deadline - Date.now()));
+  if (r.timedOut) return { ok: false, error: 'FFMPEG_TIMEOUT' };
+  if (r.code !== 0 || !fs.existsSync(outWav)) {
+    return { ok: false, error: 'FFMPEG_FAILED: ' + tail(r.stderr || r.stdout) };
+  }
+  return { ok: true, file: outWav };
+}
+
+/** 逐窗口 RMS（dBFS）。直接从 ffmpeg 管道拿 8k 单声道 s16le，自己算，不依赖解析文本。 */
+async function energyProfile(wavFile, windowSec, deadline) {
+  const ff = ffmpegPath();
+  if (!ff) return { ok: false, error: 'FFMPEG_MISSING' };
+  const rate = 8000;
+  const per = Math.max(0.1, Number(windowSec) || 0.25);
+  const chunkSamples = Math.max(1, Math.round(rate * per));
+
+  const r = await run(ff, [
+    '-hide_banner', '-loglevel', 'error', '-i', wavFile,
+    '-ac', '1', '-ar', String(rate), '-f', 's16le', 'pipe:1',
+  ], Math.max(5000, deadline - Date.now()), true);
+
+  if (r.timedOut) return { ok: false, error: 'FFMPEG_TIMEOUT' };
+  if (r.code !== 0 || !r.stdout) return { ok: false, error: 'PCM_EMPTY' };
+
+  const buf = r.stdout;
+  const total = Math.floor(buf.length / 2 / chunkSamples);
+  const segments = [];
+  for (let i = 0; i < total; i++) {
+    let sum = 0;
+    const start = i * chunkSamples * 2;
+    for (let j = 0; j < chunkSamples; j++) {
+      const v = buf.readInt16LE(start + j * 2);
+      sum += v * v;
+    }
+    const rms = Math.sqrt(sum / chunkSamples);
+    const db = rms <= 0 ? -100 : 20 * Math.log10(rms / 32768);
+    segments.push({ t: Number((i * per).toFixed(2)), db: Number(db.toFixed(1)) });
+  }
+  return { ok: true, segments, duration: total * per, windowSec: per };
+}
+
+/** 把能量曲线翻译成"听到了什么"。所有推断性结论都带"像"，不装成事实。 */
+function describeAudio(profile, transcript, truncated) {
+  const segs = profile.segments || [];
+  if (!segs.length) return { events: [], summary: '没听到任何声音（整段静音）', speechSeconds: 0 };
+
+  const SILENT = -45;
+  const LOUD = -18;
+  const events = [];
+  const parts = [];
+
+  let quiet = 0;
+  let loudCount = 0;
+  let runStart = null;
+  let runPeak = -100;
+
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i];
+    if (s.db < SILENT) quiet++;
+    if (s.db > LOUD) loudCount++;
+
+    // 突然的响动：相对上一窗口跳升 ≥12dB 且足够响
+    const prev = i > 0 ? segs[i - 1].db : s.db;
+    if (s.db > LOUD && s.db - prev >= 12) {
+      events.push({ t: fmtSec(s.t), kind: 'sudden', desc: '音量突然变大到 ' + s.db + ' dB（像撞击、爆响或突然的呼喊）' });
+    }
+
+    // 持续有声段：连续非静音且音量不低
+    if (s.db >= SILENT) {
+      if (runStart === null) { runStart = s.t; runPeak = s.db; }
+      else if (s.db > runPeak) runPeak = s.db;
+    } else if (runStart !== null) {
+      if (s.t - runStart >= 3) {
+        events.push({ t: fmtSec(runStart) + '-' + fmtSec(s.t), kind: 'sustained', desc: '持续有声约 ' + Math.round(s.t - runStart) + ' 秒（峰值 ' + runPeak + ' dB）' });
+      }
+      runStart = null;
+    }
+  }
+  if (runStart !== null && segs[segs.length - 1].t - runStart >= 3) {
+    const last = segs[segs.length - 1];
+    events.push({ t: fmtSec(runStart) + '-' + fmtSec(last.t), kind: 'sustained', desc: '持续有声约 ' + Math.round(last.t - runStart) + ' 秒（峰值 ' + runPeak + ' dB）' });
+  }
+
+  const activeSeconds = Math.round((segs.length - quiet) * (profile.windowSec || 0.25));
+  const totalSeconds = Math.round(profile.duration || 0);
+
+  parts.push('全长约 ' + totalSeconds + ' 秒，其中 ' + activeSeconds + ' 秒有声音');
+  if (quiet === segs.length) parts.push('整段基本静音');
+  else if (quiet > segs.length * 0.6) parts.push('大部分时间是安静/静音');
+
+  if (transcript && transcript.length >= 4) {
+    parts.push('听得到人说话');
+  } else if (transcript) {
+    // 只有"阿""嗯"这类语气词，不能算"有人在说话"
+    parts.push('只有零星的人声/语气词');
+  } else if (activeSeconds >= Math.max(3, totalSeconds * 0.5)) {
+    parts.push('一直有声音但没听出成句的人话（更像配乐、环境音或噪音）');
+  }
+
+  if (loudCount > segs.length * 0.2) parts.push('整体偏吵（大量窗口超过 ' + LOUD + ' dB）');
+  if (truncated) parts.push('（只听了前 ' + totalSeconds + ' 秒）');
+
+  // 同类事件太多就收成一条，别把时间线撑爆
+  const sudden = events.filter((e) => e.kind === 'sudden');
+  if (sudden.length > 6) {
+    events.length = 0;
+    events.push({ t: '-', kind: 'sudden', desc: '有 ' + sudden.length + ' 次明显响动（首次在 ' + sudden[0].t + '）' });
+  }
+
+  return { events: events.slice(0, 12), summary: parts.join('；'), speechSeconds: transcript ? activeSeconds : 0 };
+}
+
 // ------------------------------------------------------------------- routes --
 
 const server = http.createServer(async (req, res) => {
@@ -393,6 +522,90 @@ const server = http.createServer(async (req, res) => {
         `ok=${result.ok} ms=${result.ms} chars=${(result.text || '').length} ` +
         `${result.ok ? '' : 'error=' + result.error}`);
       return json(res, 200, result);
+    }
+
+    if (req.method === 'POST' && p === '/v1/hear') {
+      const t0 = Date.now();
+      const raw = await readBody(req, Number(CFG.maxAudioBytes || 32 * 1024 * 1024));
+      let body = {};
+      try {
+        body = JSON.parse(raw.toString('utf8') || '{}');
+      } catch {
+        return json(res, 400, { ok: false, error: 'BAD_JSON' });
+      }
+
+      let dir = null;
+      let sourceFile = '';
+      try {
+        dir = fs.mkdtempSync(path.join(os.tmpdir(), 'listen-hear-'));
+        if (body.filePath) {
+          sourceFile = String(body.filePath);
+          if (!fs.existsSync(sourceFile)) {
+            return json(res, 200, { ok: false, error: 'FILE_NOT_FOUND', ms: Date.now() - t0 });
+          }
+        } else {
+          const decoded = base64ToBuffer(body.audioBase64 || body.audio || '');
+          if (!decoded.ok) {
+            return json(res, 200, { ok: false, error: decoded.error, ms: Date.now() - t0 });
+          }
+          const ext = sniffExt(decoded.buf) || MIME_EXT[normalizeMime(body.mime)] || '.bin';
+          sourceFile = path.join(dir, 'src' + ext);
+          fs.writeFileSync(sourceFile, decoded.buf);
+        }
+
+        const deadline = t0 + Math.max(30000, Number(CFG.hearTimeoutMs || 180000));
+        const maxSeconds = Number(CFG.maxHearSeconds || 180);
+        const wavFile = path.join(dir, 'audio.wav');
+        const ex = await extractAudio(sourceFile, wavFile, deadline, maxSeconds);
+        if (!ex.ok) {
+          log(`hear extract failed: ${ex.error}`);
+          return json(res, 200, { ok: false, error: ex.error, ms: Date.now() - t0 });
+        }
+
+        // 有没有超过截断上限（拿 wav 时长判断）
+        let truncated = false;
+        try {
+          const info = wavInfo(fs.readFileSync(wavFile));
+          const dur = info && info.dataBytes ? info.dataBytes / (info.byteRate || 32000) : 0;
+          truncated = dur >= maxSeconds - 1.5;
+        } catch { }
+
+        const prof = await energyProfile(wavFile, Number(CFG.hearWindowSec || 0.25), deadline);
+        if (!prof.ok) {
+          return json(res, 200, { ok: false, error: prof.error, ms: Date.now() - t0 });
+        }
+
+        let asr = { ok: false, text: '' };
+        try {
+          const buf = fs.readFileSync(wavFile);
+          asr = await transcribe(buf, 'audio/wav');
+        } catch { }
+
+        const desc = describeAudio(prof, (asr.text || '').trim(), truncated);
+        const result = {
+          ok: true,
+          ms: Date.now() - t0,
+          provider: CFG.provider,
+          duration: Math.round(prof.duration),
+          truncated,
+          transcript: (asr.text || '').trim(),
+          speechOk: Boolean(asr.ok),
+          segments: prof.segments.length,
+          events: desc.events,
+          summary: desc.summary,
+          // 抽稀后的曲线，给前端画个波形用（每 2 秒一个点）
+          levels: (() => {
+            const step = Math.max(1, Math.round(2 / (prof.windowSec || 0.25)));
+            const out = [];
+            for (let i = 0; i < prof.segments.length; i += step) out.push(prof.segments[i].db);
+            return out;
+          })(),
+        };
+        log(`hear ok dur=${result.duration}s events=${result.events.length} chars=${result.transcript.length} ms=${result.ms}`);
+        return json(res, 200, result);
+      } finally {
+        if (dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { } }
+      }
     }
 
     if (req.method === 'GET' && (p === '/v1/recognizers' || p === '/recognizers')) {

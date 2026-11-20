@@ -224,6 +224,21 @@ function buildVideoTask(analysis, userText) {
     lines.push('要点：' + analysis.highlights.join('；'));
   }
   if (analysis.onScreen) lines.push('画面上出现的文字：' + analysis.onScreen);
+
+  // 听力模块听出来的东西：谁在说话、有什么响动、有多吵
+  const audio = analysis.audio;
+  if (audio && audio.ok) {
+    lines.push('');
+    lines.push('【声音（听出来的）】');
+    if (audio.transcript) lines.push('听到的话：' + audio.transcript);
+    else lines.push('没听出成句的人话');
+    if (audio.summary) lines.push('声音概况：' + audio.summary);
+    if (Array.isArray(audio.events) && audio.events.length) {
+      lines.push('声音事件：');
+      for (const e of audio.events.slice(0, 8)) lines.push(`- ${e.t || '?'} ${e.desc || ''}`);
+    }
+    lines.push('【声音结束】');
+  }
   lines.push('【描述结束】');
   lines.push('');
   lines.push('用你自己的口气回我：先给一句直接看法（这视频怎么样、值不值得看），再补一两点你自己注意到的东西或者想问的。');

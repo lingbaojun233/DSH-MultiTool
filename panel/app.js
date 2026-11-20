@@ -814,6 +814,23 @@ function renderVideoResult(r) {
       li.textContent = `${t.t || '?'}  ${t.what || ''}`;
       videoEls.timeline.appendChild(li);
     }
+
+    // 听出来的声音
+    const audioEl = document.getElementById('videoAudio');
+    if (audioEl) {
+      const audio = a.audio;
+      if (!audio || !audio.ok) {
+        audioEl.textContent = '';
+      } else {
+        const bits = [];
+        if (audio.transcript) bits.push('听到的话：' + audio.transcript);
+        if (audio.summary) bits.push('声音概况：' + audio.summary);
+        if (Array.isArray(audio.events) && audio.events.length) {
+          bits.push('声音事件：' + audio.events.map((e) => `${e.t} ${e.desc}`).join('；'));
+        }
+        audioEl.textContent = bits.join('\n');
+      }
+    }
   }
   videoEls.resultCard.classList.remove('hidden');
 }
