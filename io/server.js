@@ -96,7 +96,7 @@ const server = http.createServer(async (req, res) => {
       session,
     });
 
-    log(`output ok=${result.ok} code=${result.code} ms=${result.ms}`);
+    log(`output ok=${result.ok} code=${result.code} ms=${result.ms} tokens=${result.tokens ? result.tokens.prompt + '+' + result.tokens.answer + '=' + result.tokens.total : '?'}`);
     const { events, ...rest } = result;
     return json(res, result.ok ? 200 : 502, rest);
   }

@@ -18,6 +18,15 @@ const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 
+// 复用记忆模块的 token 估算，保证"成本数字"和人格预算用的是同一把尺子。
+// 找不到就退回按字符估算，不让 io 因为缺一个可选依赖起不来。
+let estimateTokens;
+try {
+  ({ estimateTokens } = require(path.join(__dirname, '..', 'memory', 'lib', 'budget.js')));
+} catch {
+  estimateTokens = (text) => Math.ceil(String(text || '').length / 1.2);
+}
+
 const IO_DIR = __dirname;
 const DEFAULT_TIMEOUT_MS = 300000;
 const MEMORY_URL = process.env.DSH_MEMORY_URL || 'http://127.0.0.1:8767';
@@ -335,6 +344,8 @@ async function run(task, options = {}) {
     history: options.history,
     task,
   });
+  // 成本可见性：每轮都记下输入/输出 token，否则"一次对话多少钱"只能靠猜。
+  const promptTokens = estimateTokens(promptText);
   const timeoutMs = Number(options.timeoutMs || process.env.DSH_IO_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
   // 本轮起点 + 记忆库基线：结束时用差值算出"用了什么、写了什么"
   const turnStartedAt = new Date().toISOString();
@@ -427,6 +438,8 @@ async function run(task, options = {}) {
   try {
     const [afterStats, audits] = await Promise.all([memoryStats(), memoryAuditsSince(turnStartedAt)]);
     result.usage = buildUsage(beforeStats, afterStats, audits);
+  const answerTokens = estimateTokens(result.answer || '');
+  result.tokens = { prompt: promptTokens, answer: answerTokens, total: promptTokens + answerTokens };
   } catch {
     /* 统计失败不影响对话 */
   }
