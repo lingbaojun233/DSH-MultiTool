@@ -45,13 +45,17 @@ node cli.js catalog --scope=server   # 服务器视角（memory、panel）
 node cli.js catalog --scope=local    # 开发机视角（deploy）
 ```
 
-## 用法预取（实测结论）
+## 用法加载（实测结论）
 
 | 方式 | 结果 |
 | --- | --- |
 | 指望模型自己调 `read` | **实测 0/30 次调用**，它改为 `ls`/`find` 直接翻文件，还产生"我读过文档了"的幻觉 |
 | 按 `when` 字符二元组打分预取 | **不可行**：`none` 上界 0.04 与 memory 的 0.05 重合，无阈值可分 |
-| **名字命中才预取**（现采用） | 用户/模型明确说出模块名时，直接注入该模块 README，确定性、零误判 |
+| 名字命中预取 | 已移除：与 `read_module` 原生工具重复，命中时白付 250 token |
+| **注册成原生工具**（现采用） | `plugin/memory-tools` 把 `read_module` 注册进工具表；实测模型会主动调用 |
+
+所以现在 registry 的运行时职责只有两件：**渲染目录**（io 每轮注入约 66 token）和**作为 `read_module` 的后端**。
+其余（validate / lint / gen / triggers）都是开发期工具，不进运行时。
 
 ## 新增一个模块
 
