@@ -1,0 +1,48 @@
+# ---- Secrets（真正的凭据放在仓库外的 ../secrets/，这里是双保险）----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.token
+secrets/
+credentials*
+!credentials.example*
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+
+# ---- Node / 前端 ----
+node_modules/
+.pnpm-store/
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+*.tsbuildinfo
+.vite/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 运行产物 / 本地状态 ----
+logs/
+*.log
+tmp/
+.cache/
+.dsh/
