@@ -46,3 +46,7 @@ logs/
 tmp/
 .cache/
 .dsh/
+
+# 运行时数据（事件库、审计、日志产物），绝不入库
+/data/
+data/
