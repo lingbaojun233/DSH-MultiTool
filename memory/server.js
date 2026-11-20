@@ -83,11 +83,35 @@ function parseBody(raw) {
   }
 }
 
+/**
+ * 从请求体里取 id：优先 user_id，兼容 userId；都没有 → null（不隔离）。
+ * 非法值必须报 400，不能悄悄当 null —— null 意味着"不过滤/共享"，
+ * 把调用方的私聊 id 静默降级成 null，等于把别人的记忆也一起返回。
+ */
+function readUserId(body) {
+  const raw = body && typeof body === 'object'
+    ? (body.user_id !== undefined ? body.user_id : body.userId)
+    : undefined;
+  if (raw == null) return null;
+  if (typeof raw === 'string' && raw.trim() === '') return null;
+  const num = typeof raw === 'number' ? raw : (typeof raw === 'string' ? Number(raw.trim()) : NaN);
+  if (!Number.isSafeInteger(num)) {
+    throw new MemoryError(
+      'E_BAD_REQUEST',
+      'user_id must be an integer or null',
+      '传 {"user_id": 42}；不传或传 null 表示不隔离（共享记忆）',
+    );
+  }
+  return num;
+}
+
 const ROUTES = {
   'POST /v1/tools/memory_remember': async (body) => {
     if (!body || typeof body !== 'object') throw new MemoryError('E_BAD_REQUEST');
-    const result = remember(db, body);
-    audit('remember', { ts: new Date().toISOString(), stored: result.stored, reason: result.reason, eventId: result.eventId || null });
+    // user_id：整数 = 该用户私有；不传/null = 共享记忆。remember 的入参名是 userId
+    const userId = readUserId(body);
+    const result = remember(db, { ...body, userId });
+    audit('remember', { ts: new Date().toISOString(), userId, stored: result.stored, reason: result.reason, eventId: result.eventId || null });
 
     // 无证据是硬错误（约束 1），必须给结构化错误，而不是 ok:true + stored:false
     if (!result.stored && result.reason === 'no_evidence') {
@@ -100,13 +124,17 @@ const ROUTES = {
   },
 
   'POST /v1/tools/memory_search': async (body) => {
+    // user_id：整数 = 只看"自己 + 共享"；不传/null = 不过滤（兼容旧行为）
+    const userId = readUserId(body);
     const result = search(db, {
       query: String((body && body.query) || ''),
       context: (body && body.context) || {},
       budget: (body && body.budget) || {},
+      userId,
     });
     audit('search', {
       ts: new Date().toISOString(),
+      userId,
       query: String((body && body.query) || ''),
       ids: result.items.map((item) => item.id),
       used: result.used,
@@ -187,6 +215,19 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // 事件列表（面板「最近事件」用）：可选 user_id 过滤，NULL 视为共享
+    if (key === 'GET /v1/events') {
+      const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit') || 50)));
+      const only = url.searchParams.get('user_id');
+      let events = db.prepare(
+        'SELECT id, ts, channel, group_id, speaker_id, speaker_name, kind, content, evidence, confidence, salience, user_id FROM events WHERE deleted = 0 ORDER BY id DESC LIMIT ?',
+      ).all(limit);
+      if (only) {
+        const uid = Number(only);
+        events = events.filter((e) => e.user_id === null || e.user_id === uid);
+      }
+      return sendJson(res, 200, { ok: true, count: events.length, events });
+    }
     // 审计查询：面板用它在每轮结束后统计"这一轮用了几条记忆、写入了几条事件"
     if (key === 'GET /v1/audits') {
       const kind = (url.searchParams.get('kind') || 'search').replace(/[^a-z]/g, '');

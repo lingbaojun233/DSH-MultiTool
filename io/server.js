@@ -16,7 +16,7 @@
  */
 
 const http = require('node:http');
-const { run, coreStatus } = require('./io.js');
+const { run, coreStatus, verifyUser } = require('./io.js');
 
 const HOST = process.env.DSH_IO_HOST || '127.0.0.1';
 const PORT = Number(process.env.DSH_IO_PORT || 8765);
@@ -82,12 +82,18 @@ const server = http.createServer(async (req, res) => {
     const text = typeof payload.text === 'string' ? payload.text : '';
     if (!text.trim()) return json(res, 400, { ok: false, error: 'text is required' });
 
-    log(`input len=${text.length} session=${payload.sessionId || '-'} history=${Array.isArray(payload.history) ? payload.history.length : 0}`);
+    // 身份必须在最前面校验：没有有效会话就不进入模型
+    const session = await verifyUser(req.headers.authorization || '');
+    if (!session) {
+      return json(res, 401, { ok: false, code: 'E_UNAUTHORIZED', message: '需要登录（Authorization: Bearer <token>）' });
+    }
+    log(`input user=${session.user.username}#${session.user.id} len=${text.length} session=${payload.sessionId || '-'} history=${Array.isArray(payload.history) ? payload.history.length : 0}`);
     const result = await run(text, {
       sessionId: payload.sessionId || undefined,
       permissionMode: payload.permissionMode || undefined,
       timeoutMs: payload.timeoutMs || undefined,
       history: Array.isArray(payload.history) ? payload.history.slice(-8) : undefined,
+      session,
     });
 
     log(`output ok=${result.ok} code=${result.code} ms=${result.ms}`);

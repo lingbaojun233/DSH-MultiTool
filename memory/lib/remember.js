@@ -17,6 +17,10 @@
  *
  * 事务：第 6~10 步在一个 BEGIN/COMMIT 里，任一步失败 ROLLBACK，返回 reason='error'。
  *
+ * 按用户隔离（002_users.sql）：
+ *   input.userId 为整数 → 事件与由它抽取的事实都记在该用户名下；为 null/缺省 → 共享记忆。
+ *   去重与合并（精确 / 近似 / 事实强化）都在同一归属内进行，避免把别人的记录改掉。
+ *
  * 约定：
  *   * 纯 CommonJS，零外部依赖，只用 node:sqlite 的同步 API。
  *   * events.channel 只接受 chat/video/doc/system，kind 只接受 msg/video/action/commitment；
@@ -121,6 +125,34 @@ function normId(value) {
   if (value == null) return null;
   const text = String(value).trim();
   return text ? text : null;
+}
+
+/**
+ * user_id 归一化：null/undefined/空串 → null（共享记忆）；整数或纯数字字符串 → 整数。
+ * 非法值（小数、布尔、'abc'）不回落成 null —— NULL 是全用户可见的共享记忆，
+ * 悄悄降级等于把私有内容公开，所以宁可拒收。
+ * @returns {{ok:boolean, userId:number|null}}
+ */
+function normUserId(value) {
+  if (value == null) return { ok: true, userId: null };
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) ? { ok: true, userId: value } : { ok: false, userId: null };
+  }
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!text) return { ok: true, userId: null };
+    if (!/^[+-]?\d+$/.test(text)) return { ok: false, userId: null };
+    const num = Number(text);
+    return Number.isSafeInteger(num) ? { ok: true, userId: num } : { ok: false, userId: null };
+  }
+  return { ok: false, userId: null };
+}
+
+/** 两个 user_id 是否同一归属：NULL 只与 NULL 相同，与任何整数都不同（同 SQL 的 `IS ?` 语义）。 */
+function sameUser(a, b) {
+  const left = a == null ? null : Number(a);
+  const right = b == null ? null : Number(b);
+  return left === right;
 }
 
 /** 证据门槛：既不能缺，格式也要能定位（source:scope#locator）。 */
@@ -378,28 +410,40 @@ function extractFacts(text, speakerName) {
 
 /**
  * 写 facts（第 7 步）：
- *   - 同 subject+predicate 已有相同 object：support+1、last_seen 前移、追加证据事件 id，不新增行
- *   - 同 subject+predicate 已有不同 object：新事实 status='conflict'，旧行不动
+ *   - 同 subject+predicate 已有相同 object（同一归属）：support+1、last_seen 前移、追加证据事件 id，不新增行
+ *   - 同 subject+predicate 已有不同 object（同一归属）：新事实 status='conflict'，旧行不动
  *   - 都没有：status='active'
+ *
+ * 归属（user_id）规则：
+ *   - ux_facts_triple 是全局唯一索引（001 建的不动），所以先全局查三元组，再判断归属。
+ *   - 同三元组属于别的归属：既不强化别人的行（会把证据链写到别人名下），
+ *     也不能插新行（会撞唯一索引）→ 跳过并计数，事件本身仍照常入库。
+ *   - 冲突判定只在同一归属内做：别人说过的不同值不该把这条事实标成 conflict。
+ * @returns {{written:Array, skipped:number}}
  */
 function persistFacts(db, facts, ctx) {
   const findSameSp = db.prepare(
-    'SELECT id, object, status, support, evidence_event_ids FROM facts WHERE subject = ? AND predicate = ? AND deleted = 0',
+    'SELECT id, object, status, support, evidence_event_ids, user_id FROM facts WHERE subject = ? AND predicate = ? AND deleted = 0',
   );
   const insertFact = db.prepare(
-    'INSERT INTO facts (subject, predicate, object, confidence, evidence_event_ids, first_seen, last_seen, status, salience, support, deleted, created_at)' +
-      ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?)',
+    'INSERT INTO facts (subject, predicate, object, confidence, evidence_event_ids, first_seen, last_seen, status, salience, support, deleted, created_at, user_id)' +
+      ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)',
   );
   const reinforceFact = db.prepare(
     'UPDATE facts SET support = support + 1, last_seen = ?, evidence_event_ids = ?, confidence = MAX(confidence, ?) WHERE id = ?',
   );
 
   const written = [];
+  let skipped = 0;
   for (const fact of facts) {
     const rows = findSameSp.all(fact.subject, fact.predicate);
     const same = rows.find((row) => row.object === fact.object);
 
     if (same) {
+      if (!sameUser(same.user_id, ctx.userId)) {
+        skipped += 1; // 别的归属已经记过同样的三元组
+        continue;
+      }
       const evidence = parseJsonArray(same.evidence_event_ids);
       if (!evidence.includes(ctx.eventId)) evidence.push(ctx.eventId);
       reinforceFact.run(ctx.ts, JSON.stringify(evidence), ctx.confidence, Number(same.id));
@@ -412,7 +456,7 @@ function persistFacts(db, facts, ctx) {
       continue;
     }
 
-    const status = rows.length ? 'conflict' : 'active';
+    const status = rows.some((row) => sameUser(row.user_id, ctx.userId)) ? 'conflict' : 'active';
     insertFact.run(
       fact.subject,
       fact.predicate,
@@ -424,6 +468,7 @@ function persistFacts(db, facts, ctx) {
       status,
       ctx.salience,
       ctx.nowIso,
+      ctx.userId,
     );
     written.push({
       subject: fact.subject,
@@ -432,7 +477,7 @@ function persistFacts(db, facts, ctx) {
       status,
     });
   }
-  return written;
+  return { written, skipped };
 }
 
 // ---------------------------------------------------------------------------
@@ -467,10 +512,11 @@ function computeSalience({ kind, textLength, hasFact, emotions }) {
  * @param {string}  [input.content]       原文（必填，否则会落到 chitchat）
  * @param {string}   input.evidence       证据定位，必填，形如 'chat:g1#m2'
  * @param {number}  [input.confidence]    0..1，默认 0.8
+ * @param {number|null} [input.userId]   归属用户 id：整数 = 私有，null/缺省 = 共享（所有人可见）
  * @param {Array}   [input.entities]      [{type,name,aliases?}]
  * @returns {{stored:boolean, reason:string, eventId?:number, entities?:string[],
  *            facts?:Array<{subject:string,predicate:string,object:string,status:string}>,
- *            salience?:number, detail?:string}}
+ *            factsSkipped?:number, salience?:number, detail?:string}}
  */
 function remember(db, input) {
   // ---- 0. 入参与连接校验 -------------------------------------------------
@@ -480,6 +526,17 @@ function remember(db, input) {
   const src = input && typeof input === 'object' ? input : {};
   const now = new Date();
   const nowIso = now.toISOString();
+
+  // ---- 0b. 归属：整数 = 该用户私有；null/缺省 = 共享 -----------------------
+  const parsedUser = normUserId(src.userId);
+  if (!parsedUser.ok) {
+    return {
+      stored: false,
+      reason: 'invalid_user_id',
+      detail: 'userId 必须是整数或 null（null 表示共享记忆），收到 ' + JSON.stringify(src.userId),
+    };
+  }
+  const userId = parsedUser.userId;
 
   // ---- 1. 证据门槛：没有证据直接拒收，什么都不写 --------------------------
   const evidence = typeof src.evidence === 'string' ? src.evidence.trim() : '';
@@ -524,6 +581,7 @@ function remember(db, input) {
   const speakerName = normId(src.speaker_name);
 
   // 两个 id 都缺 = 没有可比较的语境，不做近似合并（避免把无关的话并到一起）
+  // 另外只在同一归属内比较：跨用户（含共享 vs 私有）不合并，否则会把别人的 merge_count 改掉
   if (groupId !== null || speakerId !== null) {
     const from = new Date(tsMs - NEAR_DUP_WINDOW_MS).toISOString();
     const to = new Date(tsMs + NEAR_DUP_WINDOW_MS).toISOString();
@@ -532,9 +590,10 @@ function remember(db, input) {
         `SELECT id, content, ts FROM events
           WHERE deleted = 0 AND group_id IS ? AND speaker_id IS ?
             AND ts >= ? AND ts <= ?
+            AND user_id IS ?
           ORDER BY ts DESC LIMIT ${NEAR_DUP_SCAN_LIMIT}`,
       )
-      .all(groupId, speakerId, from, to);
+      .all(groupId, speakerId, from, to, userId);
 
     const grams = bigrams(text);
     let best = null;
@@ -579,8 +638,8 @@ function remember(db, input) {
         .prepare(
           `INSERT INTO events
              (ts, channel, group_id, speaker_id, speaker_name, kind, content, raw_content,
-              evidence, confidence, salience, content_hash, deleted, merged_into, merge_count, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, 1, ?)`,
+              evidence, confidence, salience, content_hash, deleted, merged_into, merge_count, created_at, user_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, 1, ?, ?)`,
         )
         .run(
           ts,
@@ -596,6 +655,7 @@ function remember(db, input) {
           salience,
           hash,
           nowIso,
+          userId,
         );
       const eventId = Number(info.lastInsertRowid);
 
@@ -605,20 +665,21 @@ function remember(db, input) {
       // 6. 实体链接
       const entityNames = linkEntities(db, eventId, entityPlan, nowIso);
 
-      // 7. 事实抽取（conflict 判定在 persistFacts 里）
-      const facts = persistFacts(db, factPlan, {
+      // 7. 事实抽取（conflict 判定在 persistFacts 里，按 user_id 隔离）
+      const factsResult = persistFacts(db, factPlan, {
         eventId,
         ts,
         nowIso,
         confidence,
         salience,
+        userId,
       });
 
-      return { eventId, entityNames, facts };
+      return { eventId, entityNames, facts: factsResult.written, factsSkipped: factsResult.skipped };
     });
 
     // ---- 10. 返回结构化结果 ----------------------------------------------
-    return {
+    const result = {
       stored: true,
       reason: 'stored',
       eventId: outcome.eventId,
@@ -626,6 +687,9 @@ function remember(db, input) {
       facts: outcome.facts,
       salience,
     };
+    // 只有真的跳过才带这个字段，保持老调用方的返回形状不变
+    if (outcome.factsSkipped) result.factsSkipped = outcome.factsSkipped;
+    return result;
   } catch (err) {
     // 事务已回滚：events / FTS / 实体 / 事实都不会留下半成品
     return {

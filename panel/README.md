@@ -6,9 +6,9 @@
 
 ```text
 panel/
-├── server.js          静态托管 + 反代到 io（127.0.0.1:8766 -> 127.0.0.1:8765）
-├── index.html         页面骨架
-├── app.js             前端逻辑（发送、等待态、错误、健康指示）
+├── server.js          静态托管 + 反代到 io / separator（127.0.0.1:8766 -> 8765 / 8768）
+├── index.html         页面骨架（含登录/注册浮层）
+├── app.js             前端逻辑（发送、等待态、错误、健康指示、登录态）
 ├── style.css          深色主题
 ├── start-server.cmd   计划任务入口（开机自启）
 └── open-panel.cmd     本地一键启动器（建隧道 + 开浏览器）
@@ -19,7 +19,7 @@ panel/
 ```text
 浏览器 -> 127.0.0.1:8766（本机 SSH 隧道）
        -> 服务器 127.0.0.1:8766（panel server）
-       -> 127.0.0.1:8765（io）
+       -> 127.0.0.1:8765（io）  /  127.0.0.1:8768（separator：登录/注册/会话）
        -> DSH 核心
 ```
 
@@ -36,6 +36,18 @@ SSH 隧道（`ssh -N -L 8766:127.0.0.1:8766 fish-server`），然后打开浏览
 ssh -N -L 8766:127.0.0.1:8766 fish-server     # 保持这个窗口
 # 浏览器打开 http://127.0.0.1:8766
 ```
+
+## 登录与用户态
+
+- 顶栏右侧是用户区：未登录显示「登录」，登录后显示显示名 +「退出」。
+- 首次使用：点「登录」→「注册一个」。用户名 3–32 位小写字母/数字/下划线，密码至少 6 位，
+  显示名可留空（默认用用户名）。注册成功即自动登录。
+- token 存在 `localStorage['dsh-panel-token']`；页面启动时调 `GET /api/auth/me` 校验，
+  无效就弹登录层并禁用输入框。
+- 受保护请求（`/api/input`、`/api/persona`、`/api/memory/*`）都带
+  `Authorization: Bearer <token>`；遇到 401 会清 token、弹层并提示「会话过期，请重新登录」。
+- 「退出」先调 `POST /api/auth/logout` 删除服务端会话，再清本地 token。
+- 面板把 `/api/auth/*` 代理到 separator 的 `/v1/auth/*`，浏览器始终只与面板同源通信。
 
 ## 开机自启（服务器上已配置）
 
@@ -85,5 +97,7 @@ C:\Apps\DSH-MultiTool\data\panel-history.jsonl    每行一条 {role, text, ts, 
 
 - 无多轮上下文：核心当前版本不支持 `--session-id`，每次提问都是独立会话；
   历史只是展示层，不会把前文带进下一次请求。
-- 无鉴权：只监听回环，靠 SSH 隧道与登录身份保护；如需对外开放，先在 io 侧设置 `DSH_IO_TOKEN`。
+- 对话历史仍是一份全局 `panel-history.jsonl`，多账号共用，不做按用户隔离。
+- 登录态存在浏览器 localStorage；清理浏览器数据会退出登录。
+- 只监听回环，靠 SSH 隧道与账号登录保护；如需对外开放，另配反向代理与 HTTPS。
 - 历史无上限保护（除 2 MB 裁剪）：长期使用会持续增长，需要时手工删 `data\panel-history.jsonl`。

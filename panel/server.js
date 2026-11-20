@@ -8,6 +8,7 @@
  * conversation so a page refresh (or another browser) still shows the history.
  *
  *   browser -> 127.0.0.1:8766 (this process) -> 127.0.0.1:8765 (io) -> DSH core
+ *                                            \-> 127.0.0.1:8768 (separator：登录/注册/会话)
  *
  * History lives OUTSIDE this folder (..\data\panel-history.jsonl) so that a
  * `push` that replaces panel\ wholesale never destroys it.
@@ -25,10 +26,12 @@ const HOST = process.env.DSH_PANEL_HOST || '127.0.0.1';
 const PORT = Number(process.env.DSH_PANEL_PORT || 8766);
 const IO_BASE = process.env.DSH_IO_URL || 'http://127.0.0.1:8765';
 const MEMORY_BASE = process.env.DSH_MEMORY_URL || 'http://127.0.0.1:8767';
+const SEPARATOR_BASE = process.env.DSH_SEPARATOR_URL || 'http://127.0.0.1:8768';
 const ROOT = __dirname;
 const MAX_BODY = 1024 * 1024;
 
-const DATA_DIR = path.join(ROOT, '..', 'data');
+// 默认写在模块目录之外，push 整目录替换也不会丢掉；DSH_PANEL_DATA 只给自测用
+const DATA_DIR = process.env.DSH_PANEL_DATA || path.join(ROOT, '..', 'data');
 const HISTORY_FILE = path.join(DATA_DIR, 'panel-history.jsonl');
 const HISTORY_MAX_LINES = 1000;
 const HISTORY_TRIM_TO = 800;
@@ -160,7 +163,18 @@ function readBody(req) {
   });
 }
 
-function proxy(req, res, ioPath, body, onDone, base) {
+function bearer(req) {
+  const raw = req.headers.authorization || '';
+  const match = /^Bearer\s+(.+)$/i.exec(raw);
+  return match ? match[1].trim() : '';
+}
+
+/** 面板自己的用户态闸门：没带 token 的请求不往 io/记忆服务转发。 */
+function protectedPath(pathname) {
+  return pathname === '/api/input' || pathname === '/api/persona' || pathname.startsWith('/api/memory/');
+}
+
+function proxy(req, res, ioPath, body, onDone, base, label) {
   const target = new URL(ioPath, base || IO_BASE);
   const headers = { 'content-type': req.headers['content-type'] || 'application/json' };
   if (req.headers.authorization) headers.authorization = req.headers.authorization;
@@ -192,7 +206,7 @@ function proxy(req, res, ioPath, body, onDone, base) {
 
   upstream.on('timeout', () => upstream.destroy(new Error('io timed out')));
   upstream.on('error', (err) => {
-    if (!res.headersSent) sendJson(res, 502, { ok: false, error: `io unreachable: ${err.message}` });
+    if (!res.headersSent) sendJson(res, 502, { ok: false, error: `${label || 'io'} unreachable: ${err.message}` });
   });
 
   if (body && body.length) upstream.write(body);
@@ -203,6 +217,21 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || HOST}`);
 
   try {
+    // 用户态：注册/登录/退出/会话校验都代理到 separator，浏览器只与面板同源
+    if (url.pathname === '/api/auth' || url.pathname.startsWith('/api/auth/')) {
+      if (req.method !== 'GET' && req.method !== 'POST') {
+        return sendJson(res, 405, { ok: false, error: 'method not allowed' });
+      }
+      const sub = url.pathname.slice('/api/auth'.length);
+      const raw = req.method === 'POST' ? await readBody(req) : null;
+      return proxy(req, res, '/v1/auth' + sub + url.search, raw, null, SEPARATOR_BASE, 'separator');
+    }
+
+    // 没登录就不该碰输入/记忆接口：浏览器会弹登录层，这里先挡一道
+    if (protectedPath(url.pathname) && !bearer(req)) {
+      return sendJson(res, 401, { ok: false, code: 'E_UNAUTHORIZED', error: '未登录或会话已过期' });
+    }
+
     // 面板的记忆/人格视图：透传到记忆服务，浏览器只走这一个口
     if (req.method === 'GET' && url.pathname === '/api/persona') {
       return proxy(req, res, '/v1/persona', null, null, MEMORY_BASE);
@@ -244,6 +273,8 @@ const server = http.createServer(async (req, res) => {
         } catch {
           /* not json */
         }
+        // 401 是用户态问题，不写进对话历史，避免每次掉线都留一条错误
+        if (status === 401) return;
         if (data && data.ok) {
           appendHistory({ role: 'assistant', text: data.answer || '', ms: data.ms, usage: data.usage || null, ts: Date.now() });
         } else {
@@ -265,7 +296,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   ensureDataDir();
-  log(`listening on http://${HOST}:${PORT}  io=${IO_BASE}  history=${HISTORY_FILE}`);
+  log(`listening on http://${HOST}:${PORT}  io=${IO_BASE}  separator=${SEPARATOR_BASE}  history=${HISTORY_FILE}`);
 });
 
 function shutdown(signal) {

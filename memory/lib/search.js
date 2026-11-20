@@ -10,6 +10,9 @@
  *   4. 无结果就返回 items: []，绝不编造；只有时间窗进来、与 query 毫无关系的近期事件也不充数。
  *   5. 只有 isRecallQuestion(query) 为真才对 top20 精排（实体名 +1.0、时间指代 +0.3），置 reranked=true。
  *   6. debug 带每条候选的分项分数，便于复盘"它为什么被排在这里"。
+ *   7. 用户隔离：options.userId 为整数时，三路候选与装载都只取
+ *      "该用户 + 共享（user_id IS NULL）"；为 null/缺省时不过滤，保持旧行为。
+ *      items 里也带 user_id，方便调用方核对归属。
  *
  * 本文件是纯查询：不 INSERT/UPDATE/DELETE，不改表结构。唯一的可变状态是模块级
  * noveltySeen 表（最近 7 天被检索过的 event.id），只活在进程内存里，重启即清空。
@@ -76,6 +79,39 @@ function parseAliases(raw) {
   } catch {
     return [];
   }
+}
+
+/**
+ * user_id 归一化：null/undefined/空串 → null（不加过滤，兼容旧行为）；
+ * 整数或纯数字字符串 → 整数；其余一律抛 TypeError。
+ * 非法值不回落成 null：那样查询方以为自己在看私有记忆，实际看到了全库。
+ */
+function readUserId(value) {
+  if (value == null) return null;
+  if (typeof value === 'number') {
+    if (Number.isSafeInteger(value)) return value;
+    throw new TypeError('search(db, options): userId 必须是整数或 null');
+  }
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!text) return null;
+    if (/^[+-]?\d+$/.test(text)) {
+      const num = Number(text);
+      if (Number.isSafeInteger(num)) return num;
+    }
+  }
+  throw new TypeError('search(db, options): userId 必须是整数或 null');
+}
+
+/**
+ * 可见性 SQL 片段：自己 + 共享（user_id IS NULL）。
+ * 参数要追加在各自 SQL 的已有占位符之后，调用方负责 push(userId)。
+ * @param {string} alias 事件表的别名（events / e）
+ * @param {number|null} userId null 时不加过滤
+ */
+function userScopeSql(alias, userId) {
+  if (userId == null) return '';
+  return ` AND (${alias}.user_id = ? OR ${alias}.user_id IS NULL)`;
 }
 
 /**
@@ -149,8 +185,9 @@ function readRange(context, nowMs) {
  * a) FTS5 全文：query 用双引号包成短语查询。
  * trigram 分词对 <3 字符的查询不生成 token，这时改用 content LIKE 兜底。
  * FTS 出错（语法/分词异常）也不让整个检索崩掉，同样落回 LIKE。
+ * 两路都带 user_id 可见性过滤（userId 为 null 时不加）。
  */
-function ftsCandidates(db, query) {
+function ftsCandidates(db, query, userId) {
   const raw = String(query).trim();
   if (!raw) return [];
 
@@ -164,15 +201,18 @@ function ftsCandidates(db, query) {
   if (ftsTerms.length) {
     try {
       const match = ftsTerms.map((t) => `"${t.replace(/"/g, '""')}"`).join(' OR ');
+      // 参数顺序：MATCH 的短语串在前，user_id 在最后
+      const params = [match];
+      if (userId != null) params.push(userId);
       const rows = db
         .prepare(
           `SELECT events_fts.rowid AS id
              FROM events_fts
              JOIN events ON events.id = events_fts.rowid
-            WHERE events_fts MATCH ? AND events.deleted = 0
+            WHERE events_fts MATCH ? AND events.deleted = 0${userScopeSql('events', userId)}
             LIMIT ${ROUTE_LIMIT}`,
         )
-        .all(match);
+        .all(...params);
       return rows.map((row) => Number(row.id)).filter((id) => Number.isFinite(id));
     } catch {
       /* 落回 LIKE 兜底 */
@@ -182,11 +222,12 @@ function ftsCandidates(db, query) {
   // LIKE 兜底：任一词命中即可（OR），避免把 "项目 部署" 拼成不存在的长串
   const where = terms.map(() => "content LIKE ? ESCAPE '\\'").join(' OR ');
   const params = terms.map((t) => `%${escapeLike(t)}%`);
+  if (userId != null) params.push(userId); // 追加在词参数之后，占位符顺序一致
   const rows = db
     .prepare(
       `SELECT id
          FROM events
-        WHERE deleted = 0 AND (${where})
+        WHERE deleted = 0 AND (${where})${userScopeSql('events', userId)}
         ORDER BY ts DESC
         LIMIT ${ROUTE_LIMIT}`,
     )
@@ -197,8 +238,9 @@ function ftsCandidates(db, query) {
 /**
  * b) 实体命中：entities.name 或 aliases 包含查询词，且该实体出现在 event_entities 中。
  * LIKE 只做粗筛——aliases 是 JSON 文本，还要逐项确认，避免被 JSON 的括号/逗号误命中。
+ * 实体表本身不分用户（人名/群名共享），但只召回当前用户可见的事件。
  */
-function entityCandidates(db, terms) {
+function entityCandidates(db, terms, userId) {
   if (!terms.length) return [];
 
   const entityIds = new Set();
@@ -227,18 +269,21 @@ function entityCandidates(db, terms) {
 
   const ids = [...entityIds].slice(0, MAX_ENTITY_IDS);
   const placeholders = ids.map(() => '?').join(',');
+  // 参数顺序：先实体 id 列表，再 user_id
+  const params = [...ids];
+  if (userId != null) params.push(userId);
   // 一个实体可能挂很多事件，按最近优先取 20 条；GROUP BY 去掉同事件的多角色重复行
   const rows = db
     .prepare(
       `SELECT ee.event_id AS id, MAX(e.ts) AS last_ts
          FROM event_entities ee
          JOIN events e ON e.id = ee.event_id
-        WHERE ee.entity_id IN (${placeholders}) AND e.deleted = 0
+        WHERE ee.entity_id IN (${placeholders}) AND e.deleted = 0${userScopeSql('e', userId)}
         GROUP BY ee.event_id
         ORDER BY last_ts DESC
         LIMIT ${ROUTE_LIMIT}`,
     )
-    .all(...ids);
+    .all(...params);
   return rows.map((row) => Number(row.id)).filter((id) => Number.isFinite(id));
 }
 
@@ -246,16 +291,19 @@ function entityCandidates(db, terms) {
  * c) 时间窗：context 给了范围就用范围，否则最近 30 天。
  * 它提供的是"候选池"而不是答案：这些事件是否有相关性，由打分阶段按 query 词命中决定。
  */
-function windowCandidates(db, range) {
+function windowCandidates(db, range, userId) {
+  // 参数顺序：since、until，然后 user_id
+  const params = [new Date(range.sinceMs).toISOString(), new Date(range.untilMs).toISOString()];
+  if (userId != null) params.push(userId);
   const rows = db
     .prepare(
       `SELECT id
          FROM events
-        WHERE deleted = 0 AND ts >= ? AND ts <= ?
+        WHERE deleted = 0 AND ts >= ? AND ts <= ?${userScopeSql('events', userId)}
         ORDER BY ts DESC
         LIMIT ${ROUTE_LIMIT}`,
     )
-    .all(new Date(range.sinceMs).toISOString(), new Date(range.untilMs).toISOString());
+    .all(...params);
   return rows.map((row) => Number(row.id)).filter((id) => Number.isFinite(id));
 }
 
@@ -263,18 +311,25 @@ function windowCandidates(db, range) {
 // 候选装载：事件行 + 关联实体名（实体名参与 likeRatio，也供精排用）
 // ---------------------------------------------------------------------------
 
-function loadEvents(db, ids) {
+/**
+ * 装载事件行：候选已经在各自 SQL 里按 user_id 过滤过，这里再兜一次底，
+ * 防止以后新增候选路由时漏了过滤而把别人的事件带出来。
+ */
+function loadEvents(db, ids, userId) {
   const byId = new Map();
   if (!ids.length) return byId;
   const placeholders = ids.map(() => '?').join(',');
+  // 参数顺序：id 列表，然后 user_id
+  const params = [...ids];
+  if (userId != null) params.push(userId);
   const rows = db
     .prepare(
       `SELECT id, ts, channel, group_id, speaker_id, speaker_name, kind,
-              content, evidence, confidence, salience
+              content, evidence, confidence, salience, user_id
          FROM events
-        WHERE id IN (${placeholders}) AND deleted = 0`,
+        WHERE id IN (${placeholders}) AND deleted = 0${userScopeSql('events', userId)}`,
     )
-    .all(...ids);
+    .all(...params);
   for (const row of rows) byId.set(Number(row.id), row);
   return byId;
 }
@@ -485,6 +540,8 @@ function emptyResult(query, budget, reranked) {
  * @param {string} [options.query]    检索词/问句
  * @param {object} [options.context]  可选时间范围：{since, until} / {timeRange:{start,end}} 等
  * @param {object} [options.budget]   {maxItems, maxTokens}，最终由 budget.clampBudget 夹住
+ * @param {number|null} [options.userId] 归属用户：整数 → 只看"自己 + 共享(user_id IS NULL)"；
+ *                                   null/缺省 → 不过滤（兼容旧行为）。非法值抛 TypeError。
  * @param {number|string|Date} [options.now] 参考"现在"（便于测试回放历史时间）
  * @returns {object} {items, used, budget, truncated, query, reranked, candidates, debug}
  */
@@ -493,6 +550,7 @@ function search(db, options = {}) {
     throw new TypeError('search(db, options): db 必须是 open() 返回的 DatabaseSync');
   }
 
+  const userId = readUserId(options.userId);
   const rawQuery = typeof options.query === 'string' ? options.query : String(options.query == null ? '' : options.query);
   const nowMs = toMs(options.now) ?? Date.now();
   const normalizedQuery = normalize(rawQuery).text;
@@ -522,14 +580,14 @@ function search(db, options = {}) {
     }
   };
 
-  addRoute(ftsCandidates(db, normalizedQuery), 'fts');
-  addRoute(entityCandidates(db, terms), 'entity');
-  addRoute(windowCandidates(db, range), 'window');
+  addRoute(ftsCandidates(db, normalizedQuery, userId), 'fts');
+  addRoute(entityCandidates(db, terms, userId), 'entity');
+  addRoute(windowCandidates(db, range, userId), 'window');
 
   if (!pool.size) return emptyResult(rawQuery, budget, recallQuestion);
 
-  // ---- 2) 装载事件行与关联实体名（deleted 在这里再兜一次底） --------------------
-  const rowsById = loadEvents(db, [...pool.keys()]);
+  // ---- 2) 装载事件行与关联实体名（deleted / user_id 在这里再兜一次底） ----------
+  const rowsById = loadEvents(db, [...pool.keys()], userId);
   const entityNamesById = loadEntityNames(db, [...rowsById.keys()]);
 
   const scored = [];
@@ -578,6 +636,7 @@ function search(db, options = {}) {
       kind: candidate.row.kind,
       content: candidate.row.content, // pack 的 textOf 用它，打包后替换为截断后的 text
       evidence: candidate.row.evidence,
+      user_id: candidate.row.user_id == null ? null : Number(candidate.row.user_id),
       score: round(candidate.total, 4),
       confidence: round(candidate.confidence, 4),
       salience: candidate.salience,

@@ -16,6 +16,13 @@
     <div class="topbar-right">
       <button id="mem" class="ghost" title="查看记忆与人格">记忆</button>
       <button id="clear" class="ghost" title="清空当前对话">清空</button>
+      <div class="user-area">
+        <button id="loginBtn" class="ghost" title="登录或注册">登录</button>
+        <div id="userBox" class="user-box hidden">
+          <span id="userName" class="user-name"></span>
+          <button id="logoutBtn" class="ghost" title="退出登录">退出</button>
+        </div>
+      </div>
       <div id="status" class="status offline">
         <span class="dot"></span>
         <span id="statusText">检查中…</span>
@@ -58,6 +65,32 @@
       <button id="send" class="primary">发送</button>
     </div>
   </footer>
+
+  <!-- 登录/注册浮层：未登录时盖住整个面板，不能跳过 -->
+  <div id="authOverlay" class="auth-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="authTitle" aria-hidden="true">
+    <form id="authForm" class="auth-card" autocomplete="on">
+      <h2 id="authTitle">登录</h2>
+      <p id="authSub" class="auth-sub">登录后才能和核心对话。</p>
+      <label class="auth-field">
+        <span>用户名</span>
+        <input id="authUsername" name="username" autocomplete="username" spellcheck="false" required>
+      </label>
+      <label class="auth-field">
+        <span>密码</span>
+        <input id="authPassword" name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <label id="authDisplayRow" class="auth-field hidden">
+        <span>显示名（可留空）</span>
+        <input id="authDisplayName" name="displayName" autocomplete="nickname" maxlength="32">
+      </label>
+      <div id="authError" class="auth-error hidden" role="alert"></div>
+      <button id="authSubmit" class="primary" type="submit">登录</button>
+      <div class="auth-switch">
+        <span id="authSwitchHint">还没有账号？</span>
+        <button id="authSwitch" class="link" type="button">注册一个</button>
+      </div>
+    </form>
+  </div>
 
   <script src="/vendor/marked.min.js"></script>
   <script src="/vendor/purify.min.js"></script>

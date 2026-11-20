@@ -9,6 +9,7 @@
       "evidence": { "type": "string", "description": "source:locator" },
       "kind": { "enum": ["msg", "video", "action", "commitment"], "default": "msg" },
       "speaker": { "type": "string" },
+      "user_id": { "type": ["integer", "null"], "description": "Owner user id. Omit or null = shared memory visible to every user." },
       "salience": { "type": "integer", "minimum": 0, "maximum": 100 }
     }
   }

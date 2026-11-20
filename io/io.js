@@ -76,6 +76,42 @@ async function postJson(url, body, timeoutMs = 8000) {
 }
 
 /** 记忆库快照（只读）；服务不可用时返回 null。 */
+const SEPARATOR_URL = process.env.DSH_SEPARATOR_URL || 'http://127.0.0.1:8768';
+
+/** 用分隔模块校验 token，返回 {user, profile} 或 null。 */
+async function verifyUser(authorization) {
+  if (!authorization) return null;
+  try {
+    const res = await fetch(SEPARATOR_URL + '/v1/auth/me', {
+      headers: { authorization },
+      signal: AbortSignal.timeout(3000),
+    });
+    const data = await res.json();
+    return data && data.ok ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 每人的相处档案：大肥鱼人格共享，但对不同人态度不同。 */
+function userBlock(session) {
+  if (!session || !session.user) return null;
+  const user = session.user;
+  const p = session.profile || {};
+  const lines = ['[当前用户]'];
+  lines.push('名字：' + (user.displayName || user.username));
+  if (p.callMe) lines.push('称呼他：' + p.callMe);
+  lines.push('关系：' + (p.relationship || 'friend'));
+  if (p.toneNote) lines.push('相处说明：' + p.toneNote);
+  const traits = p.traits || {};
+  const keys = Object.keys(traits);
+  if (keys.length) {
+    lines.push('对他的态度基准：' + keys.map((k) => k + ' ' + traits[k]).join('、'));
+  }
+  lines.push('（人格与说话方式照旧，但亲近程度、语气按上面这段来）');
+  return lines.join('\n');
+}
+
 async function memoryStats() {
   try {
     const res = await fetch(`${MEMORY_URL}/v1/stats`, { signal: AbortSignal.timeout(3000) });
@@ -169,7 +205,7 @@ function registryBlock(options = {}) {
 }
 
 /** 把人格块、对话上下文、当前消息按固定顺序拼成 prompt。 */
-function composePrompt({ catalog, persona, history, task }) {
+function composePrompt({ catalog, persona, user, history, task }) {
   const sections = [];
 
   if (catalog) sections.push(catalog);
@@ -177,6 +213,7 @@ function composePrompt({ catalog, persona, history, task }) {
   if (persona) {
     sections.push('[人格设定 · 这是你的身份与行为准则，优先遵守]', persona);
   }
+  if (user) sections.push(user);
   if (Array.isArray(history) && history.length) {
     const lines = ['[最近对话 · 用于理解指代与言外之意]'];
     for (const turn of history.slice(-8)) {
@@ -194,6 +231,7 @@ function composePrompt({ catalog, persona, history, task }) {
 async function recordTurn(task, answer, options = {}) {
   if (!memoryEnabled(options) || options.record === false) return;
   const sessionId = options.sessionId || 'adhoc';
+  const userId = options.userId == null ? null : Number(options.userId);
   const stamp = Date.now();
   const events = [
     {
@@ -205,6 +243,7 @@ async function recordTurn(task, answer, options = {}) {
       speaker_name: '用户',
       kind: 'msg',
       confidence: 0.9,
+      user_id: userId,
     },
   ];
   if (answer && String(answer).trim()) {
@@ -217,6 +256,7 @@ async function recordTurn(task, answer, options = {}) {
       speaker_name: 'DSH',
       kind: 'msg',
       confidence: 0.8,
+      user_id: userId,
     });
   }
 
@@ -284,11 +324,14 @@ async function run(task, options = {}) {
     };
   }
 
+  const session = options.session || null;
+  const userCtx = userBlock(session);
   const persona = await personaBlock(options);
   const catalog = registryBlock(options);
   const promptText = composePrompt({
     catalog,
     persona,
+    user: userCtx,
     history: options.history,
     task,
   });
@@ -297,7 +340,11 @@ async function run(task, options = {}) {
   const turnStartedAt = new Date().toISOString();
   const beforeStats = await memoryStats();
   const args = [p.bin, '--profile', 'headless', promptText];
-  const env = Object.assign({}, process.env, { DSH_HOME: p.home });
+  const env = Object.assign({}, process.env, {
+    DSH_HOME: p.home,
+    DSH_USER_ID: session && session.user ? String(session.user.id) : '',
+    DSH_USER_NAME: session && session.user ? String(session.user.displayName || session.user.username) : '',
+  });
 
   const result = await new Promise((resolve) => {
     let settled = false;
@@ -372,7 +419,7 @@ async function run(task, options = {}) {
 
   // 落事件后再统计增量，保证 usage 里能看到这一轮写了什么（多花约 15ms）
   try {
-    await recordTurn(task, result.answer, options);
+    await recordTurn(task, result.answer, Object.assign({}, options, { userId: session && session.user ? session.user.id : null }));
   } catch {
     /* 记忆不可用不影响对话 */
   }
@@ -484,4 +531,4 @@ if (require.main === module) {
   main(process.argv.slice(2)).then((code) => process.exit(code));
 }
 
-module.exports = { run, coreStatus, resolveCore, parseStream, IO_DIR, MEMORY_URL, registryBlock, composePrompt };
+module.exports = { run, coreStatus, resolveCore, parseStream, IO_DIR, MEMORY_URL, SEPARATOR_URL, registryBlock, composePrompt, verifyUser, userBlock };

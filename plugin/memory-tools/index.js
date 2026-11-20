@@ -17,6 +17,8 @@ export const inject = ['tools'];
 const DEFAULT_MEMORY_URL = process.env.DSH_MEMORY_URL || 'http://127.0.0.1:8767';
 const DEFAULT_REGISTRY_DIR = process.env.DSH_REGISTRY_DIR || 'C:\\Apps\\DSH-MultiTool\\registry';
 const DEFAULT_NODE = process.env.DSH_NODE || 'C:\\Apps\\DSH-MultiTool\\core\\runtime\\node\\node.exe';
+// 由 io 在每次派生子进程时注入：记忆读写必须落在当前用户名下
+const CURRENT_USER_ID = process.env.DSH_USER_ID ? Number(process.env.DSH_USER_ID) : null;
 
 async function postJson(url, body, timeoutMs = 15000) {
   const controller = new AbortController();
@@ -70,6 +72,7 @@ export function apply(ctx, config) {
     async execute(args) {
       const { data } = await postJson(`${memoryUrl}/v1/tools/memory_search`, {
         query: String(args.query || ''),
+        user_id: CURRENT_USER_ID,
         budget: {
           max_items: args.max_items || 8,
           max_tokens: args.max_tokens || 1200,
@@ -104,6 +107,7 @@ export function apply(ctx, config) {
       const { data } = await postJson(`${memoryUrl}/v1/tools/memory_remember`, {
         content: String(args.content || ''),
         evidence: String(args.evidence || ''),
+        user_id: CURRENT_USER_ID,
         kind: args.kind || 'msg',
         speaker_name: args.speaker,
         salience: args.salience,

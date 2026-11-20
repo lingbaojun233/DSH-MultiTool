@@ -24,6 +24,7 @@ core（dsh --profile headless "<task>"）──► 模型 + 工具
 ├── io\         IO 模块：与核心交互的唯一通道（127.0.0.1:8765）
 ├── panel\      面板：文本输入输出界面，反代 io（127.0.0.1:8766）
 ├── memory\     记忆：跨会话事件/事实/人格（127.0.0.1:8767，SQLite + FTS5）
+├── separator\  分隔模块：注册/登录/会话 + 每人一份相处档案（127.0.0.1:8768）
 ├── registry\   模块注册表：目录常驻、用法懒加载
 ├── data\       运行时数据（记忆库、面板历史、审计；模块外，部署不覆盖）
 └── logs\       服务日志（模块外）
@@ -68,6 +69,23 @@ DSH-MultiTool/
 | memory | 事件 + 事实 + 人格；双预算召回；每日巩固 | 10 万条下 p95 **0.7 ms**，冷启动 11 ms，验收 7/7 |
 | registry | 模块目录常驻、README 懒加载、触发测试 | 验收 11/11，触发测试 30/30 |
 | plugin | 把记忆与模块读取注册成 DSH 原生工具 | 已装入 headless profile，模型实测会调用 |
+| separator | 多用户身份与会话，每人一份相处档案 | 注册/登录/鉴权实测；记忆按 user_id 隔离 |
+
+### 多用户（分隔模块）
+
+```text
+浏览器 ──登录──► separator(8768) ──token──► panel(8766) ──Bearer──► io(8765)
+                                                              │
+                                       ┌──────────────────────┴───────────────┐
+                                       ▼                                      ▼
+                              人格共享（宪法/traits）              记忆按 user_id 隔离
+                              按档案调整语气/称呼                    共享记忆(NULL)对所有人可见
+```
+
+- 注册/登录后 token 存浏览器，所有对话请求带 `Authorization: Bearer`；io 与面板都会拒绝无 token 调用。
+- 大肥鱼本体共享：宪法、traits、自传只有一份；**每人一份** `relationship / callMe / toneNote / traits 覆盖` 决定态度差异。
+- 记忆写入带 `user_id`；检索只返回「自己的 + 共享的」。
+- 迁移前的存量记忆 `user_id` 为 NULL，**对所有用户可见**（历史数据默认共享）。
 
 服务器上的计划任务：`DSH-MultiTool IO`、`DSH-MultiTool Panel`、`DSH-MultiTool Memory`（均开机自启，SYSTEM）、
 `DSH-MultiTool Memory Nightly`（每日 03:00）。

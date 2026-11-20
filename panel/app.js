@@ -11,6 +11,24 @@ const memBtn = document.getElementById('mem');
 const drawer = document.getElementById('drawer');
 const drawerClose = document.getElementById('drawerClose');
 
+const loginBtn = document.getElementById('loginBtn');
+const logoutBtn = document.getElementById('logoutBtn');
+const userBox = document.getElementById('userBox');
+const userName = document.getElementById('userName');
+
+const authOverlay = document.getElementById('authOverlay');
+const authForm = document.getElementById('authForm');
+const authTitle = document.getElementById('authTitle');
+const authSub = document.getElementById('authSub');
+const authUsername = document.getElementById('authUsername');
+const authPassword = document.getElementById('authPassword');
+const authDisplayRow = document.getElementById('authDisplayRow');
+const authDisplayName = document.getElementById('authDisplayName');
+const authError = document.getElementById('authError');
+const authSubmit = document.getElementById('authSubmit');
+const authSwitch = document.getElementById('authSwitch');
+const authSwitchHint = document.getElementById('authSwitchHint');
+
 const hasMarkdown = typeof window.marked !== 'undefined' && typeof window.DOMPurify !== 'undefined';
 
 if (hasMarkdown) {
@@ -42,6 +60,175 @@ function getSessionId() {
   return id;
 }
 
+// ---- 用户态：token、请求头、登录/注册浮层 ----------------------------------
+
+const TOKEN_KEY = 'dsh-panel-token';
+
+function readToken() {
+  try {
+    return window.localStorage.getItem(TOKEN_KEY) || '';
+  } catch (err) {
+    return '';
+  }
+}
+
+function saveToken(token) {
+  try {
+    window.localStorage.setItem(TOKEN_KEY, token);
+  } catch (err) {
+    /* 隐私模式下存不住，本次打开仍然可用 */
+  }
+}
+
+function clearToken() {
+  try {
+    window.localStorage.removeItem(TOKEN_KEY);
+  } catch (err) {
+    /* 忽略 */
+  }
+}
+
+let authToken = readToken();
+let currentUser = null;
+let authMode = 'login';
+let authBusy = false;
+
+/** 所有走面板后端的请求都带上 Bearer；没登录时不带，让服务端回 401。 */
+function authHeaders(extra) {
+  const headers = Object.assign({}, extra || {});
+  if (authToken) headers.authorization = `Bearer ${authToken}`;
+  return headers;
+}
+
+async function apiFetch(url, options) {
+  const opts = Object.assign({ cache: 'no-store' }, options || {});
+  opts.headers = authHeaders(opts.headers);
+  return fetch(url, opts);
+}
+
+/** 取 JSON；401 统一按「会话过期」处理，返回 null 让调用方安静退出。 */
+async function apiJson(url, options) {
+  const res = await apiFetch(url, options);
+  if (res.status === 401) {
+    handleUnauthorized('会话过期，请重新登录');
+    return null;
+  }
+  if (!res.ok) return null;
+  return res.json().catch(() => null);
+}
+
+function setAuthError(text) {
+  authError.textContent = text || '';
+  authError.classList.toggle('hidden', !text);
+}
+
+function setLocked(locked) {
+  inputEl.disabled = locked;
+  memBtn.disabled = locked;
+  clearBtn.disabled = locked;
+  inputEl.placeholder = locked ? '请先登录后再输入…' : '输入内容…';
+  sendBtn.disabled = locked || busy;
+}
+
+/** 顶栏用户区：未登录显示「登录」，登录后显示显示名 +「退出」。 */
+function renderUser() {
+  const logged = Boolean(currentUser);
+  loginBtn.classList.toggle('hidden', logged);
+  userBox.classList.toggle('hidden', !logged);
+  if (logged) {
+    userName.textContent = currentUser.displayName || currentUser.username || '';
+    userName.title = currentUser.username ? `@${currentUser.username}` : '';
+  } else {
+    userName.textContent = '';
+    userName.title = '';
+  }
+  setLocked(!logged);
+}
+
+/** 打开登录/注册浮层；mode 只认 'login' / 'register'。 */
+function showAuth(mode, message) {
+  authMode = mode === 'register' ? 'register' : 'login';
+  const register = authMode === 'register';
+
+  authTitle.textContent = register ? '注册' : '登录';
+  authSub.textContent = register
+    ? '注册后会为大肥鱼建立一份只属于你的相处档案。'
+    : '登录后才能和核心对话。';
+  authSubmit.textContent = register ? '注册并登录' : '登录';
+  authSwitchHint.textContent = register ? '已经有账号？' : '还没有账号？';
+  authSwitch.textContent = register ? '去登录' : '注册一个';
+
+  authDisplayRow.classList.toggle('hidden', !register);
+  authPassword.autocomplete = register ? 'new-password' : 'current-password';
+  if (register) authPassword.setAttribute('minlength', '6');
+  else authPassword.removeAttribute('minlength');
+
+  setAuthError(message || '');
+  authOverlay.classList.remove('hidden');
+  authOverlay.setAttribute('aria-hidden', 'false');
+  document.body.classList.add('authing');
+  drawer.classList.add('hidden');
+  authUsername.focus();
+}
+
+function hideAuth() {
+  authOverlay.classList.add('hidden');
+  authOverlay.setAttribute('aria-hidden', 'true');
+  document.body.classList.remove('authing');
+  setAuthError('');
+  authPassword.value = '';
+}
+
+/** 收到 401：清本地 token、锁住输入、弹登录层。 */
+function handleUnauthorized(message) {
+  clearToken();
+  authToken = '';
+  currentUser = null;
+  recentTurns.length = 0;
+  renderUser();
+  showAuth('login', message || '会话过期，请重新登录');
+}
+
+/** 登录/注册成功后进入用户态。 */
+function enterSession(data) {
+  saveToken(data.token);
+  authToken = data.token;
+  currentUser = data.user || null;
+  authDisplayName.value = '';
+  renderUser();
+  hideAuth();
+  refreshHealth();
+  loadHistory();
+  if (currentUser) inputEl.focus();
+}
+
+async function logout() {
+  const token = authToken;
+  if (!token) {
+    handleUnauthorized('');
+    return;
+  }
+  try {
+    // 让服务端把这条会话删掉，再清本地；网络失败也照样退出
+    await fetch('/api/auth/logout', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      cache: 'no-store',
+    });
+  } catch (err) {
+    /* 忽略：本地退出不受影响 */
+  }
+  clearToken();
+  authToken = '';
+  currentUser = null;
+  recentTurns.length = 0;
+  renderUser();
+  showEmpty();
+  showAuth('login', '');
+}
+
+// ---- 状态与渲染 ------------------------------------------------------------
+
 function setStatus(kind, text) {
   statusEl.className = `status ${kind}`;
   statusText.textContent = text;
@@ -61,7 +248,6 @@ function renderMarkdown(text) {
   }
 }
 
-/** 把 io 返回的 usage 变成一句人话：用了多少记忆、写了什么。 */
 /** 把 io 返回的 usage 变成一句人话：用了多少记忆、写了什么。 */
 function usageNote(usage) {
   if (!usage) return '';
@@ -135,8 +321,8 @@ function showEmpty() {
  */
 async function loadHistory() {
   try {
-    const res = await fetch('/api/history?limit=200', { cache: 'no-store' });
-    const data = await res.json();
+    const data = await apiJson('/api/history?limit=200');
+    if (!data) return;
     const messages = Array.isArray(data.messages) ? data.messages : [];
     if (!messages.length) return;
 
@@ -178,6 +364,10 @@ async function refreshHealth() {
 async function send() {
   const text = inputEl.value.trim();
   if (!text || busy) return;
+  if (!currentUser) {
+    showAuth('login', '请先登录');
+    return;
+  }
 
   busy = true;
   sendBtn.disabled = true;
@@ -193,11 +383,20 @@ async function send() {
   const started = performance.now();
 
   try {
-    const res = await fetch('/api/input', {
+    const res = await apiFetch('/api/input', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ text, sessionId: getSessionId(), history }),
     });
+
+    if (res.status === 401) {
+      pending.remove();
+      // 这轮没送到核心，别留在上下文里
+      if (recentTurns.length && recentTurns[recentTurns.length - 1].text === text) recentTurns.pop();
+      handleUnauthorized('会话过期，请重新登录');
+      return;
+    }
+
     const data = await res.json().catch(() => ({ ok: false, error: '无法解析响应' }));
     pending.remove();
 
@@ -215,9 +414,9 @@ async function send() {
     addMessage('error', String(err && err.message ? err.message : err));
   } finally {
     busy = false;
-    sendBtn.disabled = false;
+    sendBtn.disabled = !currentUser;
     refreshHealth();
-    inputEl.focus();
+    if (currentUser) inputEl.focus();
   }
 }
 
@@ -231,7 +430,7 @@ sendBtn.addEventListener('click', send);
 clearBtn.addEventListener('click', async () => {
   if (!window.confirm('清空历史记录？清空后刷新也不会恢复。')) return;
   try {
-    await fetch('/api/history', { method: 'DELETE' });
+    await apiFetch('/api/history', { method: 'DELETE' });
   } catch (err) {
     /* nothing to do */
   }
@@ -255,8 +454,10 @@ function escapeHtml(value) {
 
 /** 抽屉：人格 + 记忆库统计 + 最近事件。打开时现拉，不常驻轮询。 */
 async function loadDrawer() {
+  if (!currentUser) return;
+
   try {
-    const p = await (await fetch('/api/persona', { cache: 'no-store' })).json();
+    const p = await apiJson('/api/persona');
     if (p && p.ok) {
       document.getElementById('personaVersion').textContent = 'v' + p.version;
       const traits = p.traits || {};
@@ -269,8 +470,9 @@ async function loadDrawer() {
     /* 记忆服务可能没起 */
   }
 
+  if (!currentUser) return;
   try {
-    const s = await (await fetch('/api/memory/stats', { cache: 'no-store' })).json();
+    const s = await apiJson('/api/memory/stats');
     if (s && s.ok) {
       const c = s.counts || {};
       const rows = [
@@ -285,8 +487,9 @@ async function loadDrawer() {
     /* 忽略 */
   }
 
+  if (!currentUser) return;
   try {
-    const e = await (await fetch('/api/memory/events?limit=20', { cache: 'no-store' })).json();
+    const e = await apiJson('/api/memory/events?limit=20');
     if (e && e.ok) {
       const list = (e.events || []).slice().reverse();
       document.getElementById('memEvents').innerHTML = list
@@ -300,11 +503,116 @@ async function loadDrawer() {
 }
 
 memBtn.addEventListener('click', () => {
+  if (!currentUser) {
+    showAuth('login', '请先登录');
+    return;
+  }
   drawer.classList.remove('hidden');
   loadDrawer();
 });
 drawerClose.addEventListener('click', () => drawer.classList.add('hidden'));
-refreshHealth();
+
+// ---- 登录/注册/退出交互 ----------------------------------------------------
+
+loginBtn.addEventListener('click', () => showAuth('login', ''));
+logoutBtn.addEventListener('click', logout);
+
+authSwitch.addEventListener('click', () => {
+  showAuth(authMode === 'register' ? 'login' : 'register', '');
+});
+
+authForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (authBusy) return;
+
+  const username = authUsername.value.trim();
+  const password = authPassword.value;
+  const displayName = authDisplayName.value.trim();
+
+  if (!username || !password) {
+    setAuthError('请填写用户名和密码');
+    return;
+  }
+  if (authMode === 'register' && password.length < 6) {
+    setAuthError('密码至少 6 位');
+    return;
+  }
+
+  const register = authMode === 'register';
+  authBusy = true;
+  authSubmit.disabled = true;
+  authSwitch.disabled = true;
+  authSubmit.textContent = register ? '注册中…' : '登录中…';
+  setAuthError('');
+
+  try {
+    // 登录/注册本身不需要旧 token，直接请求，避免过期 token 干扰
+    const res = await fetch(register ? '/api/auth/register' : '/api/auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(register ? { username, password, displayName } : { username, password }),
+      cache: 'no-store',
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      setAuthError(data.message || data.error || `请求失败（HTTP ${res.status}）`);
+      return;
+    }
+    enterSession(data);
+  } catch (err) {
+    setAuthError('连接失败：' + (err && err.message ? err.message : err));
+  } finally {
+    authBusy = false;
+    authSubmit.disabled = false;
+    authSwitch.disabled = false;
+    authSubmit.textContent = authMode === 'register' ? '注册并登录' : '登录';
+  }
+});
+
+// ---- 启动 ------------------------------------------------------------------
+
+/** 启动时用 token 校验会话；无效就锁住输入并弹登录层。 */
+async function boot() {
+  renderUser();
+  refreshHealth();
+
+  if (!authToken) {
+    showAuth('login', '');
+    return;
+  }
+
+  let user = null;
+  let rejected = false;
+  try {
+    const res = await fetch('/api/auth/me', {
+      headers: { authorization: `Bearer ${authToken}` },
+      cache: 'no-store',
+    });
+    if (res.ok) {
+      const data = await res.json().catch(() => null);
+      if (data && data.ok && data.user) user = data.user;
+    } else if (res.status === 401) {
+      rejected = true;
+    }
+  } catch (err) {
+    /* 账号服务没起：按未登录处理，但提示连接问题 */
+  }
+
+  if (!user) {
+    clearToken();
+    authToken = '';
+    currentUser = null;
+    renderUser();
+    showAuth('login', rejected ? '会话过期，请重新登录' : '无法连接账号服务，请登录');
+    return;
+  }
+
+  currentUser = user;
+  renderUser();
+  hideAuth();
+  await loadHistory();
+  inputEl.focus();
+}
+
 setInterval(refreshHealth, 15000);
-loadHistory();
-inputEl.focus();
+boot();
