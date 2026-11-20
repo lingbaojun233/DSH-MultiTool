@@ -54,8 +54,25 @@ ssh -N -L 8766:127.0.0.1:8766 fish-server     # 保持这个窗口
 - 页面打不开或显示"连接断开"：本机隧道没起来，重跑 `open-panel.cmd`；确认 `ssh fish-server whoami` 可用。
 - 面板进程本身：`Get-Process node`，或看 `panel\service.log` 的最后几行。
 
+## 对话历史（持久化）
+
+历史存在服务器，**刷新页面、换浏览器、重启面板进程都不会丢**：
+
+```text
+C:\Apps\DSH-MultiTool\data\panel-history.jsonl    每行一条 {role, text, ts, ms?}
+```
+
+放在模块目录之外，所以 `push` 整目录替换也不会清掉它。写入时机：提问时先记 `user`，
+核心返回后记 `assistant`（失败记 `error`）。文件超过 2 MB 且行数 > 1000 时，自动裁剪到最近 800 条。
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /api/history?limit=200` | 读取最近 N 条 |
+| `DELETE /api/history` | 清空（页面右上角"清空"按钮，会二次确认） |
+
 ## 已知限制
 
-- 无多轮上下文：核心当前版本不支持 `--session-id`，每次提问都是独立会话。
+- 无多轮上下文：核心当前版本不支持 `--session-id`，每次提问都是独立会话；
+  历史只是展示层，不会把前文带进下一次请求。
 - 无鉴权：只监听回环，靠 SSH 隧道与登录身份保护；如需对外开放，先在 io 侧设置 `DSH_IO_TOKEN`。
-- 历史不落盘：刷新页面即清空。
+- 历史无上限保护（除 2 MB 裁剪）：长期使用会持续增长，需要时手工删 `data\panel-history.jsonl`。

@@ -35,6 +35,12 @@ function renderMarkdown(text) {
   }
 }
 
+function formatClock(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
 function addMessage(role, text, meta) {
   if (emptyEl && emptyEl.parentNode) emptyEl.remove();
 
@@ -82,6 +88,33 @@ function showEmpty() {
   logEl.appendChild(div);
 }
 
+/**
+ * The server keeps the transcript; a refresh replays it.
+ */
+async function loadHistory() {
+  try {
+    const res = await fetch('/api/history?limit=200', { cache: 'no-store' });
+    const data = await res.json();
+    const messages = Array.isArray(data.messages) ? data.messages : [];
+    if (!messages.length) return;
+
+    logEl.innerHTML = '';
+    for (const m of messages) {
+      if (m.role === 'assistant') {
+        const meta = typeof m.ms === 'number' ? `${(m.ms / 1000).toFixed(1)} 秒 · ${formatClock(m.ts)}` : formatClock(m.ts);
+        addMessage('assistant', m.text || '', meta);
+      } else if (m.role === 'user') {
+        addMessage('user', m.text || '', formatClock(m.ts));
+      } else {
+        addMessage('error', m.text || '（错误）', formatClock(m.ts));
+      }
+    }
+    logEl.scrollTop = logEl.scrollHeight;
+  } catch (err) {
+    /* offline: start with an empty transcript */
+  }
+}
+
 async function refreshHealth() {
   try {
     const res = await fetch('/api/health', { cache: 'no-store' });
@@ -103,7 +136,7 @@ async function send() {
   inputEl.value = '';
   autoGrow();
 
-  addMessage('user', text);
+  addMessage('user', text, formatClock(Date.now()));
   const pending = addPending();
   const started = performance.now();
 
@@ -118,7 +151,7 @@ async function send() {
 
     if (data.ok) {
       const ms = typeof data.ms === 'number' ? data.ms : Math.round(performance.now() - started);
-      addMessage('assistant', data.answer || '（空答案）', `${(ms / 1000).toFixed(1)} 秒`);
+      addMessage('assistant', data.answer || '（空答案）', `${(ms / 1000).toFixed(1)} 秒 · ${formatClock(Date.now())}`);
     } else {
       const detail = data.exitCode != null ? `exit=${data.exitCode}` : '';
       addMessage('error', data.error || data.code || '请求失败', detail);
@@ -140,7 +173,14 @@ function autoGrow() {
 }
 
 sendBtn.addEventListener('click', send);
-clearBtn.addEventListener('click', () => {
+
+clearBtn.addEventListener('click', async () => {
+  if (!window.confirm('清空历史记录？清空后刷新也不会恢复。')) return;
+  try {
+    await fetch('/api/history', { method: 'DELETE' });
+  } catch (err) {
+    /* nothing to do */
+  }
   showEmpty();
   inputEl.focus();
 });
@@ -155,4 +195,5 @@ inputEl.addEventListener('keydown', (event) => {
 
 refreshHealth();
 setInterval(refreshHealth, 15000);
+loadHistory();
 inputEl.focus();
