@@ -56,7 +56,8 @@ switch (command) {
   }
 
   case 'catalog': {
-    const result = render({ root: ROOT });
+    const scopeArg = (argv.find((a) => a.startsWith('--scope=')) || '').split('=')[1] || null;
+    const result = render({ root: ROOT, scope: scopeArg });
     if (asJson) print(result);
     else {
       print(result.text);

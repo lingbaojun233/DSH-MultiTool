@@ -105,7 +105,10 @@ function scanModules(registryRoot) {
     }
     const name = typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : dirName;
     const when = typeof raw.when === 'string' ? raw.when.trim() : '';
-    modules.push({ name, when, dir: dirName });
+    // scope：模块在哪些运行环境可用。local=只在开发机，server=只在服务器，both=都行
+    const scopeRaw = typeof raw.scope === 'string' ? raw.scope.trim().toLowerCase() : 'both';
+    const scope = ['local', 'server', 'both'].includes(scopeRaw) ? scopeRaw : 'both';
+    modules.push({ name, when, dir: dirName, scope });
   }
 
   // 字典序（按 name，同名再按目录）——跨进程稳定
@@ -155,7 +158,13 @@ function render(options) {
 
   const { modules, errors } = scanModules(roots.registryRoot);
 
-  const rows = modules.map((mod) => {
+  // 按运行环境过滤：io 在服务器上跑时传 scope:'server'，只暴露该环境真能用的模块
+  const wantedScope = typeof opts.scope === 'string' ? opts.scope.trim().toLowerCase() : null;
+  const visible = wantedScope
+    ? modules.filter((mod) => mod.scope === 'both' || mod.scope === wantedScope)
+    : modules;
+
+  const rows = visible.map((mod) => {
     const line = mod.when ? `- ${mod.name} — ${mod.when}` : `- ${mod.name} —`;
     return { name: mod.name, when: mod.when, line, tokens: estimateTokens(line) };
   });
@@ -177,7 +186,7 @@ function render(options) {
     text,
     tokens: estimateTokens(text),
     modules: rows.map((row) => ({ name: row.name, when: row.when, tokens: row.tokens })),
-    conflicts: detectConflicts(modules),
+    conflicts: detectConflicts(visible),
     activeLine: ACTIVE_LINE,
     overBudget: offenders.length > 0,
     lineIssues,

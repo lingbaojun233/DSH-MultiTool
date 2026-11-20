@@ -126,7 +126,7 @@ async function personaBlock(options = {}) {
  * 模块目录：常驻、极便宜（每模块一行），只告诉模型"有哪些模块、何时用"。
  * 放在系统提示最前部，内容稳定才能命中前缀缓存。
  */
-let catalogCache = { at: 0, block: null };
+let catalogCache = { at: 0, block: null, modules: [] };
 function registryBlock(options = {}) {
   if (options.registry === false) return null;
   if (Date.now() - catalogCache.at < 60000) return catalogCache.block;
@@ -134,25 +134,55 @@ function registryBlock(options = {}) {
   try {
     const registryDir = path.join(IO_DIR, '..', 'registry');
     const { render } = require(path.join(registryDir, 'lib', 'catalog.js'));
-    const result = render({ root: path.join(registryDir, 'modules') });
+    // io 跑在服务器上：只暴露服务器真正能用的模块（deploy 这类本地工具不出现）
+    const scope = process.env.DSH_REGISTRY_SCOPE || 'server';
+    const result = render({ root: path.join(registryDir, 'modules'), scope });
     const lines = [
-      '[模块目录 · 需要某模块的具体用法时先加载它，不要凭名字猜]',
+      '[模块目录 · 需要某模块的具体用法时，只能用下面的 read 命令加载；不要凭目录猜]',
       result.text,
+      `模块文档：${path.join(registryDir, 'modules')}\\<name>\\README.md`,
       `加载用法：node "${path.join(registryDir, 'cli.js')}" read <name>`,
       result.activeLine || '已激活：无',
     ];
-    catalogCache = { at: Date.now(), block: lines.join('\n') };
+    catalogCache = { at: Date.now(), block: lines.join('\n'), modules: result.modules.map((m) => m.name) };
   } catch {
-    catalogCache = { at: Date.now(), block: null };
+    catalogCache = { at: Date.now(), block: null, modules: [] };
   }
   return catalogCache.block;
 }
 
+/**
+ * 名字命中才预取：用户/模型明确说了模块名时，把它的 README 直接放进上下文。
+ * 不做语义猜测——实测字符二元组打分在 none 与真实模块之间完全不可分。
+ */
+function nameTriggeredUsage(task, options = {}) {
+  if (options.registry === false) return null;
+  const names = catalogCache.modules || [];
+  if (!names.length) return null;
+
+  const text = String(task || '');
+  const hit = names.find((name) => new RegExp(`(^|[^a-z])${name}([^a-z]|$)`, 'i').test(text));
+  if (!hit) return null;
+
+  try {
+    const registryDir = path.join(IO_DIR, '..', 'registry');
+    const loader = require(path.join(registryDir, 'lib', 'loader.js'));
+    const read = loader.read(path.join(registryDir, 'modules'), hit, {
+      sessionKey: options.sessionId || 'adhoc',
+    });
+    if (!read || !read.ok) return null;
+    return { name: hit, block: `[模块用法 · ${hit}]\n${read.content}`, tokens: read.tokens };
+  } catch {
+    return null;
+  }
+}
+
 /** 把人格块、对话上下文、记忆块、当前消息按固定顺序拼成 prompt。 */
-function composePrompt({ catalog, persona, history, memory, task }) {
+function composePrompt({ catalog, usage, persona, history, memory, task }) {
   const sections = [];
 
   if (catalog) sections.push(catalog);
+  if (usage) sections.push(usage);
 
   if (persona) {
     sections.push('[人格设定 · 这是你的身份与行为准则，优先遵守]', persona);
@@ -269,8 +299,10 @@ async function run(task, options = {}) {
 
   const [recall, persona] = await Promise.all([recallFor(task, options), personaBlock(options)]);
   const catalog = registryBlock(options);
+  const usage = nameTriggeredUsage(task, options);
   const promptText = composePrompt({
     catalog,
+    usage: usage ? usage.block : null,
     persona,
     history: options.history,
     memory: recall && recall.block ? recall.block : null,
@@ -422,8 +454,9 @@ async function main(argv) {
 
     const [recall, persona] = await Promise.all([recallFor(task, opts), personaBlock(opts)]);
     const catalog = registryBlock(opts);
+    const usage = nameTriggeredUsage(task, opts);
     process.stdout.write(
-      `${composePrompt({ catalog, persona, history: opts.history, memory: recall && recall.block, task })}\n`,
+      `${composePrompt({ catalog, usage: usage ? usage.block : null, persona, history: opts.history, memory: recall && recall.block, task })}\n`,
     );
     return 0;
   }

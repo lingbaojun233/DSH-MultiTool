@@ -51,8 +51,16 @@ try {
 }
 check('跨进程渲染字节一致', childHash === [...hashes][0], `child=${childHash} parent=${[...hashes][0]}`);
 
-// ---- 2. 新增模块只多一行，工具表不变 --------------------------------------
-// 复制成 <tmp>/registry/modules 的标准形态，否则 resolveRoots 认不出来
+const serverView = render({ root: MODULES, scope: 'server' });
+const localView = render({ root: MODULES, scope: 'local' });
+const serverNames = serverView.modules.map((m) => m.name);
+const localNames = localView.modules.map((m) => m.name);
+check('scope=server 只暴露服务器可用模块', !serverNames.includes('deploy') && serverNames.includes('memory'),
+  `server=${serverNames.join(',')}`);
+check('scope=local 只暴露本地模块', localNames.includes('deploy') && !localNames.includes('memory'),
+  `local=${localNames.join(',')}`);
+
+// ---- 2. 新增模块只多一行，工具表不变 --------------------------------------// 复制成 <tmp>/registry/modules 的标准形态，否则 resolveRoots 认不出来
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'reg-accept-'));
 const tmpModules = path.join(tmpRoot, 'registry', 'modules');
 fs.mkdirSync(tmpModules, { recursive: true });

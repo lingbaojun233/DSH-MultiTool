@@ -35,6 +35,24 @@ node cli.js stats               # 读取次数 / 读了没用的清单
 
 模型侧通过 `node <registry>\cli.js read <name>` 加载用法；目录里只有名字和触发条件。
 
+## 运行环境（scope）
+
+每个模块可声明 `scope: local | server | both`（缺省 both）。io 在服务器上注入目录时传 `scope:'server'`，
+只暴露服务器真能用的模块——`deploy` 是本地工具，不会出现在服务器的目录里。
+
+```powershell
+node cli.js catalog --scope=server   # 服务器视角（memory、panel）
+node cli.js catalog --scope=local    # 开发机视角（deploy）
+```
+
+## 用法预取（实测结论）
+
+| 方式 | 结果 |
+| --- | --- |
+| 指望模型自己调 `read` | **实测 0/30 次调用**，它改为 `ls`/`find` 直接翻文件，还产生"我读过文档了"的幻觉 |
+| 按 `when` 字符二元组打分预取 | **不可行**：`none` 上界 0.04 与 memory 的 0.05 重合，无阈值可分 |
+| **名字命中才预取**（现采用） | 用户/模型明确说出模块名时，直接注入该模块 README，确定性、零误判 |
+
 ## 新增一个模块
 
 1. 建 `modules/<name>/module.yaml`（字段见下）

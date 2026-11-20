@@ -8,3 +8,4 @@ entry:
 cost: 低
 readme: README.md
 version: 0.1.0
+scope: server

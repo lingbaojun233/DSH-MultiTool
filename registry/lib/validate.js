@@ -22,6 +22,7 @@ const NAME_RE = /^[a-z][a-z0-9-]*$/;
 const VERSION_RE = /^\d+\.\d+\.\d+$/;
 const ENTRY_TYPES = ['tool', 'cmd'];
 const COSTS = ['低', '中', '高'];
+const SCOPES = ['local', 'server', 'both'];
 const WHEN_MAX_CHARS = 40;
 const DEFAULT_README = 'README.md';
 
@@ -204,6 +205,17 @@ function validateModule(dir, options) {
     add('E_COST_INVALID', 'cost', `cost 必须是 ${COSTS.join(' / ')}，实际：${show(raw.cost)}`);
   }
 
+  // scope ∈ {local, server, both}（可选；缺省 both）——决定模块出现在哪种运行环境的目录里
+  let scope = 'both';
+  if (raw.scope !== undefined && raw.scope !== null) {
+    const scopeRaw = typeof raw.scope === 'string' ? raw.scope.trim().toLowerCase() : '';
+    if (!SCOPES.includes(scopeRaw)) {
+      add('E_SCOPE_INVALID', 'scope', `scope 必须是 ${SCOPES.join(' / ')}，实际：${show(raw.scope)}`);
+    } else {
+      scope = scopeRaw;
+    }
+  }
+
   // version：\d+\.\d+\.\d+
   const version = typeof raw.version === 'string' ? raw.version.trim() : '';
   if (!VERSION_RE.test(version)) {
@@ -226,6 +238,7 @@ function validateModule(dir, options) {
     not_when: notWhen,
     entry: { type: entryType, name: entryName },
     cost,
+    scope,
     readme,
     version,
     dir: dirAbs,
