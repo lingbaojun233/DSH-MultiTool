@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "memory event (L3)",
+  "type": "object",
+  "required": ["actor", "kind", "text", "evidence"],
+  "additionalProperties": false,
+  "properties": {
+    "actor": { "enum": ["user", "dsh", "system"] },
+    "kind": { "enum": ["message", "action", "observation"] },
+    "text": { "type": "string", "minLength": 1, "maxLength": 4000 },
+    "ts": { "type": "string", "format": "date-time", "description": "省略则取当前时间" },
+    "evidence": {
+      "type": "object",
+      "required": ["source", "locator"],
+      "additionalProperties": false,
+      "properties": {
+        "source": { "type": "string", "minLength": 1, "description": "chat / video / doc / panel ..." },
+        "locator": { "type": "string", "minLength": 1, "description": "group123#msg456、v3@12:30 ..." },
+        "excerpt": { "type": "string", "maxLength": 200 }
+      }
+    },
+    "entities": { "type": "array", "items": { "type": "string" }, "maxItems": 20 },
+    "tags": { "type": "array", "items": { "type": "string" }, "maxItems": 20 },
+    "salience": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.5 },
+    "sessionId": { "type": "string" }
+  }
+}

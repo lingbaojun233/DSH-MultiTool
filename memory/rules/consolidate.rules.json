@@ -1,0 +1,23 @@
+{
+  "_comment": "Consolidation parameters. P1 consumes these; kept here so the policy is data, not code.",
+  "schedule": {
+    "mode": "daily",
+    "at": "03:00",
+    "timezone": "local"
+  },
+  "promotion": {
+    "minSupportingEvents": 2,
+    "requireDistinctEvidenceSources": true
+  },
+  "conflict": {
+    "askUser": true,
+    "timeoutDays": 7,
+    "maxInjectedPerRecall": 2,
+    "autoRule": ["newest_first", "more_evidence", "keep_old"],
+    "autoResolvedReversible": true
+  },
+  "identity": {
+    "maxTokens": 200,
+    "changesRequireUserConfirmation": true
+  }
+}

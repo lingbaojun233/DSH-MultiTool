@@ -1,0 +1,13 @@
+{
+  "name": "@dsh-multitool/memory",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cross-session memory: evidence-gated events, dual-budget recall",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

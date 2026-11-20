@@ -48,6 +48,11 @@ DSH-MultiTool/
 │   ├── index.html / app.js / style.css
 │   ├── start-server.cmd         计划任务入口
 │   └── open-panel.cmd           本地一键启动（隧道 + 浏览器）
+├── memory/
+│   ├── server.js                记忆接口（127.0.0.1:8767）
+│   ├── lib/                     闸门 / 存储 / 索引 / 召回 / token 估算
+│   ├── schema/  rules/          事件 schema、巩固与冲突规则
+│   └── README.md
 └── docs/
 ```
 
@@ -58,6 +63,7 @@ DSH-MultiTool/
 | core | 已部署并验证 | dsh 0.1.1-rc.2 + Node v22.23.5 |
 | io | 已部署、开机自启（SYSTEM 计划任务） | CLI + HTTP 均通过 |
 | panel | 已部署、开机自启（SYSTEM 计划任务） | 本地经 SSH 隧道访问，端到端 3.5 s |
+| memory | 已部署、开机自启（SYSTEM 计划任务），P0 | 证据闸门 + 双预算召回，已实测 |
 
 服务器侧基础设施：OpenSSH Server（仅公钥登录）、WinRM（控制通道）、
 计划任务 `DSH-MultiTool IO`（开机拉起 `io\server.js`）。
