@@ -11,11 +11,17 @@
     <div class="brand">
       DSH-MultiTool
       <span class="slash">/</span>
-      <span class="muted">IO 面板</span>
+      <span class="muted" id="viewTitle">聊天</span>
     </div>
+
+    <nav id="tabs" class="tabs" role="tablist">
+      <button class="tab active" data-view="chat" role="tab" aria-selected="true">聊天</button>
+      <button class="tab" data-view="memory" role="tab" aria-selected="false">记忆</button>
+      <button class="tab" data-view="persona" role="tab" aria-selected="false">人格</button>
+      <button class="tab hidden" data-view="admin" id="tabAdmin" role="tab" aria-selected="false">账号</button>
+    </nav>
+
     <div class="topbar-right">
-      <button id="mem" class="ghost" title="查看记忆与人格">记忆</button>
-      <button id="clear" class="ghost" title="清空当前对话">清空</button>
       <div class="user-area">
         <button id="loginBtn" class="ghost" title="登录或注册">登录</button>
         <div id="userBox" class="user-box hidden">
@@ -30,45 +36,58 @@
     </div>
   </header>
 
-  <aside id="drawer" class="drawer hidden">
-    <div class="drawer-head">
-      <span>记忆与人格</span>
-      <button id="drawerClose" class="ghost">关闭</button>
-    </div>
-    <div class="drawer-body">
-      <section class="card">
-        <h3>人格 <span id="personaVersion" class="muted"></span></h3>
-        <div id="personaTraits" class="traits"></div>
-        <pre id="personaBlock" class="block"></pre>
-      </section>
-      <section class="card">
-        <h3>记忆库</h3>
-        <div id="memStats" class="stats"></div>
-      </section>
-      <section class="card hidden" id="adminCard">
-        <h3>账号管理 <span id="adminCount" class="muted"></span></h3>
-        <ul id="adminUsers" class="events"></ul>
-      </section>
-      <section class="card">
-        <h3>最近事件</h3>
-        <ul id="memEvents" class="events"></ul>
-      </section>
-    </div>
-  </aside>
+  <main class="views">
+    <!-- 聊天：默认栏目 -->
+    <section id="view-chat" class="view active" role="tabpanel">
+      <div id="log" class="log" aria-live="polite">
+        <div class="empty" id="empty">
+          在下面输入一段文本，交给核心处理，答案会显示在这里。
+        </div>
+      </div>
+      <footer class="composer">
+        <textarea id="input" rows="3" placeholder="输入内容…" spellcheck="false"></textarea>
+        <div class="composer-actions">
+          <span class="hint">Ctrl+Enter 发送 · Enter 换行</span>
+          <button id="send" class="primary">发送</button>
+        </div>
+      </footer>
+    </section>
 
-  <main id="log" class="log" aria-live="polite">
-    <div class="empty" id="empty">
-      在下面输入一段文本，交给核心处理，答案会显示在这里。
-    </div>
+    <!-- 记忆：统计 + 最近事件 -->
+    <section id="view-memory" class="view" role="tabpanel">
+      <div class="pane">
+        <section class="card">
+          <h2>记忆库</h2>
+          <div id="memStats" class="stats"></div>
+        </section>
+        <section class="card">
+          <h2>最近事件 <span class="muted">自己的 + 共享的</span></h2>
+          <ul id="memEvents" class="events"></ul>
+        </section>
+      </div>
+    </section>
+
+    <!-- 人格：宪法 + traits -->
+    <section id="view-persona" class="view" role="tabpanel">
+      <div class="pane">
+        <section class="card">
+          <h2>人格 <span id="personaVersion" class="muted"></span></h2>
+          <div id="personaTraits" class="traits"></div>
+          <pre id="personaBlock" class="block"></pre>
+        </section>
+      </div>
+    </section>
+
+    <!-- 账号：仅管理员可见 -->
+    <section id="view-admin" class="view" role="tabpanel">
+      <div class="pane">
+        <section class="card">
+          <h2>账号管理 <span id="adminCount" class="muted"></span></h2>
+          <ul id="adminUsers" class="events"></ul>
+        </section>
+      </div>
+    </section>
   </main>
-
-  <footer class="composer">
-    <textarea id="input" rows="3" placeholder="输入内容…" spellcheck="false"></textarea>
-    <div class="composer-actions">
-      <span class="hint">Ctrl+Enter 发送 · Enter 换行</span>
-      <button id="send" class="primary">发送</button>
-    </div>
-  </footer>
 
   <!-- 登录/注册浮层：未登录时盖住整个面板，不能跳过 -->
   <div id="authOverlay" class="auth-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="authTitle" aria-hidden="true">

@@ -4,12 +4,11 @@ const logEl = document.getElementById('log');
 const emptyEl = document.getElementById('empty');
 const inputEl = document.getElementById('input');
 const sendBtn = document.getElementById('send');
-const clearBtn = document.getElementById('clear');
 const statusEl = document.getElementById('status');
 const statusText = document.getElementById('statusText');
-const memBtn = document.getElementById('mem');
-const drawer = document.getElementById('drawer');
-const drawerClose = document.getElementById('drawerClose');
+const tabsEl = document.getElementById('tabs');
+const viewTitle = document.getElementById('viewTitle');
+const tabAdmin = document.getElementById('tabAdmin');
 
 const loginBtn = document.getElementById('loginBtn');
 const logoutBtn = document.getElementById('logoutBtn');
@@ -124,8 +123,6 @@ function setAuthError(text) {
 
 function setLocked(locked) {
   inputEl.disabled = locked;
-  memBtn.disabled = locked;
-  clearBtn.disabled = locked;
   inputEl.placeholder = locked ? '请先登录后再输入…' : '输入内容…';
   sendBtn.disabled = locked || busy;
 }
@@ -167,7 +164,6 @@ function showAuth(mode, message) {
   authOverlay.classList.remove('hidden');
   authOverlay.setAttribute('aria-hidden', 'false');
   document.body.classList.add('authing');
-  drawer.classList.add('hidden');
   authUsername.focus();
 }
 
@@ -191,13 +187,9 @@ function handleUnauthorized(message) {
 
 /** 管理员面板：列出账号，可删除（不能删自己）。非管理员整块隐藏。 */
 async function loadAdminPanel() {
-  const card = document.getElementById('adminCard');
-  if (!card) return;
-  if (!currentUser || currentUser.role !== 'admin') {
-    card.classList.add('hidden');
-    return;
-  }
-  card.classList.remove('hidden');
+  const isAdmin = Boolean(currentUser) && currentUser.role === 'admin';
+  if (tabAdmin) tabAdmin.classList.toggle('hidden', !isAdmin);
+  if (!isAdmin) return;
   const list = document.getElementById('adminUsers');
   const count = document.getElementById('adminCount');
   try {
@@ -312,7 +304,9 @@ function formatClock(ts) {
 }
 
 function addMessage(role, text, meta) {
-  if (emptyEl && emptyEl.parentNode) emptyEl.remove();
+  // showEmpty() 会重建节点头，这里按选择器找当前节点，避免用失效引用
+  const placeholder = logEl.querySelector('.empty');
+  if (placeholder) placeholder.remove();
 
   const wrap = document.createElement('div');
   wrap.className = `msg ${role}`;
@@ -470,16 +464,6 @@ function autoGrow() {
 
 sendBtn.addEventListener('click', send);
 
-clearBtn.addEventListener('click', async () => {
-  if (!window.confirm('清空历史记录？清空后刷新也不会恢复。')) return;
-  try {
-    await apiFetch('/api/history', { method: 'DELETE' });
-  } catch (err) {
-    /* nothing to do */
-  }
-  showEmpty();
-  inputEl.focus();
-});
 
 inputEl.addEventListener('input', autoGrow);
 inputEl.addEventListener('keydown', (event) => {
@@ -495,10 +479,9 @@ function escapeHtml(value) {
   return div.innerHTML;
 }
 
-/** 抽屉：人格 + 记忆库统计 + 最近事件。打开时现拉，不常驻轮询。 */
-async function loadDrawer() {
+/** 人格栏：宪法 + traits。切到该栏时现拉。 */
+async function loadPersonaView() {
   if (!currentUser) return;
-
   try {
     const p = await apiJson('/api/persona');
     if (p && p.ok) {
@@ -512,7 +495,10 @@ async function loadDrawer() {
   } catch (err) {
     /* 记忆服务可能没起 */
   }
+}
 
+/** 记忆栏：库统计 + 最近事件。 */
+async function loadMemoryView() {
   if (!currentUser) return;
   try {
     const s = await apiJson('/api/memory/stats');
@@ -545,15 +531,31 @@ async function loadDrawer() {
   }
 }
 
-memBtn.addEventListener('click', () => {
+/** 切栏：聊天 / 记忆 / 人格 / 账号。 */
+function setView(name) {
+  document.querySelectorAll('.view').forEach((s) => s.classList.toggle('active', s.id === 'view-' + name));
+  document.querySelectorAll('.tab').forEach((t) => {
+    const on = t.dataset.view === name;
+    t.classList.toggle('active', on);
+    t.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+  const titles = { chat: '聊天', memory: '记忆', persona: '人格', admin: '账号' };
+  if (viewTitle) viewTitle.textContent = titles[name] || '';
+  if (name === 'memory') loadMemoryView();
+  if (name === 'persona') loadPersonaView();
+  if (name === 'admin') loadAdminPanel();
+  if (name === 'chat') inputEl.focus();
+}
+
+tabsEl.addEventListener('click', (event) => {
+  const btn = event.target.closest('.tab');
+  if (!btn || btn.classList.contains('hidden')) return;
   if (!currentUser) {
     showAuth('login', '请先登录');
     return;
   }
-  drawer.classList.remove('hidden');
-  loadDrawer();
+  setView(btn.dataset.view);
 });
-drawerClose.addEventListener('click', () => drawer.classList.add('hidden'));
 
 // ---- 登录/注册/退出交互 ----------------------------------------------------
 
