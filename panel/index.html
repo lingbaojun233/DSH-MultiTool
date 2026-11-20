@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DSH-MultiTool · IO 面板</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      DSH-MultiTool
+      <span class="slash">/</span>
+      <span class="muted">IO 面板</span>
+    </div>
+    <div class="topbar-right">
+      <button id="clear" class="ghost" title="清空当前对话">清空</button>
+      <div id="status" class="status offline">
+        <span class="dot"></span>
+        <span id="statusText">检查中…</span>
+      </div>
+    </div>
+  </header>
+
+  <main id="log" class="log" aria-live="polite">
+    <div class="empty" id="empty">
+      在下面输入一段文本，交给核心处理，答案会显示在这里。
+    </div>
+  </main>
+
+  <footer class="composer">
+    <textarea id="input" rows="3" placeholder="输入内容…" spellcheck="false"></textarea>
+    <div class="composer-actions">
+      <span class="hint">Ctrl+Enter 发送 · Enter 换行</span>
+      <button id="send" class="primary">发送</button>
+    </div>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>

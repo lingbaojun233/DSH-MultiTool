@@ -1,0 +1,61 @@
+# panel —— 文本输入输出面板
+
+给 IO 模块用的最小界面：输入一段文本，看到核心返回的答案。目前只做文本，不做附件、会话、多轮。
+
+## 结构
+
+```text
+panel/
+├── server.js          静态托管 + 反代到 io（127.0.0.1:8766 -> 127.0.0.1:8765）
+├── index.html         页面骨架
+├── app.js             前端逻辑（发送、等待态、错误、健康指示）
+├── style.css          深色主题
+├── start-server.cmd   计划任务入口（开机自启）
+└── open-panel.cmd     本地一键启动器（建隧道 + 开浏览器）
+```
+
+数据流：
+
+```text
+浏览器 -> 127.0.0.1:8766（本机 SSH 隧道）
+       -> 服务器 127.0.0.1:8766（panel server）
+       -> 127.0.0.1:8765（io）
+       -> DSH 核心
+```
+
+面板不直接调核心，只调 io；端口都绑回环，不对外暴露。
+
+## 本地打开
+
+双击 `DSH-MultiTool\panel\open-panel.cmd`：它会检查本机 8766 是否已在监听，没有就后台建
+SSH 隧道（`ssh -N -L 8766:127.0.0.1:8766 fish-server`），然后打开浏览器。
+
+等价的手动方式：
+
+```powershell
+ssh -N -L 8766:127.0.0.1:8766 fish-server     # 保持这个窗口
+# 浏览器打开 http://127.0.0.1:8766
+```
+
+## 开机自启（服务器上已配置）
+
+| 项 | 值 |
+| --- | --- |
+| 任务名 | `DSH-MultiTool Panel` |
+| 触发器 | 开机（AtStartup） |
+| 身份 | `SYSTEM` |
+| 入口 | `start-server.cmd` |
+| 日志 | `panel\service.log` |
+
+## 排错
+
+- 页面打开但状态显示"核心未就绪"：查 io 服务 `Get-ScheduledTaskInfo -TaskName 'DSH-MultiTool IO'`，
+  以及 `io\service.log`。
+- 页面打不开或显示"连接断开"：本机隧道没起来，重跑 `open-panel.cmd`；确认 `ssh fish-server whoami` 可用。
+- 面板进程本身：`Get-Process node`，或看 `panel\service.log` 的最后几行。
+
+## 已知限制
+
+- 无多轮上下文：核心当前版本不支持 `--session-id`，每次提问都是独立会话。
+- 无鉴权：只监听回环，靠 SSH 隧道与登录身份保护；如需对外开放，先在 io 侧设置 `DSH_IO_TOKEN`。
+- 历史不落盘：刷新页面即清空。
