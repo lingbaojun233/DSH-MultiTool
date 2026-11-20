@@ -1,0 +1,128 @@
+# 模块触发测试集：30 条真实中文问法 + 期望模块
+# 字段：
+#   id     唯一编号 q01..q30
+#   text   用户原话（覆盖口语、省略、指代、多意图）
+#   expect memory | deploy | panel | none
+# 分布：memory 10 / deploy 8 / panel 5 / none 7
+# 跑法：node tests/triggers.js [--live] [--limit N] [--json]
+
+cases:
+  - id: q01
+    expect: memory
+    text: 你还记得我上次跟你提的那个小项目叫啥吗？我一时想不起来了。
+
+  - id: q02
+    expect: deploy
+    text: 帮我把这个文件夹传到服务器上去，密码我一会儿发你。
+
+  - id: q03
+    expect: none
+    text: 帮我算一下 17 乘 23 等于多少。
+
+  - id: q04
+    expect: memory
+    text: 我说过不喜欢在回答里用一堆 emoji 吧，你怎么又用了。
+
+  - id: q05
+    expect: panel
+    text: 打开网页面板吧，我想在浏览器里直接跟你聊。
+
+  - id: q06
+    expect: deploy
+    text: 改完了，重新部署一下线上环境吧。
+
+  - id: q07
+    expect: none
+    text: 今天天气怎么样，出门要不要带伞？
+
+  - id: q08
+    expect: memory
+    text: 按我之前定的规矩来，先给结论，再讲理由。
+
+  - id: q09
+    expect: deploy
+    text: 服务器上的 nginx 好像挂了，帮我重启一下。
+
+  - id: q10
+    expect: none
+    text: 帮我看看这个函数为什么报错，我实在看不出问题。
+
+  - id: q11
+    expect: memory
+    text: 帮我回忆一下上回咱们定的目录结构，我记不清了。
+
+  - id: q12
+    expect: panel
+    text: 帮我把刚才那段对话在界面上翻出来看看。
+
+  - id: q13
+    expect: none
+    text: 把这段话翻译成英文，语气别太正式。
+
+  - id: q14
+    expect: deploy
+    text: 把 dist 目录同步到远端那台机器，别漏了静态资源。
+
+  - id: q15
+    expect: memory
+    text: 我上次让你记的那个端口号是多少来着？
+
+  - id: q16
+    expect: panel
+    text: 我想看看之前我们聊过的记录，用面板展示出来。
+
+  - id: q17
+    expect: none
+    text: 帮我 diff 一下这两个文件，看看改了哪些地方。
+
+  - id: q18
+    expect: deploy
+    text: 本地的改动都弄好了，直接发布吧。
+
+  - id: q19
+    expect: memory
+    text: 老规矩，还是照我的偏好来，别整那些花里胡哨的。
+
+  - id: q20
+    expect: none
+    text: 解释一下什么是闭包，最好带个例子。
+
+  - id: q21
+    expect: deploy
+    text: 看看线上服务现在是什么状态，是不是又崩了。
+
+  - id: q22
+    expect: panel
+    text: 在浏览器里把这段回答渲染出来给我看。
+
+  - id: q23
+    expect: memory
+    text: 你还是没记住我不吃香菜这回事吧。
+
+  - id: q24
+    expect: none
+    text: 帮我把桌面上这些图片按日期重命名一下。
+
+  - id: q25
+    expect: deploy
+    text: 用 scp 把服务器上的日志拉到本地来，我看看。
+
+  - id: q26
+    expect: memory
+    text: 上回我们商量把脚本换成 PowerShell 写，你还有印象不？
+
+  - id: q27
+    expect: panel
+    text: 给我开个能看历史对话的网页，我想自己翻。
+
+  - id: q28
+    expect: memory
+    text: 我是不是跟你提过我想换个笔记本？
+
+  - id: q29
+    expect: memory
+    text: 前两天我不是说过这个接口要加鉴权吗，你怎么还这么写。
+
+  - id: q30
+    expect: deploy
+    text: 远程那台 192.168.1.20 上的服务要更新一下，你安排。

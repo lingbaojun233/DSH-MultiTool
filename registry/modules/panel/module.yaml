@@ -1,0 +1,10 @@
+name: panel
+title: 网页对话面板
+when: 需要查看对话历史、让用户在浏览器里直接对话或翻看旧回复时
+not_when: 纯命令行任务，或不需要人机界面时
+entry:
+  type: cmd
+  name: panel/open-panel.cmd
+cost: 低
+readme: README.md
+version: 0.1.0

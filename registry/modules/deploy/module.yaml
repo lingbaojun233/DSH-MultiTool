@@ -1,0 +1,10 @@
+name: deploy
+title: 上传与部署
+when: 需要把本地文件或目录传到服务器、重启服务、查看远端状态时
+not_when: 只在本机整理文件，或只想看代码差异时
+entry:
+  type: cmd
+  name: ../deploy-tool/deploy.ps1
+cost: 中
+readme: README.md
+version: 0.1.0

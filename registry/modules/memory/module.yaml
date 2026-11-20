@@ -1,0 +1,10 @@
+name: memory
+title: 跨会话记忆
+when: 需要回忆之前说过的事、用户偏好或已确认的事实时
+not_when: 当前对话已经包含全部信息，或问题与历史无关时
+entry:
+  type: cmd
+  name: memory/cli.js
+cost: 低
+readme: README.md
+version: 0.1.0

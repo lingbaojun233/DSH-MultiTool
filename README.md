@@ -53,6 +53,11 @@ DSH-MultiTool/
 │   ├── lib/                     闸门 / 存储 / 索引 / 召回 / token 估算
 │   ├── schema/  rules/          事件 schema、巩固与冲突规则
 │   └── README.md
+├── registry/
+│   ├── modules/<name>/          每个模块一个目录：module.yaml + README.md
+│   ├── lib/                     校验 / 目录渲染 / 加载器 / README 生成 / 质检
+│   ├── tests/triggers.yaml      30 条触发测试集
+│   └── cli.js                   validate / catalog / read / lint / gen / stats
 └── docs/
 ```
 
@@ -64,6 +69,7 @@ DSH-MultiTool/
 | io | 已部署、开机自启（SYSTEM 计划任务） | CLI + HTTP 均通过 |
 | panel | 已部署、开机自启（SYSTEM 计划任务） | 本地经 SSH 隧道访问，端到端 3.5 s |
 | memory | 已部署、开机自启 + 每日 03:00 巩固，v0.2 | SQLite+FTS5，10 万条下 p95 0.7ms，验收 7/7 |
+| registry | 已部署，注入 io 的 prompt 顶部 | 目录 92 token（3 模块），触发测试 30/30，验收 9/9 |
 
 服务器侧基础设施：OpenSSH Server（仅公钥登录）、WinRM（控制通道）、
 计划任务 `DSH-MultiTool IO`（开机拉起 `io\server.js`）。

@@ -122,9 +122,37 @@ async function personaBlock(options = {}) {
   return personaCache.block;
 }
 
+/**
+ * 模块目录：常驻、极便宜（每模块一行），只告诉模型"有哪些模块、何时用"。
+ * 放在系统提示最前部，内容稳定才能命中前缀缓存。
+ */
+let catalogCache = { at: 0, block: null };
+function registryBlock(options = {}) {
+  if (options.registry === false) return null;
+  if (Date.now() - catalogCache.at < 60000) return catalogCache.block;
+
+  try {
+    const registryDir = path.join(IO_DIR, '..', 'registry');
+    const { render } = require(path.join(registryDir, 'lib', 'catalog.js'));
+    const result = render({ root: path.join(registryDir, 'modules') });
+    const lines = [
+      '[模块目录 · 需要某模块的具体用法时先加载它，不要凭名字猜]',
+      result.text,
+      `加载用法：node "${path.join(registryDir, 'cli.js')}" read <name>`,
+      result.activeLine || '已激活：无',
+    ];
+    catalogCache = { at: Date.now(), block: lines.join('\n') };
+  } catch {
+    catalogCache = { at: Date.now(), block: null };
+  }
+  return catalogCache.block;
+}
+
 /** 把人格块、对话上下文、记忆块、当前消息按固定顺序拼成 prompt。 */
-function composePrompt({ persona, history, memory, task }) {
+function composePrompt({ catalog, persona, history, memory, task }) {
   const sections = [];
+
+  if (catalog) sections.push(catalog);
 
   if (persona) {
     sections.push('[人格设定 · 这是你的身份与行为准则，优先遵守]', persona);
@@ -240,7 +268,9 @@ async function run(task, options = {}) {
   }
 
   const [recall, persona] = await Promise.all([recallFor(task, options), personaBlock(options)]);
+  const catalog = registryBlock(options);
   const promptText = composePrompt({
+    catalog,
     persona,
     history: options.history,
     memory: recall && recall.block ? recall.block : null,
@@ -382,6 +412,22 @@ async function main(argv) {
     return s.ready ? 0 : 1;
   }
 
+  if (cmd === 'prompt') {
+    // 只拼 prompt、不调模型：验收与排错用
+    const opts = parseFlags(argv.slice(1));
+    let task;
+    if (opts.file) task = fs.readFileSync(opts.file, 'utf8').replace(/^\uFEFF/, '');
+    else if (opts.stdin) task = fs.readFileSync(0, 'utf8');
+    else task = opts._.join(' ') || '（空任务）';
+
+    const [recall, persona] = await Promise.all([recallFor(task, opts), personaBlock(opts)]);
+    const catalog = registryBlock(opts);
+    process.stdout.write(
+      `${composePrompt({ catalog, persona, history: opts.history, memory: recall && recall.block, task })}\n`,
+    );
+    return 0;
+  }
+
   if (cmd === 'send') {
     const opts = parseFlags(argv.slice(1));
     let task;
@@ -415,4 +461,4 @@ if (require.main === module) {
   main(process.argv.slice(2)).then((code) => process.exit(code));
 }
 
-module.exports = { run, coreStatus, resolveCore, parseStream, IO_DIR, MEMORY_URL };
+module.exports = { run, coreStatus, resolveCore, parseStream, IO_DIR, MEMORY_URL, registryBlock, composePrompt };
