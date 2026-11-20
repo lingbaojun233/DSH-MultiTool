@@ -4,19 +4,14 @@
 /**
  * DSH-MultiTool :: IO module
  *
- * The only supported way for other modules to talk to the DSH core:
- * feed a task in, read the final answer back.
+ * 其他模块与 DSH 核心交互的唯一通道：喂任务进去，拿答案回来。
+ * 同时负责记忆的接入：
+ *   1) 发问前 → memory_search 召回，拼成上下文块前置到 prompt
+ *   2) 回答后 → memory_remember 把用户消息与 DSH 回答各写一条事件（带证据）
  *
- * It drives the core exactly the way the official headless surface documents:
- *   node <core>/app/node_modules/@deepseek-ai/dsh/lib/bin.js \
- *        --profile headless [--session-id <id>] --json -
- * with the task written to stdin and DSH_HOME pointed at <core>/home.
- *
- * Transport facts (from @deepseek-ai/dsh-headless README):
- *   - task: positional argument, or stdin when the argument is "-"
- *   - answer: stdout (final text), reasoning: stderr
- *   - --json: newline-delimited events (session/status/text/thinking/tool_call/tool_result/final)
- *   - exit 0 = completed, 1 = aborted or errored
+ * 调用形式（dsh 0.1.1-rc.2 实测）：
+ *   node <core>/app/node_modules/@deepseek-ai/dsh/lib/bin.js --profile headless "<task>"
+ * 答案走 stdout，推理走 stderr，退出码 0/1。
  */
 
 const { spawn } = require('node:child_process');
@@ -25,6 +20,8 @@ const path = require('node:path');
 
 const IO_DIR = __dirname;
 const DEFAULT_TIMEOUT_MS = 300000;
+const MEMORY_URL = process.env.DSH_MEMORY_URL || 'http://127.0.0.1:8767';
+const MEMORY_BUDGET = { max_items: 6, max_tokens: 800 };
 
 function resolveCore(options = {}) {
   const dir = path.resolve(options.coreDir || process.env.DSH_CORE_DIR || path.join(IO_DIR, '..', 'core'));
@@ -41,15 +38,104 @@ function coreStatus(options = {}) {
   const hasNode = fs.existsSync(p.node);
   const hasDsh = fs.existsSync(p.bin);
   const hasProfile = fs.existsSync(path.join(p.home, 'profiles', 'headless', 'package.json'));
-  const envFile = path.join(p.home, '.env');
   return {
     coreDir: p.dir,
     hasNode,
     hasDsh,
     hasProfile,
-    hasEnvFile: fs.existsSync(envFile),
+    hasEnvFile: fs.existsSync(path.join(p.home, '.env')),
     ready: hasNode && hasDsh && hasProfile,
   };
+}
+
+// ---- memory bridge ---------------------------------------------------------
+
+function memoryEnabled(options = {}) {
+  if (options.memory === false) return false;
+  return process.env.DSH_MEMORY_DISABLED !== '1';
+}
+
+async function postJson(url, body, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    try {
+      return { ok: res.ok, status: res.status, data: JSON.parse(text) };
+    } catch {
+      return { ok: res.ok, status: res.status, data: { raw: text } };
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** 召回并渲染注入块；记忆服务不可用时静默降级为"无记忆"。 */
+async function recallFor(task, options = {}) {
+  if (!memoryEnabled(options)) return null;
+  try {
+    const { ok, data } = await postJson(`${MEMORY_URL}/v1/tools/memory_search`, {
+      query: String(task).slice(0, 500),
+      budget: MEMORY_BUDGET,
+    });
+    if (!ok || !data || !data.ok) return null;
+
+    const items = Array.isArray(data.items) ? data.items : [];
+    if (!items.length) return { block: null, used: data.used, items: [] };
+
+    const lines = ['[可用记忆 · 仅在相关时引用；这里没有的信息不要编造]'];
+    items.forEach((item, index) => {
+      lines.push(`${index + 1}. ${item.text}  ⟵ ${item.evidence || 'no-evidence'}`);
+    });
+    return { block: lines.join('\n'), used: data.used, items: items.map((i) => ({ id: i.id, evidence: i.evidence })) };
+  } catch {
+    return null;
+  }
+}
+
+/** 记录一轮对话（用户消息 + DSH 回答）。失败只记日志，不影响对话。 */
+async function recordTurn(task, answer, options = {}) {
+  if (!memoryEnabled(options) || options.record === false) return;
+  const sessionId = options.sessionId || 'adhoc';
+  const stamp = Date.now();
+  const events = [
+    {
+      content: String(task),
+      evidence: `chat:${sessionId}#u${stamp}`,
+      channel: 'chat',
+      group_id: sessionId,
+      speaker_id: 'user',
+      speaker_name: '用户',
+      kind: 'msg',
+      confidence: 0.9,
+    },
+  ];
+  if (answer && String(answer).trim()) {
+    events.push({
+      content: String(answer),
+      evidence: `chat:${sessionId}#d${stamp}`,
+      channel: 'chat',
+      group_id: sessionId,
+      speaker_id: 'dsh',
+      speaker_name: 'DSH',
+      kind: 'msg',
+      confidence: 0.8,
+    });
+  }
+
+  for (const event of events) {
+    try {
+      await postJson(`${MEMORY_URL}/v1/tools/memory_remember`, event, 8000);
+    } catch {
+      /* 记忆不可用不应影响对话 */
+    }
+  }
 }
 
 function parseStream(stdout) {
@@ -81,24 +167,21 @@ function parseStream(stdout) {
   }
 
   let answer = finalText !== null ? finalText : (lastText !== null ? lastText : '');
-  // Plain (non-JSON) mode prints only the final assistant message on stdout.
   if (!answer) answer = String(stdout || '').trim();
   return { answer, sessionId, reason, errorMessage, events };
 }
 
 /**
- * Run one task through the DSH core.
- * @param {string} task prompt text (written to stdin)
- * @param {object} options { sessionId, permissionMode, cwd, timeoutMs, coreDir, keepEvents }
- * @returns {Promise<object>} { ok, code, exitCode, answer, sessionId, reason, stderr, ms, events? }
+ * 跑一个任务：先召回记忆组 prompt，再调用核心，最后异步落事件。
+ * @returns {Promise<object>} { ok, code, exitCode, answer, sessionId, stderr, ms, memory? }
  */
-function run(task, options = {}) {
+async function run(task, options = {}) {
   const p = resolveCore(options);
   const status = coreStatus(options);
   const startedAt = Date.now();
 
   if (!status.ready) {
-    return Promise.resolve({
+    return {
       ok: false,
       code: 'CORE_NOT_READY',
       error: `DSH core is not installed at ${p.dir}. Run core\\bootstrap.ps1 first.`,
@@ -107,28 +190,27 @@ function run(task, options = {}) {
       exitCode: null,
       stderr: '',
       ms: 0,
-    });
+    };
   }
 
-  const timeoutMs = Number(options.timeoutMs || process.env.DSH_IO_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
-  // dsh 0.1.1-rc.2: the task is a positional argument only. `-` (stdin) and
-  // `--json` / `--session-id` belong to later releases, so do not pass them:
-  // `-` would be answered literally as the task.
-  const args = [p.bin, '--profile', 'headless', String(task)];
+  const recall = await recallFor(task, options);
+  const promptText = recall && recall.block ? `${recall.block}\n\n---\n${String(task)}` : String(task);
 
+  const timeoutMs = Number(options.timeoutMs || process.env.DSH_IO_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
+  const args = [p.bin, '--profile', 'headless', promptText];
   const env = Object.assign({}, process.env, { DSH_HOME: p.home });
 
-  return new Promise((resolve) => {
+  const result = await new Promise((resolve) => {
     let settled = false;
     let stdout = '';
     let stderr = '';
     let timer = null;
 
-    const done = (result) => {
+    const done = (value) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
-      resolve(result);
+      resolve(value);
     };
 
     let child;
@@ -178,17 +260,27 @@ function run(task, options = {}) {
         error: parsed.errorMessage || undefined,
         stderr,
         ms: Date.now() - startedAt,
-        events: options.keepEvents ? parsed.events : undefined,
       });
     });
 
     try {
-      child.stdin.write(task == null ? '' : String(task), 'utf8');
+      child.stdin.write('', 'utf8');
       child.stdin.end();
     } catch (_) {
-      /* the close handler reports the failure */
+      /* close handler reports the failure */
     }
   });
+
+  if (recall) {
+    result.memory = { used: recall.used, items: recall.items };
+  }
+
+  // 落事件：不阻塞返回，失败也不影响对话
+  setImmediate(() => {
+    recordTurn(task, result.answer, options).catch(() => {});
+  });
+
+  return result;
 }
 
 // ---- CLI -------------------------------------------------------------------
@@ -204,11 +296,10 @@ function usage() {
       '  node io.js health',
       '',
       'Options:',
-      '  --session <id>        continue an existing session',
-      '  --permission-mode <m> pass a permission preset to the core',
+      '  --session <id>        session id used for memory evidence',
       '  --timeout <ms>        hard timeout, default 300000',
+      '  --no-memory           skip recall and skip recording events',
       '  --json                print the full result object',
-      '  --events              include the raw event stream in --json output',
       '',
     ].join('\n'),
   );
@@ -219,13 +310,12 @@ function parseFlags(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--session') { out.sessionId = argv[i + 1]; i += 1; }
-    else if (a === '--permission-mode') { out.permissionMode = argv[i + 1]; i += 1; }
     else if (a === '--timeout') { out.timeoutMs = Number(argv[i + 1]); i += 1; }
     else if (a === '--file') { out.file = argv[i + 1]; i += 1; }
     else if (a === '--core') { out.coreDir = argv[i + 1]; i += 1; }
     else if (a === '--stdin') { out.stdin = true; }
+    else if (a === '--no-memory') { out.memory = false; }
     else if (a === '--json') { out.json = true; }
-    else if (a === '--events') { out.events = true; }
     else { out._.push(a); }
   }
   return out;
@@ -244,7 +334,7 @@ async function main(argv) {
   if (cmd === 'send') {
     const opts = parseFlags(argv.slice(1));
     let task;
-    if (opts.file) task = fs.readFileSync(opts.file, 'utf8');
+    if (opts.file) task = fs.readFileSync(opts.file, 'utf8').replace(/^\uFEFF/, '');
     else if (opts.stdin) task = fs.readFileSync(0, 'utf8');
     else task = opts._.join(' ');
 
@@ -253,7 +343,7 @@ async function main(argv) {
       return 2;
     }
 
-    const res = await run(task, { ...opts, keepEvents: Boolean(opts.events) });
+    const res = await run(task, opts);
     if (opts.json) {
       process.stdout.write(JSON.stringify(res, null, 2) + '\n');
     } else if (res.ok) {
@@ -274,4 +364,4 @@ if (require.main === module) {
   main(process.argv.slice(2)).then((code) => process.exit(code));
 }
 
-module.exports = { run, coreStatus, resolveCore, parseStream, IO_DIR };
+module.exports = { run, coreStatus, resolveCore, parseStream, IO_DIR, MEMORY_URL };

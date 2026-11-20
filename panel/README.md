@@ -47,6 +47,14 @@ ssh -N -L 8766:127.0.0.1:8766 fish-server     # 保持这个窗口
 | 入口 | `start-server.cmd` |
 | 日志 | `..\logs\panel.log`（放在模块目录外，避免 `push` 整目录替换时被占用） |
 
+## 记忆
+
+- 前端为每个浏览器生成一个持久 `sessionId`（localStorage），随请求发给 io，
+  用作记忆证据定位 `chat:<sessionId>#u<时间戳>`。
+- 回答的元信息会显示「参考 N 条记忆」——N 来自 io 返回的 `memory.used.count`，
+  表示这一轮召回了多少条记忆；0 条时不会显示。
+- 记忆的写入/召回都在 io 层完成，面板只负责展示计数，不直接碰记忆服务。
+
 ## 排错
 
 - 页面打开但状态显示"核心未就绪"：查 io 服务 `Get-ScheduledTaskInfo -TaskName 'DSH-MultiTool IO'`，

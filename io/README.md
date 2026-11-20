@@ -43,6 +43,24 @@ Invoke-RestMethod http://127.0.0.1:8765/v1/input -Method Post `
 环境变量：`DSH_IO_HOST`（默认 127.0.0.1）、`DSH_IO_PORT`（8765）、
 `DSH_IO_TOKEN`（设置后需带 `Authorization: Bearer <token>`）、`DSH_CORE_DIR`。
 
+## 记忆接入
+
+io 是所有对话的唯一漏斗，记忆就挂在这里：
+
+```text
+用户问题 ──► memory_search（召回 ≤6 条 / ≤800 token）
+          ──► 拼成 [可用记忆] 块前置到 prompt
+          ──► dsh --profile headless
+          ──► 答案返回给调用方
+          ──► 异步 memory_remember ×2（用户消息 + DSH 回答，均带证据）
+```
+
+- 证据定位：`chat:<sessionId>#u<时间戳>` 与 `chat:<sessionId>#d<时间戳>`。
+- 召回块只声明"这里没有的信息不要编造"，不保证模型一定引用。
+- 记忆服务不可用时**静默降级**：照常对话，只是没有记忆。
+- `--no-memory` 可整体关闭；`DSH_MEMORY_DISABLED=1` 环境变量同理。
+- 返回体多一个 `memory` 字段：`{ used:{count,tokens}, items:[{id,evidence}] }`。
+
 ## 冒烟测试
 
 ```powershell

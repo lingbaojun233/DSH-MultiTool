@@ -16,6 +16,26 @@ if (hasMarkdown) {
 
 let busy = false;
 
+// 会话 id：用于记忆证据定位（chat:<sessionId>#u<时间戳>），存在浏览器里
+const SESSION_KEY = 'dsh-panel-session';
+function getSessionId() {
+  let id = '';
+  try {
+    id = window.localStorage.getItem(SESSION_KEY) || '';
+  } catch (err) {
+    id = '';
+  }
+  if (!id) {
+    id = `p${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    try {
+      window.localStorage.setItem(SESSION_KEY, id);
+    } catch (err) {
+      /* 隐私模式下忽略 */
+    }
+  }
+  return id;
+}
+
 function setStatus(kind, text) {
   statusEl.className = `status ${kind}`;
   statusText.textContent = text;
@@ -144,14 +164,16 @@ async function send() {
     const res = await fetch('/api/input', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, sessionId: getSessionId() }),
     });
     const data = await res.json().catch(() => ({ ok: false, error: '无法解析响应' }));
     pending.remove();
 
     if (data.ok) {
       const ms = typeof data.ms === 'number' ? data.ms : Math.round(performance.now() - started);
-      addMessage('assistant', data.answer || '（空答案）', `${(ms / 1000).toFixed(1)} 秒 · ${formatClock(Date.now())}`);
+      const memCount = data.memory && data.memory.used ? data.memory.used.count : 0;
+      const memNote = memCount > 0 ? ` · 参考 ${memCount} 条记忆` : '';
+      addMessage('assistant', data.answer || '（空答案）', `${(ms / 1000).toFixed(1)} 秒${memNote} · ${formatClock(Date.now())}`);
     } else {
       const detail = data.exitCode != null ? `exit=${data.exitCode}` : '';
       addMessage('error', data.error || data.code || '请求失败', detail);
