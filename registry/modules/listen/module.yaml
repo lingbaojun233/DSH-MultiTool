@@ -1,0 +1,11 @@
+name: listen
+title: 听声音
+when: 用户发来语音或录音，要把说的话转成文字时
+not_when: 纯文字对话，或录音是英文、方言（只装了中文听写引擎）时
+entry:
+  type: cmd
+  name: listen/start-server.cmd
+cost: 低
+readme: README.md
+version: 0.1.0
+scope: server

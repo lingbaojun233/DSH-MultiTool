@@ -419,7 +419,8 @@ const server = http.createServer(async (req, res) => {
 
     // 听力：浏览器录音（webm/wav base64）→ 文本
     if (req.method === 'POST' && url.pathname === '/api/asr') {
-      const rawAsr = await readBody(req);
+      // base64 后的音频比原始大 1/3，60 秒录音给到 32MB 才安全
+      const rawAsr = await readBody(req, 32 * 1024 * 1024);
       let payload = {};
       try { payload = JSON.parse(rawAsr.toString('utf8')) || {}; } catch { }
       const r = await postJson(LISTEN_BASE, '/v1/transcribe', payload, {}, 120000);
