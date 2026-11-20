@@ -17,6 +17,7 @@
     <nav id="tabs" class="tabs" role="tablist">
       <button class="tab active" data-view="chat" role="tab" aria-selected="true">聊天</button>
       <button class="tab" data-view="memory" role="tab" aria-selected="false">记忆</button>
+      <button class="tab" data-view="video" role="tab" aria-selected="false">视频</button>
       <button class="tab" data-view="persona" role="tab" aria-selected="false">人格</button>
       <button class="tab hidden" data-view="admin" id="tabAdmin" role="tab" aria-selected="false">账号</button>
     </nav>
@@ -63,6 +64,61 @@
         <section class="card">
           <h2 id="detailTitle">全部事件 <span class="muted" id="detailCount"></span></h2>
           <ul id="memEvents" class="events"></ul>
+        </section>
+      </div>
+    </section>
+
+    <!-- 视频：本地拖入（浏览器抽帧）或贴链接 -->
+    <section id="view-video" class="view" role="tabpanel">
+      <div class="pane">
+        <section class="card">
+          <h2>让它看视频</h2>
+          <div id="videoDrop" class="drop">
+            <p>把视频拖到这里，或 <button id="videoPick" class="linkbtn" type="button">选一个文件</button></p>
+            <p class="muted" id="videoDropHint">本地视频只在本机抽帧，原文件不会上传</p>
+            <input id="videoFile" type="file" accept="video/*" hidden />
+          </div>
+
+          <label class="field">
+            <span>想让我注意什么（可不填）</span>
+            <input id="videoText" placeholder="比如：他为什么输了 / 这段值不值得看" />
+          </label>
+
+          <div class="row">
+            <label class="field small">
+              <span>帧数</span>
+              <select id="videoFrames">
+                <option value="6">6</option>
+                <option value="8" selected>8</option>
+                <option value="12">12</option>
+                <option value="16">16</option>
+              </select>
+            </label>
+            <button id="videoGo" class="primary" type="button" disabled>看这个视频</button>
+          </div>
+
+          <div class="divider"><span>或者贴链接</span></div>
+          <div class="row">
+            <input id="videoUrl" placeholder="https:// 视频页面地址" />
+            <button id="videoUrlGo" class="primary" type="button">看链接</button>
+          </div>
+          <p class="muted" id="videoUrlHint">链接由服务器下载后抽帧，需要几十秒</p>
+        </section>
+
+        <section class="card hidden" id="videoFramesCard">
+          <h2>抽到的帧</h2>
+          <div id="videoFramesStrip" class="frames"></div>
+        </section>
+
+        <section class="card hidden" id="videoResultCard">
+          <h2>大肥鱼说</h2>
+          <div id="videoReply" class="reply"></div>
+          <details id="videoDetails">
+            <summary>画面描述（模型看到的内容）</summary>
+            <div id="videoSynopsis" class="muted"></div>
+            <ul id="videoTimeline" class="timeline"></ul>
+            <div id="videoOnScreen" class="muted"></div>
+          </details>
         </section>
       </div>
     </section>

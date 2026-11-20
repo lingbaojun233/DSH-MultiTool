@@ -1,0 +1,11 @@
+{
+  "port": 8769,
+  "gateway": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+  "model": "qwen3.8-flash",
+  "fallbackModel": "qwen4-max",
+  "maxFrames": 16,
+  "frameMaxSide": 896,
+  "requestTimeoutMs": 180000,
+  "ffmpeg": "C:\\Apps\\DSH-MultiTool\\tools\\ffmpeg\\bin\\ffmpeg.exe",
+  "ytdlp": "C:\\Apps\\DSH-MultiTool\\tools\\yt-dlp.exe"
+}

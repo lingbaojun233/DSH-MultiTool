@@ -576,6 +576,196 @@ async function loadMemoryView() {
 
   await loadDetail(currentDetail);
 }
+// ---------------------------------------------------------------- 视频视图 --
+
+const videoEls = {
+  drop: document.getElementById('videoDrop'),
+  file: document.getElementById('videoFile'),
+  pick: document.getElementById('videoPick'),
+  hint: document.getElementById('videoDropHint'),
+  text: document.getElementById('videoText'),
+  frames: document.getElementById('videoFrames'),
+  go: document.getElementById('videoGo'),
+  url: document.getElementById('videoUrl'),
+  urlGo: document.getElementById('videoUrlGo'),
+  strip: document.getElementById('videoFramesStrip'),
+  framesCard: document.getElementById('videoFramesCard'),
+  resultCard: document.getElementById('videoResultCard'),
+  reply: document.getElementById('videoReply'),
+  synopsis: document.getElementById('videoSynopsis'),
+  timeline: document.getElementById('videoTimeline'),
+  onScreen: document.getElementById('videoOnScreen'),
+};
+
+let pickedVideo = null;
+
+function fmtClock(sec) {
+  const s = Math.max(0, Math.round(sec));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function seekVideo(v, t) {
+  return new Promise((resolve) => {
+    const done = () => { v.removeEventListener('seeked', done); resolve(); };
+    v.addEventListener('seeked', done);
+    v.currentTime = Math.max(0, Math.min(t, (v.duration || 0) - 0.05));
+  });
+}
+
+/** 本地视频不上传：浏览器解码后只把 N 张 JPEG 送去分析。 */
+async function sampleVideoFrames(file, count) {
+  const objUrl = URL.createObjectURL(file);
+  const v = document.createElement('video');
+  v.preload = 'auto';
+  v.muted = true;
+  v.src = objUrl;
+  try {
+    await new Promise((resolve, reject) => {
+      v.onloadedmetadata = () => resolve();
+      v.onerror = () => reject(new Error('浏览器解不了这个格式'));
+      setTimeout(() => reject(new Error('读视频超时')), 20000);
+    });
+    const duration = v.duration;
+    if (!duration || !isFinite(duration)) throw new Error('读不到视频时长');
+
+    const maxSide = 896;
+    const scale = Math.min(1, maxSide / Math.max(v.videoWidth || maxSide, v.videoHeight || maxSide));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round((v.videoWidth || maxSide) * scale));
+    canvas.height = Math.max(1, Math.round((v.videoHeight || maxSide) * scale));
+    const ctx = canvas.getContext('2d');
+
+    const frames = [];
+    for (let i = 0; i < count; i++) {
+      const t = duration * (i + 0.5) / count;
+      await seekVideo(v, t);
+      ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
+      frames.push({ t: fmtClock(t), dataUrl: canvas.toDataURL('image/jpeg', 0.8) });
+    }
+    return frames;
+  } finally {
+    URL.revokeObjectURL(objUrl);
+  }
+}
+
+function renderFrameStrip(frames) {
+  if (!videoEls.strip) return;
+  videoEls.strip.innerHTML = '';
+  for (const f of frames) {
+    const wrap = document.createElement('div');
+    wrap.className = 'thumb';
+    const img = document.createElement('img');
+    img.src = f.dataUrl;
+    img.alt = f.t;
+    const cap = document.createElement('span');
+    cap.textContent = f.t;
+    wrap.append(img, cap);
+    videoEls.strip.appendChild(wrap);
+  }
+  videoEls.framesCard.classList.remove('hidden');
+}
+
+function renderVideoResult(r) {
+  if (!videoEls.resultCard) return;
+  if (!r || !r.ok) {
+    videoEls.reply.textContent = '没看成：' + ((r && r.error) || '未知原因');
+    videoEls.synopsis.textContent = '';
+    videoEls.timeline.innerHTML = '';
+    videoEls.onScreen.textContent = '';
+  } else {
+    videoEls.reply.textContent = r.reply || '（她没说话）';
+    const a = r.analysis || {};
+    videoEls.synopsis.textContent = a.synopsis || '';
+    videoEls.onScreen.textContent = a.onScreen ? '画面文字：' + a.onScreen : '';
+    videoEls.timeline.innerHTML = '';
+    for (const t of (a.timeline || [])) {
+      const li = document.createElement('li');
+      li.textContent = `${t.t || '?'}  ${t.what || ''}`;
+      videoEls.timeline.appendChild(li);
+    }
+  }
+  videoEls.resultCard.classList.remove('hidden');
+}
+
+function acceptPickedFile(file) {
+  if (!file) return;
+  pickedVideo = file;
+  videoEls.hint.textContent = `${file.name} · ${(file.size / 1048576).toFixed(1)} MB`;
+  videoEls.go.disabled = false;
+}
+
+async function analyzePickedVideo() {
+  if (!pickedVideo) return;
+  const count = Number(videoEls.frames.value) || 8;
+  videoEls.go.disabled = true;
+  videoEls.hint.textContent = `正在本机抽 ${count} 帧…`;
+  try {
+    const frames = await sampleVideoFrames(pickedVideo, count);
+    renderFrameStrip(frames);
+    videoEls.hint.textContent = `抽到 ${frames.length} 帧，正在看（几十秒）…`;
+    const r = await apiJson('/api/video/analyze', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ frames, text: videoEls.text.value.trim() }),
+    });
+    renderVideoResult(r);
+    videoEls.hint.textContent = r && r.ok ? '看完了' : '没看成';
+  } catch (err) {
+    videoEls.hint.textContent = '出错：' + (err && err.message || err);
+  } finally {
+    videoEls.go.disabled = false;
+  }
+}
+
+async function analyzeUrlVideo() {
+  const link = videoEls.url.value.trim();
+  if (!/^https?:\/\//i.test(link)) {
+    videoEls.hint.textContent = '链接要 http(s) 开头';
+    return;
+  }
+  const count = Number(videoEls.frames.value) || 8;
+  videoEls.urlGo.disabled = true;
+  videoEls.hint.textContent = '服务器正在下载并抽帧（可能要一分钟）…';
+  try {
+    const r = await apiJson('/api/video/url', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: link, text: videoEls.text.value.trim(), frames: count }),
+    });
+    renderVideoResult(r);
+    videoEls.hint.textContent = r && r.ok ? '看完了' : '没看成';
+  } catch (err) {
+    videoEls.hint.textContent = '出错：' + (err && err.message || err);
+  } finally {
+    videoEls.urlGo.disabled = false;
+  }
+}
+
+if (videoEls.pick) {
+  videoEls.pick.addEventListener('click', () => videoEls.file.click());
+  videoEls.file.addEventListener('change', () => {
+    acceptPickedFile(videoEls.file.files && videoEls.file.files[0]);
+  });
+  ['dragenter', 'dragover'].forEach((ev) => {
+    videoEls.drop.addEventListener(ev, (e) => {
+      e.preventDefault();
+      videoEls.drop.classList.add('over');
+    });
+  });
+  ['dragleave', 'drop'].forEach((ev) => {
+    videoEls.drop.addEventListener(ev, (e) => {
+      e.preventDefault();
+      videoEls.drop.classList.remove('over');
+    });
+  });
+  videoEls.drop.addEventListener('drop', (e) => {
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    acceptPickedFile(f);
+  });
+  videoEls.go.addEventListener('click', analyzePickedVideo);
+  videoEls.urlGo.addEventListener('click', analyzeUrlVideo);
+}
+
 /** 切栏：聊天 / 记忆 / 人格 / 账号。 */
 function setView(name) {
   document.querySelectorAll('.view').forEach((s) => s.classList.toggle('active', s.id === 'view-' + name));
@@ -584,7 +774,7 @@ function setView(name) {
     t.classList.toggle('active', on);
     t.setAttribute('aria-selected', on ? 'true' : 'false');
   });
-  const titles = { chat: '聊天', memory: '记忆', persona: '人格', admin: '账号' };
+  const titles = { chat: '聊天', memory: '记忆', video: '视频', persona: '人格', admin: '账号' };
   if (viewTitle) viewTitle.textContent = titles[name] || '';
   if (name === 'memory') loadMemoryView();
   if (name === 'persona') loadPersonaView();

@@ -27,6 +27,7 @@ const PORT = Number(process.env.DSH_PANEL_PORT || 8766);
 const IO_BASE = process.env.DSH_IO_URL || 'http://127.0.0.1:8765';
 const MEMORY_BASE = process.env.DSH_MEMORY_URL || 'http://127.0.0.1:8767';
 const SEPARATOR_BASE = process.env.DSH_SEPARATOR_URL || 'http://127.0.0.1:8768';
+const VIDEO_BASE = process.env.DSH_VIDEO_URL || 'http://127.0.0.1:8769';
 const ROOT = __dirname;
 const MAX_BODY = 1024 * 1024;
 
@@ -171,7 +172,60 @@ function bearer(req) {
 
 /** 面板自己的用户态闸门：没带 token 的请求不往 io/记忆服务转发。 */
 function protectedPath(pathname) {
-  return pathname === '/api/input' || pathname === '/api/persona' || pathname.startsWith('/api/memory/');
+  return pathname === '/api/input' || pathname === '/api/persona' ||
+    pathname.startsWith('/api/memory/') || pathname.startsWith('/api/video');
+}
+
+/** 服务间直连 POST（视频模块 / io）：不走 req 透传，因为要拿回结果再二次加工。 */
+function postJson(base, pathName, obj, headers = {}, timeoutMs = 600000) {
+  return new Promise((resolve) => {
+    const target = new URL(pathName, base);
+    const body = Buffer.from(JSON.stringify(obj), 'utf8');
+    const upstream = http.request(target, {
+      method: 'POST',
+      headers: Object.assign({
+        'content-type': 'application/json; charset=utf-8',
+        'content-length': body.length,
+      }, headers),
+      timeout: timeoutMs,
+    }, (reply) => {
+      const chunks = [];
+      reply.on('data', (c) => chunks.push(c));
+      reply.on('end', () => {
+        let data = null;
+        try { data = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { }
+        resolve({ status: reply.statusCode || 0, data });
+      });
+    });
+    upstream.on('timeout', () => upstream.destroy(new Error('upstream timeout')));
+    upstream.on('error', (err) => resolve({ status: 0, data: { ok: false, error: err.message } }));
+    upstream.write(body);
+    upstream.end();
+  });
+}
+
+/** 视频描述 + 用户的话 → 交给 io，让大肥鱼用自己的口气回应。 */
+function buildVideoTask(analysis, userText) {
+  const lines = [];
+  lines.push(userText ? `我给你发了一段视频，说：${userText}` : '我给你发了一段视频。');
+  lines.push('');
+  lines.push('【视频内容（已经有人帮你看过了，描述如下）】');
+  lines.push(analysis.synopsis || analysis.answer || '（没描述出来）');
+  if (Array.isArray(analysis.timeline) && analysis.timeline.length) {
+    lines.push('时间线：');
+    for (const t of analysis.timeline.slice(0, 20)) {
+      lines.push(`- ${t.t || '?'} ${t.what || ''}`);
+    }
+  }
+  if (Array.isArray(analysis.highlights) && analysis.highlights.length) {
+    lines.push('要点：' + analysis.highlights.join('；'));
+  }
+  if (analysis.onScreen) lines.push('画面上出现的文字：' + analysis.onScreen);
+  lines.push('【描述结束】');
+  lines.push('');
+  lines.push('用你自己的口气回我：先给一句直接看法（这视频怎么样、值不值得看），再补一两点你自己注意到的东西或者想问的。');
+  lines.push('不要复述时间线，不要写成报告。');
+  return lines.join('\n');
 }
 
 function proxy(req, res, ioPath, body, onDone, base, label) {
@@ -287,6 +341,45 @@ const server = http.createServer(async (req, res) => {
           const reason = (data && (data.error || data.code)) || `HTTP ${status}`;
           appendHistory({ role: 'error', text: String(reason), ts: Date.now() });
         }
+      });
+    }
+
+    // 视频：先让 video 模块看懂画面，再把描述交给 io，由大肥鱼用自己的口气回应
+    if (req.method === 'POST' && (url.pathname === '/api/video/analyze' || url.pathname === '/api/video/url')) {
+      const rawVideo = await readBody(req);
+      let body = {};
+      try { body = JSON.parse(rawVideo.toString('utf8')) || {}; } catch { }
+      const isUrl = url.pathname.endsWith('/url');
+      if (isUrl && !/^https?:\/\//i.test(String(body.url || ''))) {
+        return sendJson(res, 400, { ok: false, error: 'BAD_URL' });
+      }
+
+      const v = await postJson(VIDEO_BASE, isUrl ? '/v1/analyze-url' : '/v1/analyze',
+        isUrl ? { url: body.url, text: body.text, frames: body.frames }
+          : { frames: body.frames, text: body.text }, {}, 900000);
+
+      if (!v.data || !v.data.ok) {
+        return sendJson(res, 200, {
+          ok: false, step: 'video',
+          error: (v.data && v.data.error) || `video module HTTP ${v.status}`,
+        });
+      }
+
+      const label = String(body.text || '').trim();
+      const io = await postJson(IO_BASE, '/v1/input',
+        { text: buildVideoTask(v.data, label), sessionId: 'panel-video' },
+        { authorization: req.headers.authorization || '' }, 600000);
+      const reply = (io.data && io.data.answer) || '';
+
+      appendHistory({ role: 'user', text: label ? `[视频] ${label}` : '[视频]', ts: Date.now() });
+      if (reply) appendHistory({ role: 'assistant', text: reply, ts: Date.now(), usage: (io.data && io.data.usage) || null });
+
+      return sendJson(res, 200, {
+        ok: true,
+        analysis: v.data,
+        reply,
+        ioOk: Boolean(io.data && io.data.ok),
+        tokens: (io.data && io.data.tokens) || null,
       });
     }
 

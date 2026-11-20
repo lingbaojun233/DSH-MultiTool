@@ -421,3 +421,57 @@ button.stat {
 }
 button.stat:hover { border-color: var(--accent); }
 button.stat.active { border-color: var(--accent); background: #1b2130; }
+/* ---------------------------------------------------------------- 视频视图 -- */
+.drop {
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  padding: 18px 14px;
+  text-align: center;
+  color: var(--muted);
+  transition: border-color .15s, background .15s;
+  margin-bottom: 12px;
+}
+.drop.over { border-color: var(--accent); background: rgba(79, 140, 255, .08); }
+.drop p { margin: 4px 0; font-size: 13px; }
+
+.linkbtn {
+  background: none; border: none; padding: 0; cursor: pointer;
+  color: var(--accent); font: inherit; text-decoration: underline;
+}
+
+.field { display: block; margin-bottom: 10px; }
+.field > span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.field input, .field select, .row input {
+  width: 100%; background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+  font: inherit; font-size: 13px;
+}
+.field.small { flex: 0 0 90px; margin-bottom: 0; }
+.row { display: flex; gap: 8px; align-items: flex-end; margin-bottom: 10px; }
+.row > input { flex: 1; }
+.row > button { flex: 0 0 auto; white-space: nowrap; }
+
+.divider {
+  display: flex; align-items: center; gap: 10px;
+  color: var(--muted); font-size: 12px; margin: 14px 0 10px;
+}
+.divider::before, .divider::after {
+  content: ''; flex: 1; height: 1px; background: var(--border);
+}
+
+.reply {
+  background: var(--user); border: 1px solid var(--border); border-radius: 10px;
+  padding: 10px 12px; font-size: 14px; line-height: 1.6; white-space: pre-wrap;
+  margin-bottom: 10px;
+}
+
+.frames { display: flex; gap: 8px; flex-wrap: wrap; }
+.thumb { display: flex; flex-direction: column; align-items: center; gap: 3px; }
+.thumb img { width: 118px; border-radius: 6px; border: 1px solid var(--border); display: block; }
+.thumb span { font-size: 10px; color: var(--muted); }
+
+.timeline { margin: 8px 0 0 18px; padding: 0; font-size: 12.5px; color: var(--muted); }
+.timeline li { margin: 3px 0; }
+
+details#videoDetails { margin-top: 6px; }
+details#videoDetails summary { cursor: pointer; font-size: 12px; color: var(--muted); }

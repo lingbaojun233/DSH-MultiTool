@@ -1,0 +1,4 @@
+secrets.json
+*.jpg
+*.mp4
+node_modules/

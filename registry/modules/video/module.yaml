@@ -1,0 +1,11 @@
+name: video
+title: 看视频
+when: 用户发来视频文件或链接，要知道里面发生了什么、值不值得看时
+not_when: 纯文字对话，或视频在需要登录的私有页面上（yt-dlp 拿不到）时
+entry:
+  type: cmd
+  name: video/start-server.cmd
+cost: 高
+readme: README.md
+version: 0.1.0
+scope: server
