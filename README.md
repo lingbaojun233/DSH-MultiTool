@@ -2,88 +2,108 @@
 
 以 **DeepSeek Harness（DSH）** 为核心的 AI 多功能工具集。
 
-## 架构
-
-一个核心 + 多个模块。核心与每个模块在程序文件夹下**各占一个目录**：
+一个核心 + 多个模块：核心是 DSH 本体，模块各占一个目录，彼此通过 IO 层通信。
 
 ```text
-程序文件夹（服务器上 C:\Apps\DSH-MultiTool\）
-├── core\     核心 = DSH 本体：便携 Node、@deepseek-ai/dsh、headless profile、DSH_HOME
-├── io\       IO 模块：向核心喂输入、从核心取输出的唯一通道（127.0.0.1:8765）
-└── panel\    面板模块：文本输入输出界面，反代 io（127.0.0.1:8766）
+调用方（面板 / CLI / 脚本）
+    │
+    ▼
+io  ──► 拼 prompt（目录 → 人格 → 上下文 → 记忆 → 当前消息）
+    │
+    ▼
+core（dsh --profile headless "<task>"）──► 模型 + 工具
+    │
+    ▼
+答案回传；异步把这一轮写进记忆库
 ```
 
-模块不直接调用模型，只通过 IO 模块与核心交互；核心的模型、工具、安全默认值都来自 DSH 本体，
-模块不重复实现。
-
-## 数据流
+## 程序布局（服务器 `C:\Apps\DSH-MultiTool\`）
 
 ```text
-调用方 ──(HTTP POST /v1/input 或 CLI send)──> io 模块
-                                                │ 以位置参数传入任务
-                                                ▼
-                                        dsh --profile headless "<task>"
-                                                │ 模型推理 + 工具执行
-                                                ▼
-                                        stdout = 最终答案
-                                                │
-调用方 <──(JSON {ok, answer, exitCode, ms})──────┘
+├── core\       DSH 本体：便携 Node、@deepseek-ai/dsh、headless profile、DSH_HOME
+├── io\         IO 模块：与核心交互的唯一通道（127.0.0.1:8765）
+├── panel\      面板：文本输入输出界面，反代 io（127.0.0.1:8766）
+├── memory\     记忆：跨会话事件/事实/人格（127.0.0.1:8767，SQLite + FTS5）
+├── registry\   模块注册表：目录常驻、用法懒加载
+├── data\       运行时数据（记忆库、面板历史、审计；模块外，部署不覆盖）
+└── logs\       服务日志（模块外）
+```
+
+## prompt 的组装顺序
+
+io 在调用核心前按固定顺序拼接，**目录在最前**，以保证前缀稳定、可缓存：
+
+```text
+[模块目录]      registry 渲染：每行「名字 — 触发条件」，服务器视角 2 行 / 60 token
+[人格设定]      persona 常驻块（宪法 + traits + 自传），≤1500 token
+[最近对话]      面板带上的最近 6 轮
+[可用记忆]      memory_search 召回，≤6 条 / ≤800 token，每条带证据
+[当前消息]      用户这句话
 ```
 
 ## 仓库结构
 
 ```text
 DSH-MultiTool/
-├── core/
-│   ├── bootstrap.ps1            在 Windows 上安装/修复核心（幂等）
-│   ├── start-core.ps1           用 WMI 后台拉起安装（脱离 WinRM 管道）
-│   ├── start-bootstrap.cmd      同上，cmd 入口
-│   └── profile/headless/        headless profile 模板
-├── io/
-│   ├── io.js                    CLI + 库：调用核心并取回答案
-│   ├── server.js                HTTP 接口（默认 127.0.0.1:8765）
-│   └── smoke-test.ps1           端到端冒烟测试
-├── panel/
-│   ├── server.js                静态托管 + 反代 io（127.0.0.1:8766）
-│   ├── index.html / app.js / style.css
-│   ├── start-server.cmd         计划任务入口
-│   └── open-panel.cmd           本地一键启动（隧道 + 浏览器）
-├── memory/
-│   ├── server.js                记忆接口（127.0.0.1:8767）
-│   ├── lib/                     闸门 / 存储 / 索引 / 召回 / token 估算
-│   ├── schema/  rules/          事件 schema、巩固与冲突规则
-│   └── README.md
-├── registry/
-│   ├── modules/<name>/          每个模块一个目录：module.yaml + README.md
-│   ├── lib/                     校验 / 目录渲染 / 加载器 / README 生成 / 质检
-│   ├── tests/triggers.yaml      30 条触发测试集
-│   └── cli.js                   validate / catalog / read / lint / gen / stats
-└── docs/
+├── core/                 bootstrap.ps1（安装/修复）、profile 模板、启动器
+├── io/                   io.js（CLI + 库）、server.js、smoke-test.ps1
+├── panel/                server.js、index.html/app.js/style.css、open-panel.cmd
+├── memory/               server.js、lib/（闸门/存储/索引/召回/人格/维护）、
+│                         schema/、rules/、test/acceptance.js
+├── registry/             modules/<name>/{module.yaml,README.md}、
+│                         lib/（校验/目录/加载器/生成/质检/预取）、
+│                         tests/triggers.yaml、test/acceptance.js
+└── docs/                 memory-design.md、registry-design.md
 ```
 
-## 部署状态
+## 模块与状态
 
-| 组件 | 状态 | 版本 |
+| 模块 | 作用 | 状态 |
 | --- | --- | --- |
-| core | 已部署并验证 | dsh 0.1.1-rc.2 + Node v22.23.5 |
-| io | 已部署、开机自启（SYSTEM 计划任务） | CLI + HTTP 均通过 |
-| panel | 已部署、开机自启（SYSTEM 计划任务） | 本地经 SSH 隧道访问，端到端 3.5 s |
-| memory | 已部署、开机自启 + 每日 03:00 巩固，v0.2 | SQLite+FTS5，10 万条下 p95 0.7ms，验收 7/7 |
-| registry | 已部署，注入 io 的 prompt 顶部 | 目录 92 token（3 模块），触发测试 30/30，验收 9/9 |
+| core | DSH 本体 + 便携 Node | dsh 0.1.1-rc.2 / Node 22.23.5 |
+| io | 唯一对话通道，负责拼 prompt、调核心、回写记忆 | 延迟 3.4 s（模型侧为主） |
+| panel | 网页面板：Markdown 渲染、历史持久化、引用计数 | 经 SSH 隧道访问，仅监听回环 |
+| memory | 事件 + 事实 + 人格；双预算召回；每日巩固 | 10 万条下 p95 **0.7 ms**，冷启动 11 ms，验收 7/7 |
+| registry | 模块目录常驻、README 懒加载、触发测试 | 验收 11/11，触发测试 30/30 |
 
-服务器侧基础设施：OpenSSH Server（仅公钥登录）、WinRM（控制通道）、
-计划任务 `DSH-MultiTool IO`（开机拉起 `io\server.js`）。
+服务器上的计划任务：`DSH-MultiTool IO`、`DSH-MultiTool Panel`、`DSH-MultiTool Memory`（均开机自启，SYSTEM）、
+`DSH-MultiTool Memory Nightly`（每日 03:00）。
 
-验证记录（服务器实测）：`io send` → 3.4 s 返回；HTTP `/v1/input` → 3.2 s 返回；中文任务往返正常。
+## 快速开始
 
-## 关键约束（0.1.1-rc.2 实测）
+```powershell
+# 本地打开面板（自动建 SSH 隧道）
+DSH-MultiTool\panel\open-panel.cmd
 
-- `dsh --profile headless "<task>"`：**任务只能作为位置参数**。
-- 不支持 `-`（stdin 标记）、`--json`、`--session-id` —— 文档里这些是更新版本的能力；
-  传 `-` 会被当成任务文本原样回复。
+# 命令行直接问
+node io\io.js send "帮我查一下上次说的部署路径"
+
+# 模块注册表
+node registry\cli.js catalog            # 渲染目录
+node registry\cli.js read memory        # 懒加载用法
+node registry\cli.js lint               # README 质检
+```
+
+## 关键约束（dsh 0.1.1-rc.2 实测）
+
+- 任务**只能**作为位置参数；不支持 `-`（stdin 标记）、`--json`、`--session-id`。
 - 凭据读取顺序：启动环境变量 → 当前目录 `.env` → `$DSH_HOME/.env`；headless 不读图形界面凭据库。
+- 每次请求派生一个核心进程（约 1.5–2 s 启动），并发数 ≈ 进程数，当前无并发闸。
+
+## 实测结论（决定设计取舍的依据）
+
+| 结论 | 数据 |
+| --- | --- |
+| 人格块必须显式注入 | 之前漏接时模型完全看不到宪法；接入后回答体现身份与边界 |
+| 对话上下文能消解指代 | 带 history 时能答"那个东西"；不带时会明确拒答而非编造 |
+| 记忆召回有效 | 只存在于记忆里的信息可被召回并正确回答（3.5 s） |
+| 目录字节必须稳定 | 同输入跨进程/跨机器 sha 一致（`62afa0cf…`） |
+| **模型不会主动调 `read`** | 30 条标注问法，实测 **0 次**调用；它改为 `ls`/`find` 直接翻文件，甚至声称"我用 read 加载了文档"（幻觉） |
+| 按触发条件预取不可行 | `when` 二元组打分：none 上界 0.04 与 memory 的 0.05 重合，无阈值可分 |
+| 名字命中预取有效 | 明确说出模块名时注入 README，确定性、零误判，仅此时付约 250 token |
 
 ## 安全
 
-- 凭据、Token 一律不进本仓库；服务器上的 Key 放在 `core\home\.env`（已在仓库外）。
-- 详见 `../secrets/README.md`。
+- 凭据、Token 不进仓库；服务器 Key 放在 `core\home\.env`（仓库外）。
+- SSH 仅公钥登录（`PasswordAuthentication no` + `KbdInteractiveAuthentication no`）。
+- 所有服务只监听 `127.0.0.1`；本地经 SSH 隧道访问，不暴露公网端口。
