@@ -99,6 +99,52 @@ async function recallFor(task, options = {}) {
   }
 }
 
+/**
+ * 人格常驻块：这是"按人格要求回答"的唯一依据。
+ * 60 秒缓存——人格变更低频，但也不能永远拿到陈旧版本。
+ */
+let personaCache = { at: 0, block: null };
+async function personaBlock(options = {}) {
+  if (!memoryEnabled(options) || options.persona === false) return null;
+  if (Date.now() - personaCache.at < 60000) return personaCache.block;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const res = await fetch(`${MEMORY_URL}/v1/persona`, { signal: controller.signal });
+    const data = await res.json();
+    personaCache = { at: Date.now(), block: data && data.ok && data.block ? data.block : null };
+  } catch {
+    personaCache = { at: Date.now(), block: null };
+  } finally {
+    clearTimeout(timer);
+  }
+  return personaCache.block;
+}
+
+/** 把人格块、对话上下文、记忆块、当前消息按固定顺序拼成 prompt。 */
+function composePrompt({ persona, history, memory, task }) {
+  const sections = [];
+
+  if (persona) {
+    sections.push('[人格设定 · 这是你的身份与行为准则，优先遵守]', persona);
+  }
+  if (Array.isArray(history) && history.length) {
+    const lines = ['[最近对话 · 用于理解指代与言外之意]'];
+    for (const turn of history.slice(-8)) {
+      const who = turn.role === 'user' ? '用户' : 'DSH';
+      lines.push(`${who}：${String(turn.text || '').slice(0, 500)}`);
+    }
+    sections.push(lines.join('\n'));
+  }
+  if (memory) {
+    sections.push(memory);
+  }
+
+  sections.push('[当前消息]', String(task));
+  return sections.join('\n\n');
+}
+
 /** 记录一轮对话（用户消息 + DSH 回答）。失败只记日志，不影响对话。 */
 async function recordTurn(task, answer, options = {}) {
   if (!memoryEnabled(options) || options.record === false) return;
@@ -193,8 +239,13 @@ async function run(task, options = {}) {
     };
   }
 
-  const recall = await recallFor(task, options);
-  const promptText = recall && recall.block ? `${recall.block}\n\n---\n${String(task)}` : String(task);
+  const [recall, persona] = await Promise.all([recallFor(task, options), personaBlock(options)]);
+  const promptText = composePrompt({
+    persona,
+    history: options.history,
+    memory: recall && recall.block ? recall.block : null,
+    task,
+  });
 
   const timeoutMs = Number(options.timeoutMs || process.env.DSH_IO_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
   const args = [p.bin, '--profile', 'headless', promptText];

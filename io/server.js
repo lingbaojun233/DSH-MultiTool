@@ -82,11 +82,12 @@ const server = http.createServer(async (req, res) => {
     const text = typeof payload.text === 'string' ? payload.text : '';
     if (!text.trim()) return json(res, 400, { ok: false, error: 'text is required' });
 
-    log(`input len=${text.length} session=${payload.sessionId || '-'}`);
+    log(`input len=${text.length} session=${payload.sessionId || '-'} history=${Array.isArray(payload.history) ? payload.history.length : 0}`);
     const result = await run(text, {
       sessionId: payload.sessionId || undefined,
       permissionMode: payload.permissionMode || undefined,
       timeoutMs: payload.timeoutMs || undefined,
+      history: Array.isArray(payload.history) ? payload.history.slice(-8) : undefined,
     });
 
     log(`output ok=${result.ok} code=${result.code} ms=${result.ms}`);

@@ -16,6 +16,9 @@ if (hasMarkdown) {
 
 let busy = false;
 
+// 最近几轮对话（发给 io 作为上下文），刷新后从服务端历史回填
+const recentTurns = [];
+
 // 会话 id：用于记忆证据定位（chat:<sessionId>#u<时间戳>），存在浏览器里
 const SESSION_KEY = 'dsh-panel-session';
 function getSessionId() {
@@ -130,6 +133,13 @@ async function loadHistory() {
       }
     }
     logEl.scrollTop = logEl.scrollHeight;
+
+    // 回填上下文，避免刷新后模型"失忆"
+    recentTurns.length = 0;
+    for (const m of messages.slice(-8)) {
+      if (m.role === 'user') recentTurns.push({ role: 'user', text: m.text || '' });
+      else if (m.role === 'assistant') recentTurns.push({ role: 'assistant', text: m.text || '' });
+    }
   } catch (err) {
     /* offline: start with an empty transcript */
   }
@@ -156,7 +166,10 @@ async function send() {
   inputEl.value = '';
   autoGrow();
 
+  // 把最近几轮带上去，模型才能读出指代与言外之意
+  const history = recentTurns.slice(-6);
   addMessage('user', text, formatClock(Date.now()));
+  recentTurns.push({ role: 'user', text });
   const pending = addPending();
   const started = performance.now();
 
@@ -164,7 +177,7 @@ async function send() {
     const res = await fetch('/api/input', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text, sessionId: getSessionId() }),
+      body: JSON.stringify({ text, sessionId: getSessionId(), history }),
     });
     const data = await res.json().catch(() => ({ ok: false, error: '无法解析响应' }));
     pending.remove();
@@ -173,6 +186,8 @@ async function send() {
       const ms = typeof data.ms === 'number' ? data.ms : Math.round(performance.now() - started);
       const memCount = data.memory && data.memory.used ? data.memory.used.count : 0;
       const memNote = memCount > 0 ? ` · 参考 ${memCount} 条记忆` : '';
+      recentTurns.push({ role: 'assistant', text: data.answer || '' });
+      if (recentTurns.length > 12) recentTurns.splice(0, recentTurns.length - 12);
       addMessage('assistant', data.answer || '（空答案）', `${(ms / 1000).toFixed(1)} 秒${memNote} · ${formatClock(Date.now())}`);
     } else {
       const detail = data.exitCode != null ? `exit=${data.exitCode}` : '';
