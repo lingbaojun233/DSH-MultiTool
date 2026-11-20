@@ -21,7 +21,6 @@ const path = require('node:path');
 const IO_DIR = __dirname;
 const DEFAULT_TIMEOUT_MS = 300000;
 const MEMORY_URL = process.env.DSH_MEMORY_URL || 'http://127.0.0.1:8767';
-const MEMORY_BUDGET = { max_items: 6, max_tokens: 800 };
 
 function resolveCore(options = {}) {
   const dir = path.resolve(options.coreDir || process.env.DSH_CORE_DIR || path.join(IO_DIR, '..', 'core'));
@@ -76,36 +75,13 @@ async function postJson(url, body, timeoutMs = 8000) {
   }
 }
 
-/** 召回并渲染注入块；记忆服务不可用时静默降级为"无记忆"。 */
-async function recallFor(task, options = {}) {
-  if (!memoryEnabled(options)) return null;
-  try {
-    const { ok, data } = await postJson(`${MEMORY_URL}/v1/tools/memory_search`, {
-      query: String(task).slice(0, 500),
-      budget: MEMORY_BUDGET,
-    });
-    if (!ok || !data || !data.ok) return null;
-
-    const items = Array.isArray(data.items) ? data.items : [];
-    if (!items.length) return { block: null, used: data.used, items: [] };
-
-    const lines = ['[可用记忆 · 仅在相关时引用；这里没有的信息不要编造]'];
-    items.forEach((item, index) => {
-      lines.push(`${index + 1}. ${item.text}  ⟵ ${item.evidence || 'no-evidence'}`);
-    });
-    return { block: lines.join('\n'), used: data.used, items: items.map((i) => ({ id: i.id, evidence: i.evidence })) };
-  } catch {
-    return null;
-  }
-}
-
 /**
  * 人格常驻块：这是"按人格要求回答"的唯一依据。
  * 60 秒缓存——人格变更低频，但也不能永远拿到陈旧版本。
  */
 let personaCache = { at: 0, block: null };
 async function personaBlock(options = {}) {
-  if (!memoryEnabled(options) || options.persona === false) return null;
+  if (options.persona === false) return null;
   if (Date.now() - personaCache.at < 60000) return personaCache.block;
 
   const controller = new AbortController();
@@ -124,7 +100,7 @@ async function personaBlock(options = {}) {
 
 /**
  * 模块目录：常驻、极便宜（每模块一行），只告诉模型"有哪些模块、何时用"。
- * 放在系统提示最前部，内容稳定才能命中前缀缓存。
+ * 用法由 read_module 原生工具按需加载——这里不再给路径与命令，避免重复。
  */
 let catalogCache = { at: 0, block: null, modules: [] };
 function registryBlock(options = {}) {
@@ -137,52 +113,19 @@ function registryBlock(options = {}) {
     // io 跑在服务器上：只暴露服务器真正能用的模块（deploy 这类本地工具不出现）
     const scope = process.env.DSH_REGISTRY_SCOPE || 'server';
     const result = render({ root: path.join(registryDir, 'modules'), scope });
-    const lines = [
-      '[模块目录 · 需要某模块的具体用法时，只能用下面的 read 命令加载；不要凭目录猜]',
-      result.text,
-      `模块文档：${path.join(registryDir, 'modules')}\\<name>\\README.md`,
-      `加载用法：node "${path.join(registryDir, 'cli.js')}" read <name>`,
-      result.activeLine || '已激活：无',
-    ];
-    catalogCache = { at: Date.now(), block: lines.join('\n'), modules: result.modules.map((m) => m.name) };
+    const block = ['[模块目录]', result.text].join('\n');
+    catalogCache = { at: Date.now(), block, modules: result.modules.map((m) => m.name) };
   } catch {
     catalogCache = { at: Date.now(), block: null, modules: [] };
   }
   return catalogCache.block;
 }
 
-/**
- * 名字命中才预取：用户/模型明确说了模块名时，把它的 README 直接放进上下文。
- * 不做语义猜测——实测字符二元组打分在 none 与真实模块之间完全不可分。
- */
-function nameTriggeredUsage(task, options = {}) {
-  if (options.registry === false) return null;
-  const names = catalogCache.modules || [];
-  if (!names.length) return null;
-
-  const text = String(task || '');
-  const hit = names.find((name) => new RegExp(`(^|[^a-z])${name}([^a-z]|$)`, 'i').test(text));
-  if (!hit) return null;
-
-  try {
-    const registryDir = path.join(IO_DIR, '..', 'registry');
-    const loader = require(path.join(registryDir, 'lib', 'loader.js'));
-    const read = loader.read(path.join(registryDir, 'modules'), hit, {
-      sessionKey: options.sessionId || 'adhoc',
-    });
-    if (!read || !read.ok) return null;
-    return { name: hit, block: `[模块用法 · ${hit}]\n${read.content}`, tokens: read.tokens };
-  } catch {
-    return null;
-  }
-}
-
-/** 把人格块、对话上下文、记忆块、当前消息按固定顺序拼成 prompt。 */
-function composePrompt({ catalog, usage, persona, history, memory, task }) {
+/** 把人格块、对话上下文、当前消息按固定顺序拼成 prompt。 */
+function composePrompt({ catalog, persona, history, task }) {
   const sections = [];
 
   if (catalog) sections.push(catalog);
-  if (usage) sections.push(usage);
 
   if (persona) {
     sections.push('[人格设定 · 这是你的身份与行为准则，优先遵守]', persona);
@@ -194,9 +137,6 @@ function composePrompt({ catalog, usage, persona, history, memory, task }) {
       lines.push(`${who}：${String(turn.text || '').slice(0, 500)}`);
     }
     sections.push(lines.join('\n'));
-  }
-  if (memory) {
-    sections.push(memory);
   }
 
   sections.push('[当前消息]', String(task));
@@ -297,15 +237,12 @@ async function run(task, options = {}) {
     };
   }
 
-  const [recall, persona] = await Promise.all([recallFor(task, options), personaBlock(options)]);
+  const persona = await personaBlock(options);
   const catalog = registryBlock(options);
-  const usage = nameTriggeredUsage(task, options);
   const promptText = composePrompt({
     catalog,
-    usage: usage ? usage.block : null,
     persona,
     history: options.history,
-    memory: recall && recall.block ? recall.block : null,
     task,
   });
 
@@ -384,10 +321,6 @@ async function run(task, options = {}) {
     }
   });
 
-  if (recall) {
-    result.memory = { used: recall.used, items: recall.items };
-  }
-
   // 落事件：不阻塞返回，失败也不影响对话
   setImmediate(() => {
     recordTurn(task, result.answer, options).catch(() => {});
@@ -411,7 +344,7 @@ function usage() {
       'Options:',
       '  --session <id>        session id used for memory evidence',
       '  --timeout <ms>        hard timeout, default 300000',
-      '  --no-memory           skip recall and skip recording events',
+      '  --no-memory           skip persona injection and event recording',
       '  --json                print the full result object',
       '',
     ].join('\n'),
@@ -452,11 +385,10 @@ async function main(argv) {
     else if (opts.stdin) task = fs.readFileSync(0, 'utf8');
     else task = opts._.join(' ') || '（空任务）';
 
-    const [recall, persona] = await Promise.all([recallFor(task, opts), personaBlock(opts)]);
+    const persona = await personaBlock(opts);
     const catalog = registryBlock(opts);
-    const usage = nameTriggeredUsage(task, opts);
     process.stdout.write(
-      `${composePrompt({ catalog, usage: usage ? usage.block : null, persona, history: opts.history, memory: recall && recall.block, task })}\n`,
+      `${composePrompt({ catalog, persona, history: opts.history, task })}\n`,
     );
     return 0;
   }

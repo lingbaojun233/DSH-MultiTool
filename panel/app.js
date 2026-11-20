@@ -184,11 +184,9 @@ async function send() {
 
     if (data.ok) {
       const ms = typeof data.ms === 'number' ? data.ms : Math.round(performance.now() - started);
-      const memCount = data.memory && data.memory.used ? data.memory.used.count : 0;
-      const memNote = memCount > 0 ? ` · 参考 ${memCount} 条记忆` : '';
       recentTurns.push({ role: 'assistant', text: data.answer || '' });
       if (recentTurns.length > 12) recentTurns.splice(0, recentTurns.length - 12);
-      addMessage('assistant', data.answer || '（空答案）', `${(ms / 1000).toFixed(1)} 秒${memNote} · ${formatClock(Date.now())}`);
+      addMessage('assistant', data.answer || '（空答案）', `${(ms / 1000).toFixed(1)} 秒 · ${formatClock(Date.now())}`);
     } else {
       const detail = data.exitCode != null ? `exit=${data.exitCode}` : '';
       addMessage('error', data.error || data.code || '请求失败', detail);

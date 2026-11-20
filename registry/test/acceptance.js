@@ -123,7 +123,7 @@ const withCatalog = io.composePrompt({ catalog: catalogBlock, persona: personaSt
 const delta = estimateTokens(withCatalog) - estimateTokens(withoutCatalog);
 check('接入目录的常驻开销可量化', delta > 0 && delta < 250, `+${delta} token（目录 ${catalogTokens} token）`);
 check('“已激活”行不在目录文本里', !catalogBlock.split('\n').some((l) => l.startsWith('已激活') && before.text.includes(l)));
-check('目录块含 3 行模块与加载提示', catalogBlock.includes('- memory —') && catalogBlock.includes('read <name>'));
+check('目录块含 3 行模块与加载提示', catalogBlock.includes('- memory —') && catalogBlock.startsWith('[模块目录]'));
 
 console.log('\n集成前后对比：');
 console.log(`  不带目录 prompt  ${estimateTokens(withoutCatalog)} token`);
