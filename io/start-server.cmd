@@ -1,7 +1,10 @@
 @echo off
 setlocal
 rem Entry point for the "DSH-MultiTool IO" scheduled task (starts at boot).
-rem Kept as a .cmd so the task action needs no shell quoting and stdout has a home.
-set "IO=%~dp0"
-cd /d "%IO%"
-"%IO%..\core\runtime\node\node.exe" "%IO%server.js" >> "%IO%service.log" 2>&1
+rem Logs live OUTSIDE the module folder: push replaces io\ wholesale, and an open
+rem log file inside it would make the directory undeletable.
+set "HERE=%~dp0"
+set "LOGDIR=%HERE%..\logs"
+if not exist "%LOGDIR%" mkdir "%LOGDIR%"
+cd /d "%HERE%"
+"%HERE%..\core\runtime\node\node.exe" "%HERE%server.js" >> "%LOGDIR%\io.log" 2>&1

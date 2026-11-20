@@ -45,7 +45,7 @@ ssh -N -L 8766:127.0.0.1:8766 fish-server     # 保持这个窗口
 | 触发器 | 开机（AtStartup） |
 | 身份 | `SYSTEM` |
 | 入口 | `start-server.cmd` |
-| 日志 | `panel\service.log` |
+| 日志 | `..\logs\panel.log`（放在模块目录外，避免 `push` 整目录替换时被占用） |
 
 ## 排错
 

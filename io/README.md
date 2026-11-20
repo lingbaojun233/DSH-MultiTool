@@ -75,7 +75,7 @@ powershell -NoProfile -File io\smoke-test.ps1
 | 触发器 | 开机（AtStartup） |
 | 运行身份 | `SYSTEM`（无需登录、无需密码） |
 | 入口 | `start-server.cmd` |
-| 日志 | `io\service.log`（追加写） |
+| 日志 | `..\logs\io.log`（追加写；放在模块目录外，避免 `push` 整目录替换时被占用） |
 | 失败策略 | 每 1 分钟重试，最多 3 次；不设运行时长上限 |
 
 运维命令（管理员）：

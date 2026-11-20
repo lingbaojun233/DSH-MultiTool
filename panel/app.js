@@ -8,11 +8,31 @@ const clearBtn = document.getElementById('clear');
 const statusEl = document.getElementById('status');
 const statusText = document.getElementById('statusText');
 
+const hasMarkdown = typeof window.marked !== 'undefined' && typeof window.DOMPurify !== 'undefined';
+
+if (hasMarkdown) {
+  window.marked.setOptions({ gfm: true, breaks: true });
+}
+
 let busy = false;
 
 function setStatus(kind, text) {
   statusEl.className = `status ${kind}`;
   statusText.textContent = text;
+}
+
+/**
+ * Model output is untrusted: render Markdown, then sanitize before touching DOM.
+ * Without the libraries the bubble falls back to plain text.
+ */
+function renderMarkdown(text) {
+  if (!hasMarkdown) return null;
+  try {
+    const html = window.marked.parse(text);
+    return window.DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
+  } catch (err) {
+    return null;
+  }
 }
 
 function addMessage(role, text, meta) {
@@ -23,7 +43,15 @@ function addMessage(role, text, meta) {
 
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
-  bubble.textContent = text;
+
+  const html = role === 'assistant' ? renderMarkdown(text) : null;
+  if (html !== null) {
+    bubble.classList.add('md');
+    bubble.innerHTML = html;
+  } else {
+    bubble.textContent = text;
+  }
+
   wrap.appendChild(bubble);
 
   if (meta) {
