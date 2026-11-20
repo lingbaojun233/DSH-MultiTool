@@ -219,14 +219,40 @@ const server = http.createServer(async (req, res) => {
     if (key === 'GET /v1/events') {
       const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit') || 50)));
       const only = url.searchParams.get('user_id');
+      const deletedParam = url.searchParams.get('deleted') === '1';
       let events = db.prepare(
-        'SELECT id, ts, channel, group_id, speaker_id, speaker_name, kind, content, evidence, confidence, salience, user_id FROM events WHERE deleted = 0 ORDER BY id DESC LIMIT ?',
+        'SELECT id, ts, channel, group_id, speaker_id, speaker_name, kind, content, evidence, confidence, salience, user_id, deleted FROM events WHERE deleted = ' + (deletedParam ? 1 : 0) + ' ORDER BY id DESC LIMIT ?',
       ).all(limit);
       if (only) {
         const uid = Number(only);
         events = events.filter((e) => e.user_id === null || e.user_id === uid);
       }
       return sendJson(res, 200, { ok: true, count: events.length, events });
+    }
+    // 事实列表：status=active|conflict|retired|all
+    if (key === 'GET /v1/facts') {
+      const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit') || 100)));
+      const status = url.searchParams.get('status') || 'all';
+      const uid = url.searchParams.get('user_id');
+      const where = ['deleted = 0'];
+      const params = [];
+      if (status !== 'all') { where.push('status = ?'); params.push(status); }
+      if (uid) { where.push('(user_id = ? OR user_id IS NULL)'); params.push(Number(uid)); }
+      params.push(limit);
+      const rows = db.prepare(
+        `SELECT id, subject, predicate, object, confidence, support, status, evidence_event_ids, first_seen, last_seen, user_id
+           FROM facts WHERE ${where.join(' AND ')} ORDER BY id DESC LIMIT ?`,
+      ).all(...params);
+      return sendJson(res, 200, { ok: true, count: rows.length, facts: rows });
+    }
+
+    // 实体列表
+    if (key === 'GET /v1/entities') {
+      const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit') || 200)));
+      const rows = db.prepare(
+        'SELECT id, type, name, aliases, note, created_at FROM entities ORDER BY id DESC LIMIT ?',
+      ).all(limit);
+      return sendJson(res, 200, { ok: true, count: rows.length, entities: rows });
     }
     // 审计查询：面板用它在每轮结束后统计"这一轮用了几条记忆、写入了几条事件"
     if (key === 'GET /v1/audits') {

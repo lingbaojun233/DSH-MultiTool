@@ -497,40 +497,85 @@ async function loadPersonaView() {
   }
 }
 
-/** 记忆栏：库统计 + 最近事件。 */
+/** 五种明细的取数与标题。 */
+const DETAILS = {
+  events: { title: '全部事件', url: '/api/memory/events?limit=100' },
+  facts: { title: '全部事实', url: '/api/memory/facts?limit=100' },
+  conflicts: { title: '冲突事实', url: '/api/memory/facts?status=conflict&limit=100' },
+  entities: { title: '全部实体', url: '/api/memory/entities?limit=200' },
+  deleted: { title: '已删除事件', url: '/api/memory/events?limit=100&deleted=1' },
+};
+let currentDetail = 'events';
+
+function renderDetail(kind, payload) {
+  const spec = DETAILS[kind] || DETAILS.events;
+  const titleEl = document.getElementById('detailTitle');
+  const countEl = document.getElementById('detailCount');
+  const list = document.getElementById('memEvents');
+  if (!list) return;
+
+  let rows = [];
+  if (kind === 'facts' || kind === 'conflicts') {
+    rows = (payload.facts || []).map((f) => '<li><div>' + escapeHtml(f.subject + ' · ' + f.predicate + ' · ' + f.object)
+      + '</div><div class="ev-meta">' + escapeHtml(f.status) + ' · 置信 ' + escapeHtml(f.confidence)
+      + ' · 支持 ' + escapeHtml(f.support) + ' · ' + escapeHtml(f.last_seen) + '</div></li>');
+  } else if (kind === 'entities') {
+    rows = (payload.entities || []).map((e) => '<li><div>' + escapeHtml(e.name)
+      + ' <span class="ev-meta">' + escapeHtml(e.type) + '</span></div><div class="ev-meta">'
+      + escapeHtml(e.aliases || '') + '</div></li>');
+  } else {
+    rows = (payload.events || []).map((ev) => '<li><div>' + escapeHtml(ev.content)
+      + '</div><div class="ev-meta">#' + escapeHtml(ev.id) + ' · ' + escapeHtml(ev.actor) + ' · '
+      + escapeHtml(ev.ts) + ' · ' + escapeHtml(ev.evidence)
+      + (ev.user_id == null ? ' · 共享' : ' · 用户 ' + escapeHtml(ev.user_id)) + '</div></li>');
+  }
+
+  if (titleEl) titleEl.firstChild.textContent = spec.title + ' ';
+  if (countEl) countEl.textContent = rows.length + ' 条';
+  list.innerHTML = rows.join('') || '<li class="ev-meta">（暂无）</li>';
+}
+
+async function loadDetail(kind) {
+  currentDetail = DETAILS[kind] ? kind : 'events';
+  try {
+    const data = await apiJson(DETAILS[currentDetail].url);
+    renderDetail(currentDetail, data || {});
+  } catch (err) {
+    const list = document.getElementById('memEvents');
+    if (list) list.innerHTML = '<li class="ev-meta">加载失败：' + escapeHtml(err.message) + '</li>';
+  }
+}
+
+/** 记忆栏：统计按钮（点了看明细）+ 明细列表。 */
 async function loadMemoryView() {
   if (!currentUser) return;
+
   try {
     const s = await apiJson('/api/memory/stats');
     if (s && s.ok) {
       const c = s.counts || {};
-      const rows = [
-        ['事件', c.events], ['事实', c.facts], ['冲突', c.conflicts],
-        ['实体', c.entities], ['已删', c.deletedEvents],
+      const kinds = [
+        ['events', '事件', c.events], ['facts', '事实', c.facts], ['conflicts', '冲突', c.conflicts],
+        ['entities', '实体', c.entities], ['deleted', '已删', c.deletedEvents],
       ];
-      document.getElementById('memStats').innerHTML = rows
-        .map(([k, v]) => '<div class="stat"><b>' + (v == null ? 0 : v) + '</b><span>' + k + '</span></div>')
+      document.getElementById('memStats').innerHTML = kinds
+        .map(([kind, label, v]) => '<button class="stat" data-kind="' + kind + '"><b>'
+          + (v == null ? 0 : v) + '</b><span>' + label + '</span></button>')
         .join('');
+      document.querySelectorAll('#memStats .stat').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          document.querySelectorAll('#memStats .stat').forEach((b) => b.classList.remove('active'));
+          btn.classList.add('active');
+          loadDetail(btn.dataset.kind);
+        });
+      });
     }
   } catch (err) {
     /* 忽略 */
   }
 
-  if (!currentUser) return;
-  try {
-    const e = await apiJson('/api/memory/events?limit=20');
-    if (e && e.ok) {
-      const list = (e.events || []).slice().reverse();
-      document.getElementById('memEvents').innerHTML = list
-        .map((ev) => '<li><div>' + escapeHtml(ev.content) + '</div><div class="ev-meta">'
-          + escapeHtml(ev.actor) + ' · ' + escapeHtml(ev.ts) + ' · ' + escapeHtml(ev.evidence) + '</div></li>')
-        .join('') || '<li class="ev-meta">（暂无事件）</li>';
-    }
-  } catch (err) {
-    /* 忽略 */
-  }
+  await loadDetail(currentDetail);
 }
-
 /** 切栏：聊天 / 记忆 / 人格 / 账号。 */
 function setView(name) {
   document.querySelectorAll('.view').forEach((s) => s.classList.toggle('active', s.id === 'view-' + name));

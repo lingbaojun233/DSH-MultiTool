@@ -411,3 +411,13 @@ button.danger:hover { border-color: var(--err); }
 
 .card h2 { margin: 0 0 10px; font-size: 14px; font-weight: 600; }
 .card h2 .muted { font-weight: 400; font-size: 12px; margin-left: 6px; }
+/* 统计卡片可点击 */
+button.stat {
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+  border: 1px solid var(--border);
+  font: inherit;
+}
+button.stat:hover { border-color: var(--accent); }
+button.stat.active { border-color: var(--accent); background: #1b2130; }
