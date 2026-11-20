@@ -1,4 +1,4 @@
-# DSH MultiTool
+# DSH-MultiTool
 
 以 **DeepSeek Harness（DSH）** 为核心的 AI 多功能工具集。
 
@@ -12,7 +12,7 @@ DSH 驱动的统一入口，用自然语言调用，而不是散落一堆一次�
 ## 仓库结构
 
 ```text
-dsh-multitool/
+DSH-MultiTool/
 ├── README.md          # 本文件
 ├── .gitignore         # 忽略规则（含密钥类文件，双保险）
 ├── docs/              # 设计文档、需求记录
