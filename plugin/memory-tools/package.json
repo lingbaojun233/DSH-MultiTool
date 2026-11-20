@@ -1,0 +1,17 @@
+{
+  "name": "@dsh-multitool/memory-tools",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "把 memory 与 registry 暴露成 DSH 原生工具",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": ["index.js", "cordis.patch.yml", "locale", "README.md"],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

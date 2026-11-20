@@ -53,6 +53,7 @@ DSH-MultiTool/
 ├── registry/             modules/<name>/{module.yaml,README.md}、
 │                         lib/（校验/目录/加载器/生成/质检/预取）、
 │                         tests/triggers.yaml、test/acceptance.js
+├── plugin/               DSH 原生工具插件（把能力注册进工具表，而非只给散文）
 └── docs/                 memory-design.md、registry-design.md
 ```
 
@@ -65,6 +66,7 @@ DSH-MultiTool/
 | panel | 网页面板：Markdown 渲染、历史持久化、引用计数 | 经 SSH 隧道访问，仅监听回环 |
 | memory | 事件 + 事实 + 人格；双预算召回；每日巩固 | 10 万条下 p95 **0.7 ms**，冷启动 11 ms，验收 7/7 |
 | registry | 模块目录常驻、README 懒加载、触发测试 | 验收 11/11，触发测试 30/30 |
+| plugin | 把记忆与模块读取注册成 DSH 原生工具 | 已装入 headless profile，模型实测会调用 |
 
 服务器上的计划任务：`DSH-MultiTool IO`、`DSH-MultiTool Panel`、`DSH-MultiTool Memory`（均开机自启，SYSTEM）、
 `DSH-MultiTool Memory Nightly`（每日 03:00）。
@@ -101,6 +103,7 @@ node registry\cli.js lint               # README 质检
 | **模型不会主动调 `read`** | 30 条标注问法，实测 **0 次**调用；它改为 `ls`/`find` 直接翻文件，甚至声称"我用 read 加载了文档"（幻觉） |
 | 按触发条件预取不可行 | `when` 二元组打分：none 上界 0.04 与 memory 的 0.05 重合，无阈值可分 |
 | 名字命中预取有效 | 明确说出模块名时注入 README，确定性、零误判，仅此时付约 250 token |
+| **注册成工具后模型会主动调用** | 装上 plugin 后：`memory_search` 触发 +3 次、`read_module` +1 次；散文时代为 0 次 |
 
 ## 安全
 

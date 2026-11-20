@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Memory tools",
+    "description": "Exposes memory_search / memory_remember / memory_forget and read_module as native DSH tools, backed by the local memory service and module registry."
+  }
+}
