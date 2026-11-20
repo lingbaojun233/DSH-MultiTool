@@ -87,6 +87,14 @@ DSH-MultiTool/
 - 记忆写入带 `user_id`；检索只返回「自己的 + 共享的」。
 - 迁移前的存量记忆 `user_id` 为 NULL，**对所有用户可见**（历史数据默认共享）。
 
+### 管理员
+
+- `users.role` 为 `admin` 的账号可调 `GET /v1/admin/users` 与 `DELETE /v1/admin/users/:id`。
+- 删除账号会连带清空其会话、相处档案，并调用 memory 的 `purge-user` **软删其全部记忆**（移出索引，检索立即不可见）。
+- 管理员不能删除自己（`E_SELF`）。
+- 面板中管理员登录后，记忆抽屉会多出「账号管理」卡片，可逐个删除账号。
+- 首个管理员靠一次性 SQL 引导（`UPDATE users SET role='admin' WHERE username=?`），之后可正常用接口管理。
+
 服务器上的计划任务：`DSH-MultiTool IO`、`DSH-MultiTool Panel`、`DSH-MultiTool Memory`（均开机自启，SYSTEM）、
 `DSH-MultiTool Memory Nightly`（每日 03:00）。
 

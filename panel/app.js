@@ -189,6 +189,47 @@ function handleUnauthorized(message) {
   showAuth('login', message || '会话过期，请重新登录');
 }
 
+/** 管理员面板：列出账号，可删除（不能删自己）。非管理员整块隐藏。 */
+async function loadAdminPanel() {
+  const card = document.getElementById('adminCard');
+  if (!card) return;
+  if (!currentUser || currentUser.role !== 'admin') {
+    card.classList.add('hidden');
+    return;
+  }
+  card.classList.remove('hidden');
+  const list = document.getElementById('adminUsers');
+  const count = document.getElementById('adminCount');
+  try {
+    const data = await apiJson('/api/admin/users');
+    const users = (data && data.users) || [];
+    if (count) count.textContent = users.length + ' 个';
+    list.innerHTML = users.map((u) => {
+      const self = u.id === currentUser.id;
+      return '<li data-uid="' + u.id + '"><div>' + escapeHtml(u.display_name || u.username)
+        + (self ? '（我）' : '') + ' <span class="ev-meta">@' + escapeHtml(u.username)
+        + ' · ' + escapeHtml(u.role) + '</span></div>'
+        + (self ? '' : '<button class="ghost danger" data-del="' + u.id + '">删除</button>')
+        + '</li>';
+    }).join('') || '<li class="ev-meta">（暂无账号）</li>';
+
+    list.querySelectorAll('[data-del]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const uid = Number(btn.dataset.del);
+        if (!window.confirm('删除这个账号连同其全部记忆？不可恢复。')) return;
+        try {
+          await apiFetch('/api/admin/users/' + uid, { method: 'DELETE' });
+          await loadAdminPanel();
+        } catch (err) {
+          window.alert('删除失败：' + (err && err.message ? err.message : err));
+        }
+      });
+    });
+  } catch (err) {
+    list.innerHTML = '<li class="ev-meta">加载失败：' + escapeHtml(err && err.message ? err.message : String(err)) + '</li>';
+  }
+}
+
 /** 登录/注册成功后进入用户态。 */
 function enterSession(data) {
   saveToken(data.token);
@@ -200,6 +241,7 @@ function enterSession(data) {
   refreshHealth();
   loadHistory();
   if (currentUser) inputEl.focus();
+  loadAdminPanel();
 }
 
 async function logout() {
@@ -417,6 +459,7 @@ async function send() {
     sendBtn.disabled = !currentUser;
     refreshHealth();
     if (currentUser) inputEl.focus();
+  loadAdminPanel();
   }
 }
 

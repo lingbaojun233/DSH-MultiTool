@@ -233,6 +233,12 @@ const server = http.createServer(async (req, res) => {
     }
 
     // 面板的记忆/人格视图：透传到记忆服务，浏览器只走这一个口
+    // 管理员接口透传（鉴权在 separator 里做，面板只负责转发）
+    if (url.pathname.startsWith('/api/admin/')) {
+      const rest = '/v1/admin' + url.pathname.slice('/api/admin'.length);
+      const body = req.method === 'POST' || req.method === 'DELETE' ? await readBody(req) : null;
+      return proxy(req, res, rest + url.search, body, null, SEPARATOR_BASE);
+    }
     if (req.method === 'GET' && url.pathname === '/api/persona') {
       return proxy(req, res, '/v1/persona', null, null, MEMORY_BASE);
     }

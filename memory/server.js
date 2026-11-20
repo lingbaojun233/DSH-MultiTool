@@ -251,6 +251,30 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, kind, since, count: items.length, items });
     }
 
+    // 管理员删除账号时连带清理该用户的记忆（软删 + 移出索引）
+    if (req.method === 'POST' && url.pathname === '/v1/admin/purge-user') {
+      let pbody = {};
+      try { pbody = JSON.parse(await readBody(req) || '{}'); } catch { pbody = {}; }
+      const uid = Number(pbody.user_id);
+      if (!Number.isFinite(uid)) {
+        return sendJson(res, 400, { ok: false, code: 'E_BAD_REQUEST', message: 'user_id is required' });
+      }
+      const ids = db.prepare('SELECT id FROM events WHERE user_id = ? AND deleted = 0').all(uid).map((r) => r.id);
+      const factCount = db.prepare('SELECT COUNT(*) c FROM facts WHERE user_id = ? AND deleted = 0').get(uid).c;
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        db.prepare('UPDATE events SET deleted = 1 WHERE user_id = ?').run(uid);
+        for (const id of ids) db.prepare('DELETE FROM events_fts WHERE rowid = ?').run(id);
+        db.prepare('UPDATE facts SET deleted = 1 WHERE user_id = ?').run(uid);
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+      log(`purged user ${uid}: ${ids.length} event(s), ${factCount} fact(s)`);
+      return sendJson(res, 200, { ok: true, userId: uid, events: ids.length, facts: factCount });
+    }
+
     const handler = ROUTES[key];
     if (!handler) return sendJson(res, 404, fail('E_NOT_FOUND', `no route: ${key}`));
 

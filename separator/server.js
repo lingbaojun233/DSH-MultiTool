@@ -31,6 +31,9 @@ function openDb() {
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA foreign_keys = ON');
   db.exec(fs.readFileSync(path.join(__dirname, 'db', 'schema.sql'), 'utf8'));
+  // 老库补列（CREATE TABLE IF NOT EXISTS 不会加列）
+  const cols = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
+  if (!cols.includes('role')) db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'");
   return db;
 }
 
@@ -95,14 +98,14 @@ function issueSession(userId) {
 function userFromToken(token) {
   if (!token) return null;
   const row = db.prepare(
-    `SELECT s.user_id, s.expires_at, u.username, u.display_name
+    `SELECT s.user_id, s.expires_at, u.username, u.display_name, u.role
        FROM sessions s JOIN users u ON u.id = s.user_id
       WHERE s.token_hash = ?`,
   ).get(tokenHash(token));
   if (!row) return null;
   if (String(row.expires_at) < new Date().toISOString()) return null;
   db.prepare('UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?').run(new Date().toISOString(), tokenHash(token));
-  return { id: row.user_id, username: row.username, displayName: row.display_name };
+  return { id: row.user_id, username: row.username, displayName: row.display_name, role: row.role || 'user' };
 }
 
 function profileOf(userId) {
@@ -164,7 +167,7 @@ const server = http.createServer(async (req, res) => {
       log(`register ${username} (#${userId})`);
       return sendJson(res, 201, {
         ok: true,
-        user: { id: userId, username, displayName },
+        user: { id: userId, username, displayName, role: 'user' },
         profile: profileOf(userId),
         ...session,
       });
@@ -184,7 +187,7 @@ const server = http.createServer(async (req, res) => {
       log(`login ${username} (#${row.id})`);
       return sendJson(res, 200, {
         ok: true,
-        user: { id: row.id, username: row.username, displayName: row.display_name },
+        user: { id: row.id, username: row.username, displayName: row.display_name, role: row.role || 'user' },
         profile: profileOf(row.id),
         ...session,
       });
@@ -202,6 +205,59 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, user, profile: profileOf(user.id) });
     }
 
+    // ---- 管理员：查看 / 删除账号 ----
+    if (url.pathname.startsWith('/v1/admin/')) {
+      const me = userFromToken(bearer(req));
+      if (!me) return sendJson(res, 401, { ok: false, code: 'E_UNAUTHORIZED', message: '未登录' });
+      if (me.role !== 'admin') return sendJson(res, 403, { ok: false, code: 'E_FORBIDDEN', message: '需要管理员权限' });
+
+      if (req.method === 'GET' && url.pathname === '/v1/admin/users') {
+        const rows = db.prepare(
+          `SELECT u.id, u.username, u.display_name, u.role, u.created_at, u.last_login_at,
+                  (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id) AS sessions
+             FROM users u ORDER BY u.id`,
+        ).all();
+        return sendJson(res, 200, { ok: true, users: rows });
+      }
+
+      const del = /^\/v1\/admin\/users\/(\d+)$/.exec(url.pathname);
+      if (req.method === 'DELETE' && del) {
+        const targetId = Number(del[1]);
+        if (targetId === me.id) return sendJson(res, 400, { ok: false, code: 'E_SELF', message: '不能删除当前登录的管理员自己' });
+        const target = db.prepare('SELECT id, username FROM users WHERE id = ?').get(targetId);
+        if (!target) return sendJson(res, 404, { ok: false, code: 'E_NOT_FOUND', message: '用户不存在' });
+
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          db.prepare('DELETE FROM sessions WHERE user_id = ?').run(targetId);
+          db.prepare('DELETE FROM user_traits WHERE user_id = ?').run(targetId);
+          db.prepare('DELETE FROM users WHERE id = ?').run(targetId);
+          db.exec('COMMIT');
+        } catch (err) {
+          db.exec('ROLLBACK');
+          throw err;
+        }
+
+        // 连带清掉该用户的记忆（软删），失败不阻断账号删除
+        let memoryPurged = null;
+        try {
+          const res2 = await fetch((process.env.DSH_MEMORY_URL || 'http://127.0.0.1:8767') + '/v1/admin/purge-user', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ user_id: targetId }),
+            signal: AbortSignal.timeout(10000),
+          });
+          memoryPurged = await res2.json();
+        } catch (err) {
+          memoryPurged = { ok: false, error: err.message };
+        }
+
+        log(`admin ${me.username} deleted user ${target.username} (#${targetId})`);
+        return sendJson(res, 200, { ok: true, deleted: { id: targetId, username: target.username }, memoryPurged });
+      }
+
+      return sendJson(res, 404, { ok: false, code: 'E_NOT_FOUND', message: '未知的管理接口' });
+    }
     return sendJson(res, 404, { ok: false, code: 'E_NOT_FOUND', message: `no route: ${req.method} ${url.pathname}` });
   } catch (err) {
     log(`error: ${err.message}`);

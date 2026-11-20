@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS users (
   username      TEXT NOT NULL UNIQUE,          -- 登录名，全小写
   display_name  TEXT NOT NULL,                 -- 希望被怎么称呼（会进人格提示词）
   password_hash TEXT NOT NULL,                 -- scrypt: salt$hash（hex）
+  role          TEXT NOT NULL DEFAULT 'user',  -- admin | user
   created_at    TEXT NOT NULL,
   last_login_at TEXT
 );
