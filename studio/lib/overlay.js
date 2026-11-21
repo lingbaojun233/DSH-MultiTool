@@ -1,6 +1,6 @@
 'use strict';
 /**
- * overlay.js -- 把 GIF 表情包（带透明通道）叠到视频上，带淡入淡出。
+ * overlay.js -- 把 GIF 表情包（带透明通道）叠到视频上：播完一轮，然后**停在末帧**。
  *
  * 为什么单独一个文件、一个函数：表情叠加是"后期装饰"，不该和 render.js 的
  * "从分镜生成画面" 混在一起；调用方（server.js）可以在 concatClips 之后、
@@ -9,6 +9,13 @@
  * 整体两步：
  *   1) GIF → 带 alpha 的 webm（或 PNG 序列），结果按 <id>-<像素高度> 缓存在 work/cache
  *   2) 一条 filter_complex 把 N 个表情链式 overlay 到视频上，-t 裁到视频原本的时长
+ *
+ * 播放策略（用户实测反馈：以前"只放一部分"很别扭）：
+ *   表情从 at 开始**完整播一轮** GIF，播完用 tpad 克隆末帧一直停到本场结束，
+ *   不再用 enable=between(at, at+duration) 把它截断，也不再淡出。多个表情各自从
+ *   自己的 at 开始、各自停在自己的末帧，互不遮挡靠位置错开。
+ *   实现就是 setpts 平移 PTS + tpad=stop_mode=clone:stop_duration=<剩余时长>，
+ *   输入**不能**再 -stream_loop -1（那会一直循环，永远到不了"末帧"）。
  *
  * 两个踩过的坑，写在最前面免得后来人重踩：
  *   a) ffmpeg 默认的 vp9 解码器（native "vp9"）不认 webm 里的 alpha 层，
@@ -35,14 +42,28 @@ const CACHE_VERSION = 'v1';
 const WEBM_MAX_BYTES = 6 * 1024 * 1024;
 const WEBM_MAX_MS = 15000;
 
-/** 默认淡入淡出秒数（API 文档写的是 0.25） */
+/** 默认淡入秒数（API 文档写的是 0.25）。只在开头淡入；结尾不淡出（要停到本场结束） */
 const DEFAULT_FADE = 0.25;
-/** 默认大小：画面高度的 20%，即 1080p 下 216px */
-const DEFAULT_SCALE = 0.2;
+/** 默认大小：画面高度的 30%，即 1080p 下 324px（规划提示词给的是 0.25~0.38） */
+const DEFAULT_SCALE = 0.3;
+/**
+ * 大小下限。规划提示词已经改成 0.25~0.38，但计划缓存有 30 天，
+ * 老计划里写的 0.15~0.25 会比现在的期望小一大圈，所以统一抬到这个下限。
+ */
+const MIN_SCALE = 0.25;
 /** 表情高度下限，太小的表情没有意义，也给 scale 表达式留余量 */
 const MIN_STICKER_PX = 16;
 /** 表情高度上限比例（相对画面高）。再大就糊了，也容易被写成离谱的值 */
 const MAX_SCALE = 1.5;
+/** 底部字幕带默认高度（1080p 下的像素）。表情不许压进去，调用方可以覆盖 */
+const DEFAULT_BOTTOM_RESERVE_PX = 200;
+/**
+ * GIF 一轮比规划给的 duration 长时，最多提速到这个倍数（2 倍再看不懂就没意义了）。
+ * 提速是为了兑现"最长 duration 秒内必须播完一轮"。
+ */
+const MAX_SPEED = 2;
+/** 停末帧的最短时长：比这小就不加 tpad（少一个滤波器，也避免 0 值边界） */
+const MIN_FREEZE_SEC = 0.04;
 /** 纯色背景判定容差：四角 RGB 每个通道都在这个范围内就算"同色" */
 const SAME_COLOR_TOL = 16;
 
@@ -134,7 +155,8 @@ async function probeSticker({ ffmpeg, gif, id, cacheDir, timeoutMs }) {
   const cacheFile = path.join(cacheDir, `${CACHE_VERSION}-${id}.detect.json`);
   try {
     const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
-    if (cached && cached.stamp === stamp && cached.mode) return cached;
+    // durationSec 是"播放策略"改版后才探的：老缓存没有它，必须重测一次（多跑一个 ffmpeg，~0.1s）
+    if (cached && cached.stamp === stamp && cached.mode && Number(cached.durationSec) > 0) return cached;
   } catch { /* 没有/坏了就重测 */ }
 
   const tmp = path.join(cacheDir, `.detect-${id}-${process.pid}-${Date.now()}.rgba`);
@@ -202,6 +224,9 @@ async function probeSticker({ ffmpeg, gif, id, cacheDir, timeoutMs }) {
     width: info.width || 0,
     height: info.height || 0,
     fps: info.fps || 15,
+    // GIF 一轮的时长：决定"播完一轮"在哪里结束，也是停末帧的起算点。
+    // 探不到就当 0，调用方退回按 duration 估。
+    durationSec: parseDuration(r.stderr) || 0,
     mode,
     key,
   };
@@ -380,26 +405,29 @@ function dirBytes(dir) {
 }
 
 /**
- * 把若干表情叠到视频上。
+ * 把若干表情叠到视频上：各自从 at 开始**完整播一轮**，播完停在末帧，一直留到本场结束。
  *
  * stickers: [{ id, at, duration, x, y, scale, fade }]
  *   id       12 位 hex，对应 <stickerDir>/<id>.gif
  *   at       相对本片段的起始秒
- *   duration 持续秒数
- *   x, y     中心点，0~1 相对坐标（0.5,0.5 = 正中）
- *   scale    相对画面高度的比例（0.2 = 1080p 下高 216px）
- *   fade     淡入淡出秒数，默认 0.25
+ *   duration 不再是"显示多久"，而是"最晚什么时候必须播完一轮"：
+ *            播完就定格到本场结束。GIF 一轮比它长时会提速（最多 MAX_SPEED 倍）。
+ *   x, y     0~1 相对位置。注意：x 是"表情左上角在剩余空间里的比例"（overlay 的 (W-w)*x），
+ *            y 同理 (H-h)*y；所以 0=最左/最上、1=最右/最下，天然不会出画。
+ *   scale    相对画面高度的比例（0.3 = 1080p 下高 324px），默认 0.3，下限 0.25
+ *   fade     淡入秒数，默认 0.25；没有淡出
  *
  * 返回：
  *   { ok, file, applied, skipped, error, warning?, details? }
  *   applied  成功叠上去的个数
  *   skipped  [{ id, at, reason }]，缺文件/转码失败/时间越界都会进这里
  *   warning  只有"给了表情但一个都没叠上"时才有值（此时 ok 仍是 true、输出是原视频的拷贝）
- *   details  每个真的叠上去的表情：转码方式、耗时、体积，方便调用方打日志
+ *   details  每个真的叠上去的表情：转码方式、耗时、体积、播完时刻、停末帧时长、像素矩形
  *
  * extra（可选，都有默认值）：
- *   transcode  'auto' | 'webm' | 'png'  仅用于测试/排障：强制走某条转码路
- *   fps        默认 30，只影响 PNG 序列那条路的输入帧率
+ *   bottomReserve  底部字幕带高度（像素），表情会被夹到这条带之上，默认 1080p 下 200
+ *   transcode      'auto' | 'webm' | 'png'  仅用于测试/排障：强制走某条转码路
+ *   fps            默认 30，只影响 PNG 序列那条路的输入帧率
  */
 async function overlayStickers({
   ffmpeg,
@@ -411,6 +439,7 @@ async function overlayStickers({
   w,
   h,
   stickers,
+  bottomReserve = 0,
   timeoutMs = 300000,
   transcode = 'auto',
   fps = 30,
@@ -428,13 +457,17 @@ async function overlayStickers({
 
   const W = Number(w) > 0 ? Number(w) : 1920;
   const H = Number(h) > 0 ? Number(h) : 1080;
+  // 字幕带：调用方（server.js）按字幕样式算好传进来；没传就按 1080p 的默认值等比换算
+  const reservePx = Math.max(0, Math.round(
+    Number(bottomReserve) > 0 ? Number(bottomReserve) : (DEFAULT_BOTTOM_RESERVE_PX * H) / 1080,
+  ));
   const list = Array.isArray(stickers) ? stickers : [];
   const cacheDir = path.join(work, 'cache');
   const baseDir = stickerDir ? path.resolve(String(stickerDir)) : null;
   // 探测也要写临时文件到 cache，先建好目录；建不出来后面会以"无法解码"的形式体现
   try { fs.mkdirSync(cacheDir, { recursive: true }); } catch { /* 后面自然会失败 */ }
 
-  // 视频总时长：-t 用。探不到就不加 -t（overlay 的输出长度本来就跟着主输入走）
+  // 视频总时长：-t 用，也是"停末帧停到哪"的终点。探不到就不加 -t（输出长度跟着主输入走）
   let total = null;
   {
     const p = await run(ffmpeg, ['-hide_banner', '-loglevel', 'info', '-i', videoIn], Math.min(timeoutMs, 60000));
@@ -460,19 +493,23 @@ async function overlayStickers({
       res.skipped.push({ id, at, reason: `at=${at}s 超出视频时长 ${total.toFixed(2)}s` });
       continue;
     }
+    // duration 只是"最晚播完"的预算，不再裁短可见区间；超出视频剩余时长的部分没意义
     let duration = clampNum(s.duration, 0.05, 1e6, 2);
     if (total != null) duration = Math.min(duration, total - at);
-    const scale = clampNum(s.scale, 0.02, MAX_SCALE, DEFAULT_SCALE);
-    const height = Math.max(MIN_STICKER_PX, Math.round((H * scale) / 2) * 2); // 取偶数，yuv420 要求
+    const scale = clampNum(s.scale, MIN_SCALE, MAX_SCALE, DEFAULT_SCALE);
+    let height = Math.max(MIN_STICKER_PX, Math.round((H * scale) / 2) * 2); // 取偶数，yuv420 要求
+    // 放大后的硬上限：整个表情必须落在字幕带上沿之上（留 8px 余量），否则宁可缩小
+    const maxHeight = Math.max(MIN_STICKER_PX, H - reservePx - 8);
+    if (height > maxHeight) height = Math.round(maxHeight / 2) * 2;
     jobs.push({
       id,
       gif,
       at,
       duration,
-      x: clampNum(s.x, 0, 1, 0.5),
-      y: clampNum(s.y, 0, 1, 0.5),
-      // 淡入淡出各自最长不超过 duration 的一半，否则两段 fade 会互相覆盖
-      fade: Math.min(clampNum(s.fade, 0, 1e6, DEFAULT_FADE), duration / 2),
+      xRaw: clampNum(s.x, 0, 1, 0.5),
+      yRaw: clampNum(s.y, 0, 1, 0.5),
+      scale,
+      fadeRaw: clampNum(s.fade, 0, 1e6, DEFAULT_FADE),
       height,
     });
   }
@@ -531,6 +568,9 @@ async function overlayStickers({
     job.ms = tc.ms;
     job.mode = probe.mode;
     job.fps = probe.fps;
+    job.probeW = probe.width;
+    job.probeH = probe.height;
+    job.probeDurationSec = probe.durationSec;
     used.push(job);
   }
 
@@ -538,18 +578,43 @@ async function overlayStickers({
     return passthrough('所有表情都转码失败，输出为原视频拷贝');
   }
 
-  // 组装 filter_complex。输入 0 是视频，之后每个表情一个输入
+  // 输入 0 是视频，之后每个表情一个输入。几何与时间轴先在这一圈里算清楚
+  // （像素宽高、播完时刻、停末帧时长、夹取后的 x/y），下面的滤波器链只拼数字。
   for (let i = 0; i < used.length; i++) {
     const job = used[i];
+    const srcW = Number(job.probeW) || 0;
+    const srcH = Number(job.probeH) || 0;
+    // 转码时只指定了高度（scale=-2:h），宽度按原始宽高比推，取偶数（和 ffmpeg 的 -2 一致）
+    job.width = srcH > 0 && srcW > 0
+      ? Math.max(2, Math.round((job.height * srcW) / srcH / 2) * 2)
+      : job.height;
+    // GIF 一轮多长：探不到就按 duration 估（宁可少停一会儿，也不要凭空多停）
+    job.loopSec = Number(job.probeDurationSec) > 0.05
+      ? Number(job.probeDurationSec)
+      : Math.max(0.2, Math.min(job.duration, 2));
+    // 一轮比 duration 长就提速，兑现"最晚 duration 秒播完一轮"；最多 2 倍，再快就看不懂了
+    job.speed = job.loopSec > job.duration + 0.05 ? Math.min(MAX_SPEED, job.loopSec / job.duration) : 1;
+    job.playSec = job.loopSec / job.speed;
+    // 停末帧停到本场结束（视频总时长）；探不到总时长就按 duration/一轮里大的那个收尾
+    const sceneEnd = total != null ? total : job.at + Math.max(job.duration, job.playSec);
+    job.freeze = Math.max(0, sceneEnd - job.at - job.playSec);
+    job.fade = Math.min(job.fadeRaw, Math.max(0.05, job.playSec));
+    job.x = job.xRaw;
+    // y 的夹取要算实际尺寸：表情底边不能落进字幕带（H-reservePx 之上），超出就往内推。
+    // (H-h)*y 是左上角的像素位置，所以底边 = (H-h)*y + h，解出 y 的上限就是这个式子。
+    const yMax = H > job.height ? (H - reservePx - job.height) / (H - job.height) : 0;
+    job.y = Math.max(0, Math.min(job.yRaw, Math.min(1, yMax)));
+    job.yClamped = job.y < job.yRaw - 1e-6;
+
     if (job.kind === 'webm') {
-      // -stream_loop -1：表情通常只有 1~2 秒，要循环到 duration 那么长；
+      // 不再 -stream_loop -1：要的是"播一轮就停在末帧"，循环输入永远到不了末帧。
       // -c:v libvpx-vp9：必须显式指定解码器，native vp9 解码器会丢掉 alpha（变黑块）
-      inputs.push('-stream_loop', '-1', '-c:v', 'libvpx-vp9', '-i', job.path);
+      inputs.push('-c:v', 'libvpx-vp9', '-i', job.path);
     } else {
       // PNG 序列：-framerate 给原本的 GIF 帧率（可能是 16.67 这种小数），
       // 不然默认 25fps 会让表情快放/慢放。
       const rate = Math.min(60, Math.max(1, Number(job.fps) || Number(fps) || 25));
-      inputs.push('-stream_loop', '-1', '-framerate', num(rate), '-i', job.path);
+      inputs.push('-framerate', num(rate), '-i', job.path);
     }
   }
 
@@ -557,26 +622,29 @@ async function overlayStickers({
   for (let i = 0; i < used.length; i++) {
     const job = used[i];
     const idx = i + 1;
-    const end = job.at + job.duration;
     const chain = [job.kind === 'png' ? 'format=rgba' : 'format=yuva420p'];
 
-    // 淡入淡出的时间轴就是视频时间轴：表情输入从 0 开始（-stream_loop 循环时 PTS 是单调的），
-    // 所以直接按 at / at+duration 写 st，不用额外 setpts 平移。
-    if (job.fade > 0.001) {
-      chain.push(`fade=t=in:st=${num(job.at)}:d=${num(job.fade)}:alpha=1`);
-      chain.push(`fade=t=out:st=${num(end - job.fade)}:d=${num(job.fade)}:alpha=1`);
-    }
+    // 把表情自己的 PTS 平移到 at：之后 fade 的 st 和 overlay 的 t 都按"视频时间轴"走，
+    // 不用再靠 enable 凑时间（以前就是那么凑的，顺手把表情截断了）。
+    chain.push(job.speed > 1.001
+      ? `setpts=(PTS-STARTPTS)*${num(1 / job.speed)}+${num(job.at)}/TB`
+      : `setpts=PTS-STARTPTS+${num(job.at)}/TB`);
+    // 播完一轮后用 tpad 克隆末帧补足到本场结束 —— 这就是"停在最后一帧，等其它表情也播完"。
+    if (job.freeze > MIN_FREEZE_SEC) chain.push(`tpad=stop_mode=clone:stop_duration=${num(job.freeze)}`);
+    // 只有淡入：结尾不再淡出（淡出等于"只放一部分"，用户实测反馈过）。
+    if (job.fade > 0.001) chain.push(`fade=t=in:st=${num(job.at)}:d=${num(job.fade)}:alpha=1`);
     const sLabel = `[s${i}]`;
     filterParts.push(`[${idx}:v]${chain.join(',')}${sLabel}`);
 
-    // 位置：x/y 是中心点，overlay 要左上角，所以 (W-w)*x —— W 是主画面宽、w 是表情宽，
-    // x=0.5 时正好居中；用表达式而不是算死的像素，表情实际宽度变了也不会偏。
-    // enable 只在这段时间内叠，其余帧原样透传；between 的逗号用引号包住，避免被当成滤波器分隔符。
+    // 位置：x/y 是"左上角在剩余空间里的比例"，overlay 用 (W-w)*x / (H-h)*y ——
+    // W/w 是主画面/表情的宽，所以 x=0 贴左、x=1 贴右，实际尺寸变了也不会出画。
+    // enable 只从 at 开始（之前原样透传），一直到本场结束都不再关掉：表情要留到最后。
     const label = i === used.length - 1 ? '[vout]' : `[v${i}]`;
     filterParts.push(
       `${prev}${sLabel}overlay=` +
       `x=(W-w)*${num(job.x)}:y=(H-h)*${num(job.y)}:` +
-      `enable='between(t,${num(job.at)},${num(end)})':format=auto${label}`
+      // eof_action=repeat：万一 tpad 的时长取整短了一帧，末帧也不会提前消失
+      `eof_action=repeat:enable='gte(t,${num(job.at)})':format=auto${label}`
     );
     prev = label;
 
@@ -586,7 +654,23 @@ async function overlayStickers({
       duration: job.duration,
       x: job.x,
       y: job.y,
+      yClamped: job.yClamped,
+      width: job.width,
       height: job.height,
+      scale: job.scale,
+      // 表情在画面上的像素矩形（左上角 + 宽高），抽帧核对大小/避让时直接对这几个数。
+      // 左上角用 floor：overlay 的 x/y 表达式求值后是截断取整，四舍五入会和实际差 1px。
+      rect: {
+        x: Math.floor((W - job.width) * job.x),
+        y: Math.floor((H - job.height) * job.y),
+        w: job.width,
+        h: job.height,
+      },
+      loopSec: Number(job.loopSec.toFixed(3)),
+      speed: Number(job.speed.toFixed(3)),
+      playSec: Number(job.playSec.toFixed(3)),
+      freezeSec: Number(job.freeze.toFixed(3)),
+      endSec: total != null ? total : Number((job.at + job.playSec + job.freeze).toFixed(3)),
       fade: job.fade,
       mode: job.mode,
       kind: job.kind,

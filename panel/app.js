@@ -1793,6 +1793,16 @@ function renderStudioScenes() {
       : '自然语言描述要画什么，比如：画坐标轴、曲线上两个点，连线，然后让点靠近变成切线';
     hint.value = scene.visual_hint || '';
     row.append(studioField(scene.tool === 'aivideo' ? '画什么（AI 生成画面的提示词）' : '画什么（会翻译成 manim 代码）', hint));
+    // 空的时候不能只留一个空框：旧配方 / 写稿拆出来的场次都可能没有「画什么」，
+    // 用户看到的应该是一句可操作的提示，而不是一片空白。
+    if (!String(scene.visual_hint || '').trim()) {
+      const empty = document.createElement('p');
+      empty.className = 'scene-visual-empty muted';
+      empty.textContent = scene.tool === 'aivideo'
+        ? '还没写「画什么」：这一场会按标题/旁白自动写 AI 画面描述。'
+        : '还没写「画什么」：这一场会按标题/旁白自动决定画什么；想指定就写一句（图形/标注/动作）。';
+      row.append(empty);
+    }
 
     // 这一场的参考图（可选）：按钮 + 缩略图 + 去掉
     const imageBox = document.createElement('div');
@@ -1880,6 +1890,9 @@ function onStudioSceneEdit(event) {
       // 「画什么」或工具变了，旧代码就过时了：下次会用新的重新生成。
       scene.dirty = true;
       scene.status = field === 'tool' && control.value === 'text' ? 'text' : 'pending';
+      // 关键一行：把旧 manim 代码丢掉。不清的话提交时会原样带回 studio，
+      // studio 看到 code 就沿用 —— 用户改了描述却还是按上一次的画（实测 bug）。
+      if (field === 'visual_hint') scene.manim = null;
       // AI 生成场的旧英文 prompt 也不再对应用户新写的描述，清掉才会重新翻译
       if (field === 'visual_hint' && scene.tool === 'aivideo') scene.video = null;
     }
@@ -2340,7 +2353,9 @@ function studioAddScene() {
 /** 分镜 → 交给 studio 的场景数组。tool=text 时把旧代码丢掉，别让文字卡带着动画。 */
 function studioPlanFromScenes() {
   const scenes = studioScenes.map((s) => {
-    const useManim = s.tool !== 'text' && s.tool !== 'aivideo' && s.manim && s.manim.code;
+    // 改过「画什么」的场（dirty）一定不能把旧代码带回去：studio 看到有 code 就会直接沿用，
+    // 结果就是"改了描述、成片还是上一次的画"。清掉 code + 不传 kind，让 studio 重新生成。
+    const useManim = !s.dirty && s.tool !== 'text' && s.tool !== 'aivideo' && s.manim && s.manim.code;
     if (s.tool === 'aivideo') {
       // AI 生成场：已经翻好的 video.prompt 原样带回；只有中文「画什么」时只传 visual_hint，
       // 让 studio 负责翻英文（它才有模型），别把中文当英文 prompt 直接塞给生成接口。
@@ -2353,7 +2368,7 @@ function studioPlanFromScenes() {
         visual_hint: String(s.visual_hint || '').trim(),
       };
       const videoPrompt = String((s.video && s.video.prompt) || '').trim();
-      if (videoPrompt) out.video = { prompt: videoPrompt, size: (s.video && s.video.size) || '1280*720' };
+      if (videoPrompt && !s.dirty) out.video = { prompt: videoPrompt, size: (s.video && s.video.size) || '1280*720' };
       if (s.image) out.image = String(s.image);
       // 表情跟着场景走：选了就要渲进画面，不能在上交这一步悄悄丢掉
       const aiStickers = studioStickersOf(s.stickers);
@@ -2366,9 +2381,11 @@ function studioPlanFromScenes() {
       seconds: studioSceneSeconds(s),
       visual_hint: String(s.visual_hint || '').trim(),
       tool: String(s.tool || ''),
-      kind: useManim ? 'manim' : 'text',
       manim: useManim ? s.manim : null,
     };
+    // 没改过的场照旧带上 kind（studio 可直通，不重算引擎）；改过的场故意不带：
+    // 否则 kind:'text' 会让 studio 的 scenesLookFinal 误判成"已经补全"，又跳过重新生成。
+    if (!s.dirty) out.kind = useManim ? 'manim' : 'text';
     // 参考图只在真有的时候才带：删掉图，请求体里就不该再有这个字段
     if (s.image) out.image = String(s.image);
     const stickers = studioStickersOf(s.stickers);
@@ -2407,7 +2424,8 @@ function adoptStudioScenes(data) {
       visual_hint: String((s && s.visual_hint) || (hasVideo ? videoPrompt : '')),
       tool,
       kind: hasManim ? 'manim' : (wantsAi ? 'aivideo' : 'text'),
-      manim: hasManim ? { code: s.manim.code, scene: s.manim.scene || null } : null,
+      // 顺手带上代码对应的「画什么」戳：studio 靠它判断这段代码有没有过期。
+      manim: hasManim ? { code: s.manim.code, scene: s.manim.scene || null, hint: s.manim.hint == null ? null : String(s.manim.hint) } : null,
       video: hasVideo ? { prompt: videoPrompt, size: (s.video && s.video.size) || '1280*720' } : null,
       status: (s && s.status) || (hasManim ? 'manim' : (hasVideo ? 'aivideo' : 'pending')),
       note: String((s && s.note) || ''),
@@ -2530,9 +2548,11 @@ function updateStudioRedoUi() {
   if (studioEls.redoNote) {
     studioEls.redoNote.classList.toggle('hidden', !active);
     if (active) {
-      studioEls.redoNote.textContent = studioRedoChanged
+      // 末尾那句是给用户的约定：改了「画什么」才会重新生成动画，没改的场复用上次画面。
+      studioEls.redoNote.textContent = (studioRedoChanged
         ? `已载入 ${studioScenes.length} 场分镜 · 改过了：点「按修改重做」就按你改的跑。`
-        : `已载入 ${studioScenes.length} 场分镜，改完点「开始做」就按你改的跑。`;
+        : `已载入 ${studioScenes.length} 场分镜，改完点「开始做」就按你改的跑。`)
+        + '改了「画什么」的场会重新生成动画，其它场复用上次的画面。';
     }
   }
   if (studioEls.go) {
@@ -3124,6 +3144,9 @@ async function loadStudioLibraryItem(id, options) {
       return;
     }
     studioTitle = String(item.title || request.title || '').slice(0, 60);
+    // 记下原项目 id：重做提交时带回 studio，才会复用同一份项目缓存
+    // （片段/旁白/拼接都命中），只重渲真正改过的那一场。
+    if (item.projectId) studioProjectId = String(item.projectId);
     adoptStudioScenes({ title: studioTitle, scenes });
     studioScenesTouched = true;
     studioScenesFromText = studioEls.input ? studioEls.input.value.trim() : '';
@@ -3174,6 +3197,8 @@ function redoStudioFromRecipe(recipe) {
     return false;
   }
   studioTitle = String(recipe.title || studioTitle || '').slice(0, 60);
+  // 浏览器配方里没有 projectId：别把上一次载入的项目 id 用到这一份分镜上
+  studioProjectId = '';
   adoptStudioScenes({ title: studioTitle, scenes });
   studioScenesTouched = true;
   studioScenesFromText = studioEls.input ? studioEls.input.value.trim() : '';
@@ -3267,6 +3292,9 @@ function studioBuildPayload() {
     const scenes = studioPlanFromScenes().scenes;
     if (refImage && scenes.length && !scenes[0].image) scenes[0].image = refImage;
     const payload = { scenes, seconds, style, voice };
+    // 重做：带上原项目 id。studio 靠它复用同一份项目缓存（片段/旁白/拼接），
+    // 只重渲真正变了的那一场；不带就是新项目、缓存为空、全部重渲。
+    if (studioRedoActive() && studioProjectId) payload.projectId = String(studioProjectId);
     if (refImage) payload.image = refImage;
     return { payload, title: studioTitle || text, kind: 'scenes' };
   }

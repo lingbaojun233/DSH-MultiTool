@@ -148,7 +148,28 @@ const CFG = Object.assign({
   // 任务替模型调 io 时用的用户 id。插件/面板会带 x-dsh-user；直接 curl 提任务时
   // 没有身份，用一个固定的服务账号（默认 1）比"整个任务在写分镜阶段 E_UNAUTHORIZED"好。
   defaultUserId: 1,
+  // 底部字幕带安全区（1080p 像素）：场景内容、表情包都不许低于 H-这个值。
+  // 实测 marginBottom=120 + 字号 64 时字幕带占 [892,963]，所以 200 够用（含 12px 呼吸）。
+  subtitleReservedPx: 200,
 }, readJson(path.join(DIR, 'config.json'), {}));
+
+/**
+ * 底部"字幕带"高度（像素）：场景内容与表情包都不许低于 H-这个值。
+ *
+ * 为什么非要这么个数：字幕是烧在画面最下沿的（Alignment=2 + MarginV=subtitleMarginBottom），
+ * manim 的 to_edge(DOWN) 和表情包的下角落都落在同一片区域，视频底边一有内容，
+ * 字幕的黑底就正好压上去（用户实测反馈）。所以：
+ *   1) 算出一个安全区，写进分镜/脚本提示词，让模型别把东西放那么低；
+ *   2) 表情包叠图时按实际尺寸把这个区让出来（lib/overlay.js 的 bottomReserve）。
+ * 字幕带高度 = 底边距 + 字高 + 一点呼吸；config 给了 subtitleReservedPx 就用它。
+ */
+function subtitleReservePx() {
+  const explicit = Number(CFG.subtitleReservedPx);
+  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+  const m = Number(CFG.subtitleMarginBottom) || 120;
+  const f = Number(CFG.subtitleFontSize) || 64;
+  return Math.round(m + f + 16);
+}
 
 // 把静帧模式交给渲染层（在 require 之后、任何 sceneClip 之前）
 R.setStillMotion(CFG.stillMotion);
@@ -758,11 +779,13 @@ function buildSkeletonPrompt(prompt, total, opts = {}) {
       '- 只放在情绪点上：吐槽、惊讶、结论、自嘲。没有情绪点的场次不要放。',
       '- 每条视频 1~3 处就够（不是每场都放，最多 3 场）；同一场最多 1 个。',
       '- 在场景对象里加 stickers 数组，一项长这样：',
-      '  {"id":"<下面列表里的 id>","at":1.2,"duration":1.6,"x":0.82,"y":0.18,"scale":0.2}',
+      '  {"id":"<下面列表里的 id>","at":1.2,"duration":1.8,"x":0.82,"y":0.12,"scale":0.3}',
       '  - at：这一场里的第几秒开始，放中后段（0.5~2 秒起；且不要超过这一场的 seconds-1.5）',
-      '  - duration：1.2~2.0 秒',
-      '  - x/y：中心点相对位置（0~1），放角落别挡住图和公式：右上 0.82/0.18，左下 0.16/0.80',
-      '  - scale：0.15~0.25（占画面高度的比例）',
+      '  - duration：1.2~2.2 秒，表示"最晚在这之前必须把一轮表情播完"。播完不会消失，',
+      '    而是停在最后一帧一直留到本场结束 —— 所以别把表情放在"马上要切走"的位置。',
+      '  - x/y：0~1 的相对位置，放角落别挡住图和公式。**底部约 1/5 是字幕带，不许放**：',
+      '    右上 0.82/0.12，左上 0.10/0.12，右下 0.82/0.62，左下 0.10/0.62（y 最大 0.68）。',
+      '  - scale：0.25~0.38（占画面高度的比例；0.3 在 1080p 下约 324px 高）',
       `- 可用表情（id=情绪）：${stickerIds.map((s) => `${s.id}=${s.name}`).join('，')}`,
       '- 只能从上面这个列表里挑 id；没有合适的那一场就干脆不加，宁缺勿滥。',
       '- **但整集至少要有 1 个表情；讲"我 / 自己 / 大肥鱼"的那一场必须有**（笑、爱心、点赞都算）。',
@@ -829,6 +852,11 @@ function buildScriptSplitPrompt(script, total, opts = {}) {
  */
 function buildVisualPrompt(scene, kind, style) {
   const hint = String(scene.visual_hint || '').trim();
+  // 底部字幕带换算成 manim 的坐标单位：manim 默认 frame 高 8 单位，
+  // 所以 1 单位 = 画面高/8（1080p 下一单位 135px），200px 的安全区约 1.5 单位。
+  const reservePx = subtitleReservePx();
+  const unitPx = (Number(CFG.height) || 1080) / 8;
+  const reserveUnits = Math.ceil((reservePx / unitPx) * 10) / 10;
   const head = [
     '只输出 JSON，第一个字符必须是 {，不要解释。',
     `要画这一场：标题「${scene.text}」，旁白「${scene.narration}」`,
@@ -893,6 +921,10 @@ function buildVisualPrompt(scene, kind, style) {
     '- 图形：Axes、NumberPlane、Line、Arrow、Dot、Circle、Rectangle、Square、Polygon、SurroundingRectangle、VGroup、NumberLine、axes.plot',
     '- 动作：Write、Create、FadeIn、FadeOut、Transform、ReplacementTransform、GrowArrow、Rotate、Indicate、.animate、VGroup.arrange、self.wait',
     '- 排版：self.play(..., run_time=1.2) 控制节奏；标题用 .to_edge(UP, buff=0.5)',
+    `- **底部 ${reservePx}px（约 ${reserveUnits} 个坐标单位）是字幕带，不许放任何内容**：` +
+      '字幕烧在画面最下沿，东西放低了就被字幕黑底压住。',
+    `  最低的元素离画面底边至少 ${reserveUnits} 个单位：要贴底就写 .to_edge(DOWN, buff=${reserveUnits})，` +
+      '不要用默认的 .to_edge(DOWN)（默认 buff=0.5 会进字幕带）。',
     '',
     '## 三个必须避开的坑',
     '- **坐标轴不要 include_numbers=True**（刻度数字是 DecimalNumber，内部走 TeX，慢且容易失败）；要数字就用 Text 在轴旁手标',
@@ -1350,6 +1382,40 @@ function clampSceneSeconds(value) {
  * 重新夹到 3~10 —— 旁白撑长的场次被改短，缓存键就变了，重跑等于重渲。
  * 所以能直通的就直通，一个字段都不动。
  */
+/**
+ * "画什么"的比较用归一化（只用于判断代码是否过期，不参与缓存键 ——
+ * 缓存键由 lib/plan-cache.js 自己归一化，两边口径一致即可）。
+ */
+function hintNorm(value) {
+  return String(value == null ? '' : value).replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/**
+ * 这一场的 manim 代码是不是为**当前**的「画什么」生成的？
+ *
+ * 代码生成时会把它依据的 visual_hint 盖在 manim.hint 上（见 fillScenes / saveLibrary）。
+ * 用户只改「画什么」时，面板会清掉代码；但历史配方、API 调用方、旧版本存档都可能
+ * 带着"旧代码 + 新描述"过来 —— 这里必须再拦一道，否则改了描述却继续按上一次的画。
+ *
+ * 没有戳的旧数据返回 true：升级前的存档无法判断代码是按哪句描述生成的，
+ * 保守沿用（重跑时 stampManimHint 会补上戳，之后就判断得出来了）。
+ */
+function manimHintMatches(scene) {
+  const manim = scene && scene.manim;
+  if (!manim || typeof manim.code !== 'string' || !manim.code.trim()) return true;
+  if (manim.hint == null) return true;
+  return hintNorm(manim.hint) === hintNorm(scene && scene.visual_hint);
+}
+
+/** 给已有的 manim 代码补一个「按这句画什么生成」的戳（只补缺，不覆盖）。 */
+function stampManimHint(scene) {
+  if (!scene || !scene.manim || typeof scene.manim.code !== 'string' || !scene.manim.code.trim()) return scene;
+  if (scene.manim.hint != null) return scene;
+  return Object.assign({}, scene, {
+    manim: Object.assign({}, scene.manim, { hint: String(scene.visual_hint || '') }),
+  });
+}
+
 function scenesLookFinal(list) {
   const arr = Array.isArray(list) ? list : [];
   if (!arr.length) return false;
@@ -1357,6 +1423,9 @@ function scenesLookFinal(list) {
     if (!s || typeof s !== 'object') return false;
     const code = s.manim && typeof s.manim.code === 'string' && s.manim.code.trim();
     const video = s.video && typeof s.video.prompt === 'string' && s.video.prompt.trim();
+    // 代码在、但戳对不上当前「画什么」= 代码过期：不能走"直通"，要让 fillScenes
+    // 把这一场重新生成（其余场仍会原样沿用，不会全部重来）。
+    if (code && !manimHintMatches(s)) return false;
     if (code || video) return true;
     const kind = String(s.kind || '').toLowerCase();
     const tool = String(s.tool || '').toLowerCase();
@@ -1529,13 +1598,18 @@ async function fillScenes(inputScenes, opts = {}) {
     // "画面能复用就复用" 直接失效；更糟的是模型可能把好代码写成坏代码。
     if (decided.tool === 'manim') {
       const given = src.manim && typeof src.manim.code === 'string' ? src.manim.code.trim() : '';
-      if (given) {
+      if (given && manimHintMatches(src)) {
         base.kind = 'manim';
-        base.manim = { code: given.slice(0, 8000), scene: (src.manim && src.manim.scene) || null };
+        base.manim = { code: given.slice(0, 8000), scene: (src.manim && src.manim.scene) || null, hint: String(base.visual_hint || '') };
         base.status = 'manim';
         manimCount += 1;
         scenes[i] = base;
         continue;
+      }
+      if (given) {
+        // 旧代码是按上一句「画什么」生成的：继续用就等于"改了也不生效"。
+        // 丢掉它走下面的重新生成；其它场不受影响（各自判断各自的戳）。
+        log(`scene#${i} 「画什么」改过了（代码是按旧描述生成的），丢掉旧 manim 代码重新生成`);
       }
     }
 
@@ -1685,7 +1759,7 @@ async function fillScenes(inputScenes, opts = {}) {
       continue;
     }
     base.kind = 'manim';
-    base.manim = { code: clean.slice(0, 8000), scene: (manimObj && manimObj.scene) || null };
+    base.manim = { code: clean.slice(0, 8000), scene: (manimObj && manimObj.scene) || null, hint: String(base.visual_hint || '') };
     base.status = 'manim';
     manimCount += 1;
     scenes[i] = base;
@@ -2953,13 +3027,18 @@ async function renderProject(project, opts = {}, scope = 'auto') {
               ffmpeg: CFG.ffmpeg, stickerDir: CFG.stickerDir, work, index: i,
               videoIn: clipFile, out: path.join(work, `ov-${i}.mp4`),
               w: CFG.width, h: CFG.height, stickers: s.stickers,
+              // 表情不许压进底部字幕带：按字幕样式算出的安全区高度传下去，
+              // 超出就由 overlay 按实际尺寸往内推（y 会被夹小）
+              bottomReserve: subtitleReservePx(),
             });
             stickerMs = Date.now() - ovStarted;
             if (ov && ov.ok && ov.applied > 0) {
               clipFile = ov.file;
               stickerApplied = ov.applied;
+              // 日志里带上"播完一轮 + 停末帧"的时长，排查"表情怎么还停在那儿"时一眼能看出来
               const detail = (ov.details || [])
-                .map((d) => `${d.id}@${d.at}s(${d.kind}${d.cached ? '/缓存' : ''},${d.transcodeMs || 0}ms)`)
+                .map((d) => `${d.id}@${d.at}s(${d.kind}${d.cached ? '/缓存' : ''},${d.transcodeMs || 0}ms,`
+                  + `播${d.playSec || 0}s+停${d.freezeSec || 0}s${d.yClamped ? ',已上推' : ''})`)
                 .join('，');
               log(`scene#${i} 表情叠加 ${ov.applied} 个 ${stickerMs}ms：${detail}`);
               if (Array.isArray(ov.skipped) && ov.skipped.length) {
@@ -3396,16 +3475,55 @@ function libraryView(item, full = false) {
     status: it.status || '',
     thumb: it.thumb || '',
     videoUrl: it.videoUrl || '',
+    // 重做要按原项目复用片段缓存，列表里就带上 projectId（不必再取一次详情）
+    projectId: it.projectId || '',
   };
   if (full) {
     base.request = it.request === undefined ? null : it.request;
-    base.scenes = Array.isArray(it.scenes) ? it.scenes : [];
+    base.scenes = arrayOf(it.scenes);
     base.projectId = it.projectId || '';
     base.rerunOf = it.rerunOf || '';
     base.jobIdForVideo = it.jobIdForVideo || '';
     base.updatedAt = it.updatedAt || '';
   }
   return base;
+}
+
+/** 数组兜底：旧配方/坏存档里 scenes 可能是 null 或对象。 */
+function arrayOf(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+/**
+ * 详情/重跑时把「画什么」补齐。
+ *
+ * 升级前的 library 存档把 visual_hint 弄丢了（normalizeScene 的白名单里没有它），
+ * 但这些条目的 request.scenes 里往往还留着用户当初填的原文。读的时候回填：
+ * 面板「重做」能把上次的「画什么」显示出来，重跑也能按它判断旧代码是否过期。
+ * 只补空值，不覆盖存档里已有的字段。
+ */
+function withRequestHints(item) {
+  const it = item || {};
+  const scenes = arrayOf(it.scenes);
+  if (!scenes.length) return it;
+  const reqScenes = arrayOf(it.request && it.request.scenes);
+  if (!reqScenes.length) return it;
+  let changed = false;
+  const merged = scenes.map((s, i) => {
+    const rq = reqScenes[i] || null;
+    if (!s || !rq) return s;
+    const patch = {};
+    if (!String(s.visual_hint || '').trim() && String(rq.visual_hint || '').trim()) {
+      patch.visual_hint = String(rq.visual_hint).slice(0, 600);
+    }
+    if (!String(s.tool || '').trim() && String(rq.tool || '').trim()) {
+      patch.tool = String(rq.tool).trim().toLowerCase().slice(0, 16);
+    }
+    if (!patch.visual_hint && !patch.tool) return s;
+    changed = true;
+    return Object.assign({}, s, patch);
+  });
+  return changed ? Object.assign({}, it, { scenes: merged }) : it;
 }
 
 /** 任务对外的 JSON 形状（GET /v1/jobs 与 /v1/jobs/:id 共用）。 */
@@ -3666,7 +3784,9 @@ async function prepareJob(job) {
 
   // 参考图：解析成 uploads 下的绝对路径。浅拷贝一份再改，保证 library 里的 request
   // 与用户提交的一字不差（图片引用还是原来的 uploadId）。
-  scenes = scenes.map((s) => Object.assign({}, s));
+  // 顺便给每一场的 manim 代码补「按哪句画什么生成」的戳（旧存档没有，补一次之后
+  // 就能判断"改了描述要不要重生成"；已有戳的不覆盖）。
+  scenes = scenes.map((s) => stampManimHint(Object.assign({}, s)));
   attachSceneImages(scenes, warnings);
 
   if (fromScenes || !reuseId) {
@@ -4006,7 +4126,7 @@ const server = http.createServer(async (req, res) => {
       const isRerun = rest.endsWith('/rerun');
       const id = decodeURIComponent(isRerun ? rest.slice(0, -'/rerun'.length) : rest);
       if (isRerun && req.method === 'POST') {
-        const item = readLibrary(id);
+        const item = withRequestHints(readLibrary(id));
         if (!item) return json(res, 404, { ok: false, error: 'NOT_FOUND' });
         // 用保存的 request + 最终 scenes 重新提交：场景都带着 manim 代码/video.prompt，
         // prepare 不会再问模型；projectId 沿用，片段缓存与旁白缓存全部命中。
@@ -4020,7 +4140,7 @@ const server = http.createServer(async (req, res) => {
         return json(res, 202, { ok: true, jobId: job.jobId });
       }
       if (!isRerun && req.method === 'GET') {
-        const item = readLibrary(id);
+        const item = withRequestHints(readLibrary(id));
         if (!item) return json(res, 404, { ok: false, error: 'NOT_FOUND' });
         return json(res, 200, { ok: true, item: libraryView(item, true) });
       }
@@ -4242,7 +4362,11 @@ const server = http.createServer(async (req, res) => {
       const saved = saveDraftProject({
         projectId: body.projectId,
         title: r.title,
-        scenes: r.scenes.map((s) => ({ text: s.text, narration: s.narration, seconds: s.seconds })),
+        // 全量存：visual_hint / tool 也要落进项目，否则重做时「画什么」是空的
+        scenes: r.scenes.map((s) => ({
+          text: s.text, narration: s.narration, seconds: s.seconds,
+          visual_hint: s.visual_hint || '', tool: s.tool || '',
+        })),
         style: body.style || '',
         voice: body.voice || '',
       });
@@ -4279,10 +4403,9 @@ const server = http.createServer(async (req, res) => {
       const saved = saveDraftProject({
         projectId: body.projectId,
         title,
-        scenes: r.scenes.map((s) => ({
-          text: s.text, narration: s.narration, seconds: s.seconds,
-          kind: s.kind, manim: s.manim || null, video: s.video || null,
-        })),
+        // 分镜补全的结果整份落盘（visual_hint / stickers / image / tool / kind / manim
+        // 一个都不许在“存项目”这一步悄悄丢掉 —— 重做时全靠它们还原上次的画面）。
+        scenes: r.scenes,
         style: body.style || '',
         voice: body.voice || '',
       });

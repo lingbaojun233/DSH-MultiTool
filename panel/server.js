@@ -1281,6 +1281,17 @@ const handler = async (req, res) => {
           style: body.style || '',
           voice: body.voice || '',
         };
+        // 重做要复用原项目：projectId 给了 studio 才认得出"这还是同一集"，
+        // 片段缓存/旁白缓存才命得中。以前这里只转 seconds/style/voice，
+        // 面板就算带了 projectId 也会在代理这一层被丢掉 —— 每次重做都是新项目、全量重渲。
+        const projectId = String(body.projectId || body.existingProjectId || '').trim();
+        if (projectId) payload.projectId = projectId;
+        if (body.title) payload.title = String(body.title).slice(0, 80);
+        if (body.scope) payload.scope = String(body.scope);
+        if (body.fresh === true || body.fresh === 'true') payload.fresh = true;
+        if (body.maxAiVideo != null) payload.maxAiVideo = Number(body.maxAiVideo) || 0;
+        if (body.subtitles != null) payload.subtitles = body.subtitles === true || body.subtitles === 'true';
+        if (body.renderQuality) payload.renderQuality = String(body.renderQuality);
         // 三个入口只带一个：带错的那个会让 studio 选错流程
         if (scenes) payload.scenes = scenes;
         else if (script) payload.script = script;

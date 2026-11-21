@@ -86,8 +86,12 @@ const DEFAULT_STYLE = {
   outlinePx: 3,
   outlineColor: '#000000',
   backColor: '#000000',  // 半透明黑底
-  backAlpha: 0.55,       // 0=全透明 1=不透明
-  marginBottomPx: 64,    // 距画面底部的像素
+  // 0=全透明 1=不透明。0.55 在浅色画面上不够"压住"，实测字幕和场景内容糊在一起；
+  // 0.72 是"能看清白字、又不至于像一条黑杠"的位置（config.subtitleBackAlpha 同步）
+  backAlpha: 0.72,
+  // 距画面底部的像素。以前是 64，字幕几乎贴着下边缘，还正好压在 manim 的贴底内容上；
+  // 120 + 字号 64 让字幕带落在 [892,963]（1080p 实测），下面留 116px 呼吸
+  marginBottomPx: 120,
   marginSidePx: 96,
   // 一条字幕最多几个字。16 字硬切会断在词中间（用户实测："能把事／做完"），
   // 现在按标点分句再合并到这个上限（18~22 是 CJK 单行的舒适区），可在 config.subtitleMaxChars 改。
