@@ -24,10 +24,10 @@ function readJson(file, fallback) {
 
 const CFG = Object.assign({
   port: 8770,
-  provider: 'windows',       // windows | qwen（qwen 需先有可路由的音频上游）
-  voice: '',                 // 空 = 自动挑中文女声
-  rate: -1,                  // SAPI 语速 -10..10
-  maxChars: 300,             // 一条语音的上限，防止把整篇文章念出来
+  provider: 'winrt',         // winrt（OneCore 音色，推荐）| sapi（老引擎）| qwen（未接通）
+  voice: 'Yaoyao',           // OneCore: Yaoyao / Huihui / Kangkang
+  rate: -1,
+  maxChars: 300,
   gateway: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
   qwenModel: 'qwen-audio-3.0-tts-plus',
   requestTimeoutMs: 60000,
@@ -83,10 +83,10 @@ function cleanForSpeech(raw) {
   return t;
 }
 
-function runPowerShell(args, timeoutMs) {
+function runPowerShellScript(scriptName, args, timeoutMs) {
   return new Promise((resolve) => {
     const child = spawn('powershell.exe',
-      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(DIR, 'speak.ps1'), ...args],
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(DIR, scriptName), ...args],
       { windowsHide: true });
     let out = '';
     let err = '';
@@ -96,6 +96,31 @@ function runPowerShell(args, timeoutMs) {
     child.on('close', (code) => { clearTimeout(timer); resolve({ code, stdout: out, stderr: err }); });
     child.on('error', (e) => { clearTimeout(timer); resolve({ code: -1, stdout: '', stderr: String(e.message || e) }); });
   });
+}
+
+function runPowerShell(args, timeoutMs) {
+  return runPowerShellScript('speak.ps1', args, timeoutMs);
+}
+
+/** OneCore 音色（WinRT）。比 SAPI 多出 Yaoyao 这类音色，音质也更新。 */
+async function synthesizeWinRt(text, voice) {
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+  const stamp = `${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
+  const txtFile = path.join(OUT_DIR, `t-${stamp}.txt`);
+  const wavFile = path.join(OUT_DIR, `s-${stamp}.wav`);
+  fs.writeFileSync(txtFile, text, 'utf8');
+  try {
+    const args = ['-InFile', txtFile, '-OutFile', wavFile, '-VoiceMatch', voice || 'Yaoyao'];
+    const r = await runPowerShellScript('tts-winrt.ps1', args, CFG.requestTimeoutMs);
+    if (r.code !== 0 || !fs.existsSync(wavFile)) {
+      return { ok: false, error: (r.stderr || r.stdout || 'WINRT_FAILED').slice(0, 400) };
+    }
+    let info = {};
+    try { info = JSON.parse(r.stdout.split('\n').filter(Boolean).pop()); } catch { }
+    return { ok: true, file: wavFile, info, provider: 'winrt' };
+  } finally {
+    try { fs.unlinkSync(txtFile); } catch { }
+  }
 }
 
 async function synthesizeWindows(text, voice, rate) {
@@ -129,6 +154,7 @@ async function synthesizeQwen() {
 
 async function synthesize(text, voice, rate) {
   if (CFG.provider === 'qwen') return synthesizeQwen(text, voice, rate);
+  if (CFG.provider === 'winrt') return synthesizeWinRt(text, voice);
   return synthesizeWindows(text, voice, rate);
 }
 
@@ -137,12 +163,16 @@ const server = http.createServer(async (req, res) => {
   const p = url.pathname;
   try {
     if (req.method === 'GET' && (p === '/v1/health' || p === '/health')) {
-      let voiceCount = 0;
-      try {
-        const r = await runPowerShell(['-InFile', path.join(os.tmpdir(), 'noop.txt'), '-OutFile', path.join(os.tmpdir(), 'noop.wav')], 5000);
-        voiceCount = r.code === 0 ? 1 : 0;
-      } catch { }
-      return json(res, 200, { ok: true, provider: CFG.provider, voice: CFG.voice || 'auto(zh)', rate: CFG.rate });
+      return json(res, 200, {
+        ok: true,
+        provider: CFG.provider,
+        voice: CFG.voice || 'auto',
+        rate: CFG.rate,
+        scripts: {
+          winrt: fs.existsSync(path.join(DIR, 'tts-winrt.ps1')),
+          sapi: fs.existsSync(path.join(DIR, 'speak.ps1')),
+        },
+      });
     }
 
     // 返回 wav 字节，方便 <audio> 直接播

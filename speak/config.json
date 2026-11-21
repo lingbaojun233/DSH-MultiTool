@@ -1,7 +1,7 @@
 {
   "port": 8770,
-  "provider": "windows",
-  "voice": "",
+  "provider": "winrt",
+  "voice": "Yaoyao",
   "rate": -1,
   "maxChars": 300,
   "gateway": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
