@@ -422,22 +422,8 @@ button.stat {
 button.stat:hover { border-color: var(--accent); }
 button.stat.active { border-color: var(--accent); background: #1b2130; }
 /* ---------------------------------------------------------------- 视频视图 -- */
-.drop {
-  border: 1px dashed var(--border);
-  border-radius: 10px;
-  padding: 18px 14px;
-  text-align: center;
-  color: var(--muted);
-  transition: border-color .15s, background .15s;
-  margin-bottom: 12px;
-}
-.drop.over { border-color: var(--accent); background: rgba(79, 140, 255, .08); }
-.drop p { margin: 4px 0; font-size: 13px; }
-
-.linkbtn {
-  background: none; border: none; padding: 0; cursor: pointer;
-  color: var(--accent); font: inherit; text-decoration: underline;
-}
+/* 视频页只剩"做视频"：分析视频的样式（拖放区、帧条、时间线、结果卡）一起删掉了 */
+.view-note { margin: 0; font-size: 12.5px; line-height: 1.7; }
 
 .field { display: block; margin-bottom: 10px; }
 .field > span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
@@ -451,30 +437,6 @@ button.stat.active { border-color: var(--accent); background: #1b2130; }
 .row > input { flex: 1; }
 .row > button { flex: 0 0 auto; white-space: nowrap; }
 
-.divider {
-  display: flex; align-items: center; gap: 10px;
-  color: var(--muted); font-size: 12px; margin: 14px 0 10px;
-}
-.divider::before, .divider::after {
-  content: ''; flex: 1; height: 1px; background: var(--border);
-}
-
-.reply {
-  background: var(--user); border: 1px solid var(--border); border-radius: 10px;
-  padding: 10px 12px; font-size: 14px; line-height: 1.6; white-space: pre-wrap;
-  margin-bottom: 10px;
-}
-
-.frames { display: flex; gap: 8px; flex-wrap: wrap; }
-.thumb { display: flex; flex-direction: column; align-items: center; gap: 3px; }
-.thumb img { width: 118px; border-radius: 6px; border: 1px solid var(--border); display: block; }
-.thumb span { font-size: 10px; color: var(--muted); }
-
-.timeline { margin: 8px 0 0 18px; padding: 0; font-size: 12.5px; color: var(--muted); }
-.timeline li { margin: 3px 0; }
-
-details#videoDetails { margin-top: 6px; }
-details#videoDetails summary { cursor: pointer; font-size: 12px; color: var(--muted); }
 /* ------------------------------------------------------------- 发声 / 听力 -- */
 .msg-tools { display: flex; gap: 4px; margin-top: 3px; }
 .msg.user .msg-tools { justify-content: flex-end; }
@@ -486,37 +448,54 @@ details#videoDetails summary { cursor: pointer; font-size: 12px; color: var(--mu
 .iconbtn:disabled { opacity: .6; cursor: default; }
 .iconbtn.recording { color: var(--err); border-color: var(--err); }.iconbtn.mic { padding: 2px 9px; font-size: 13px; margin-right: auto; }
 .iconbtn.mic.recording { color: var(--err); border-color: var(--err); animation: pulse 1s infinite; }
-@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }.audioNote {
-  white-space: pre-line; font-size: 12.5px; color: var(--muted);
-  background: rgba(79, 140, 255, .06); border-left: 2px solid var(--accent);
-  padding: 6px 8px; border-radius: 4px; margin: 8px 0;
-}
-.audioNote:empty { display: none; }.checkline { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); margin: 0 0 10px; cursor: pointer; }
-.checkline input { accent-color: var(--accent); }
-.progress { height: 6px; background: var(--panel); border: 1px solid var(--border); border-radius: 4px; overflow: hidden; margin-bottom: 10px; }
-.progress .bar { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
-/* ------------------------------------------------------- 聊天里的附件（视频） -- */
-.attach-list { margin-bottom: 8px; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+/* ------------------------------------------------------- 聊天里的附件 -- */
+/* 输入框上方那排 chip：图标 + 名字 + 大小 + 删除；上传时下面再挂一条总进度 */
+.attach-list { margin-bottom: 8px; display: flex; flex-direction: column; gap: 6px; }
 .attach-chip {
   display: flex; align-items: center; gap: 8px;
   background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
   padding: 6px 8px; font-size: 12px;
 }
+.attach-chip .attach-icon { flex: 0 0 auto; font-size: 14px; line-height: 1; }
 .attach-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attach-size { flex: 0 0 auto; font-size: 11px; color: var(--muted); }
 .attach-bar { flex: 0 0 80px; height: 4px; background: var(--border); border-radius: 3px; overflow: hidden; }
 .attach-bar-fill { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+.attach-total {
+  display: flex; align-items: center; gap: 8px;
+  padding: 2px 2px 0; font-size: 11px; color: var(--muted);
+}
+.attach-total .attach-bar { flex: 1; }
 .attach-x {
   background: none; border: none; color: var(--muted); font-size: 16px;
   cursor: pointer; padding: 0 4px; line-height: 1;
 }
 .attach-x:hover { color: var(--err); }
-.bubble-attach {
-  font-size: 11.5px; color: var(--muted); border: 1px dashed var(--border);
-  border-radius: 6px; padding: 3px 7px; margin-bottom: 6px; display: inline-block;
+
+/* 气泡里的一条用户消息：文字、表情、附件都装在这一个 .bubble 里 */
+.bubble-text { white-space: pre-wrap; }
+.bubble-files { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.bubble-text + .bubble-files,
+.bubble-sticker + .bubble-files { margin-top: 8px; }
+.bubble-file {
+  display: flex; align-items: center; gap: 7px;
+  max-width: 280px; padding: 5px 8px;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: rgba(0, 0, 0, .16);
+  color: inherit; text-decoration: none; font-size: 12px;
 }
-.msg-details { margin-top: 4px; font-size: 12px; }
-.msg-details summary { cursor: pointer; color: var(--muted); }
-.msg-details .muted { white-space: pre-line; margin-top: 4px; }
+a.bubble-file:hover { border-color: var(--accent); }
+.bubble-file.image { padding: 0; border: 0; background: transparent; }
+.bubble-thumb {
+  display: block; max-width: 180px; max-height: 180px;
+  border-radius: 8px; border: 1px solid var(--border); object-fit: cover;
+}
+.bubble-file-icon { flex: 0 0 auto; font-size: 16px; line-height: 1; }
+.bubble-file-meta { display: flex; flex-direction: column; min-width: 0; }
+.bubble-file-name { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bubble-file-sub { font-size: 11px; color: var(--muted); }
+.msg.user .bubble-sticker { margin-bottom: 6px; }
 /* --------------------------------------------------------- 视频创作 -- */
 .plan { white-space: pre-line; font-size: 12.5px; color: var(--muted); margin: 8px 0; }
 .plan:empty { display: none; }
@@ -611,5 +590,4 @@ details#videoDetails summary { cursor: pointer; font-size: 12px; color: var(--mu
 .sticker-star:hover, .sticker-star:focus-visible { opacity: 1; color: #ffd25a; outline: none; }
 .sticker-star.on { color: #ffd25a; opacity: 1; }
 .bubble-media { padding: 4px; background: transparent !important; border: none !important; }
-.bubble-sticker { width: 140px; height: 140px; object-fit: contain; border-radius: 8px; display: block; }.sticker-look { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); white-space: nowrap; cursor: pointer; }
-.sticker-look input { margin: 0; }
+.bubble-sticker { width: 140px; height: 140px; object-fit: contain; border-radius: 8px; display: block; }

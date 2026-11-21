@@ -609,6 +609,7 @@ async function handleMessage(req, res) {
         uploadId: files[i].id, name: a.name, kind: a.kind, bytes: files[i].bytes,
       })),
       sticker: stickerId || undefined,
+      stickerLabel: sticker ? sticker.label : undefined,
       ts: Date.now(),
     });
 
@@ -626,7 +627,8 @@ async function handleMessage(req, res) {
       // 用户态问题：不写 assistant，也别把"未登录"当成一句话存进历史
       return sendJson(res, 401, { ok: false, code: 'E_UNAUTHORIZED', error: '会话已过期，请重新登录' });
     }
-    if (ok && answer) {
+    if (ok) {
+      // 一条 user + 一条 assistant：即使答案是空串也照记，回放时才看得出这一轮走完了
       appendHistory(user.id, {
         role: 'assistant',
         text: answer,
@@ -634,7 +636,7 @@ async function handleMessage(req, res) {
         usage: (io.data && io.data.usage) || null,
         ts: Date.now(),
       });
-    } else if (!ok) {
+    } else {
       const reason = (io.data && (io.data.error || io.data.code)) || `io HTTP ${io.status}`;
       appendHistory(user.id, { role: 'error', text: String(reason), ts: Date.now() });
     }

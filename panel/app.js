@@ -125,7 +125,7 @@ function setAuthError(text) {
 
 function setLocked(locked) {
   inputEl.disabled = locked;
-  inputEl.placeholder = locked ? '请先登录后再输入…' : '输入内容…';
+  inputEl.placeholder = locked ? '请先登录后再输入…' : '输入内容… 也可以挂图片 / 视频 / 音频 / 文档（可多选）';
   sendBtn.disabled = locked || busy;
 }
 
@@ -260,6 +260,10 @@ async function logout() {
   authToken = '';
   currentUser = null;
   recentTurns.length = 0;
+  // 退出就把没发出去的附件一起丢掉：下一个登录的人不该看到别人的文件
+  attachments = [];
+  pickedSticker = null;
+  renderAttachChips();
   renderUser();
   showEmpty();
   showAuth('login', '');
@@ -609,7 +613,7 @@ function showEmpty() {
   const div = document.createElement('div');
   div.className = 'empty';
   div.id = 'empty';
-  div.textContent = '在下面输入一段文本，交给核心处理，答案会显示在这里。';
+  div.textContent = '在下面输入内容，也可以挂图片 / 视频 / 音频 / 文档，一起发给我。';
   logEl.appendChild(div);
 }
 
@@ -885,8 +889,24 @@ function probeAudioDuration(file) {
   });
 }
 
-/**
- * 气泡里的一个附件。刚发出去的有本地 File（能做缩略图/时长），
+function fileMetaNode(info) {
+  const icon = document.createElement('span');
+  icon.className = 'bubble-file-icon';
+  icon.textContent = KIND_ICON[info.kind || 'other'] || KIND_ICON.other;
+
+  const body = document.createElement('span');
+  body.className = 'bubble-file-meta';
+  const name = document.createElement('span');
+  name.className = 'bubble-file-name';
+  name.textContent = info.name || '文件';
+  const sub = document.createElement('span');
+  sub.className = 'bubble-file-sub';
+  sub.textContent = formatBytes(info.size);
+  body.append(name, sub);
+  return { icon, body, sub };
+}
+
+/** 气泡里的一个附件。刚发出去的有本地 File（能做缩略图/时长），
  * 从历史回放的只有名字；两者用同一个节点，结构不会因为刷新而变样。
  */
 function userFileCard(info) {
@@ -901,40 +921,30 @@ function userFileCard(info) {
     card.rel = 'noopener';
   }
 
+  const { icon, body, sub } = fileMetaNode({ kind, name: info.name, size: info.size });
+
   // 图片：本地 File 直接出缩略图。发送后服务端会删文件，所以缩略图必须靠本地 blob，
   // 不能指望 /api/upload/:id —— 那正是"点开看原图"用的，不是缩略图用的。
-  if (kind === 'image' && info.file) {
+  if (kind === 'image' && (info.file || info.uploadId)) {
     const img = document.createElement('img');
     img.className = 'bubble-thumb';
     img.alt = info.name || '图片';
     img.loading = 'lazy';
-    img.src = URL.createObjectURL(info.file);
-    card.appendChild(img);
-    return card;
-  }
-  if (kind === 'image' && info.uploadId) {
-    const img = document.createElement('img');
-    img.className = 'bubble-thumb';
-    img.alt = info.name || '图片';
-    img.loading = 'lazy';
-    img.src = `/api/upload/${encodeURIComponent(info.uploadId)}`;
+    if (info.file) {
+      img.src = URL.createObjectURL(info.file);
+    } else {
+      img.src = `/api/upload/${encodeURIComponent(info.uploadId)}`;
+      // 历史里的文件早被删了：别留一个破图标，退回成"图标 + 文件名"的卡片
+      img.onerror = () => {
+        card.textContent = '';
+        card.classList.remove('image');
+        card.append(icon, body);
+      };
+    }
     card.appendChild(img);
     return card;
   }
 
-  const icon = document.createElement('span');
-  icon.className = 'bubble-file-icon';
-  icon.textContent = KIND_ICON[kind] || KIND_ICON.other;
-
-  const body = document.createElement('span');
-  body.className = 'bubble-file-meta';
-  const name = document.createElement('span');
-  name.className = 'bubble-file-name';
-  name.textContent = info.name || '文件';
-  const sub = document.createElement('span');
-  sub.className = 'bubble-file-sub';
-  sub.textContent = formatBytes(info.size);
-  body.append(name, sub);
   card.append(icon, body);
 
   // 音频有时长就补上；拿不到就只显示文件名，够用了
@@ -969,7 +979,6 @@ function addUserMessage(text, meta, opts = {}) {
     img.loading = 'lazy';
     img.src = `/api/stickers/gif?id=${encodeURIComponent(opts.sticker.id)}`;
     bubble.appendChild(img);
-    bubble.classList.add('has-sticker');
   }
 
   if (text) {
@@ -1115,6 +1124,8 @@ async function send() {
         `${(ms / 1000).toFixed(1)} 秒${usageNote(data.usage)} · ${formatClock(Date.now())}`);
       // 插件在这一轮里"做了点什么"：发张表情、念一段。模型自己碰不到界面，靠这里落地。
       applyActions(data.actions);
+      // 它回「收藏这张」：收的就是这条消息里发的那张
+      if (sticker && parseReplyMarks(data.answer || '').favorite) await favoriteSentSticker(sticker);
     } else {
       addMessage('error', data.error || data.code || '请求失败', '');
     }
@@ -1272,211 +1283,6 @@ async function loadMemoryView() {
   }
 
   await loadDetail(currentDetail);
-}
-// ---------------------------------------------------------------- 视频视图 --
-
-const videoEls = {
-  drop: document.getElementById('videoDrop'),
-  file: document.getElementById('videoFile'),
-  pick: document.getElementById('videoPick'),
-  hint: document.getElementById('videoDropHint'),
-  text: document.getElementById('videoText'),
-  frames: document.getElementById('videoFrames'),
-  go: document.getElementById('videoGo'),
-  url: document.getElementById('videoUrl'),
-  urlGo: document.getElementById('videoUrlGo'),
-  strip: document.getElementById('videoFramesStrip'),
-  framesCard: document.getElementById('videoFramesCard'),
-  resultCard: document.getElementById('videoResultCard'),
-  reply: document.getElementById('videoReply'),
-  synopsis: document.getElementById('videoSynopsis'),
-  timeline: document.getElementById('videoTimeline'),
-  onScreen: document.getElementById('videoOnScreen'),
-  audio: document.getElementById('videoAudio'),
-  progress: document.getElementById('videoProgress'),
-  bar: document.getElementById('videoBar'),
-};
-
-let pickedVideo = null;
-
-/** 原片直传：XHR 边发边报进度，不经过 base64。 */
-function uploadVideoFile(file, onProgress) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    const qs = `name=${encodeURIComponent(file.name || 'video.bin')}&size=${file.size}`;
-    xhr.open('PUT', `/api/video/upload?${qs}`);
-    const h = authHeaders({});
-    Object.keys(h).forEach((k) => xhr.setRequestHeader(k, h[k]));
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total);
-    };
-    xhr.onload = () => {
-      let data = null;
-      try { data = JSON.parse(xhr.responseText); } catch { }
-      if (!data) return reject(new Error('服务器返回不是 JSON'));
-      if (!data.ok) return reject(new Error(data.error || `HTTP ${xhr.status}`));
-      resolve(data);
-    };
-    xhr.onerror = () => reject(new Error('上传失败（网络中断或面板不可达）'));
-    xhr.ontimeout = () => reject(new Error('上传超时'));
-    xhr.send(file);
-  });
-}
-
-function fmtClock(sec) {
-  const s = Math.max(0, Math.round(sec));
-  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
-}
-
-function seekVideo(v, t) {
-  return new Promise((resolve) => {
-    const done = () => { v.removeEventListener('seeked', done); resolve(); };
-    v.addEventListener('seeked', done);
-    v.currentTime = Math.max(0, Math.min(t, (v.duration || 0) - 0.05));
-  });
-}
-
-/** 本地视频不上传：浏览器解码后只把 N 张 JPEG 送去分析。 */
-async function sampleVideoFrames(file, count) {
-  const objUrl = URL.createObjectURL(file);
-  const v = document.createElement('video');
-  v.preload = 'auto';
-  v.muted = true;
-  v.src = objUrl;
-  try {
-    await new Promise((resolve, reject) => {
-      v.onloadedmetadata = () => resolve();
-      v.onerror = () => reject(new Error('浏览器解不了这个格式'));
-      setTimeout(() => reject(new Error('读视频超时')), 20000);
-    });
-    const duration = v.duration;
-    if (!duration || !isFinite(duration)) throw new Error('读不到视频时长');
-
-    const maxSide = 896;
-    const scale = Math.min(1, maxSide / Math.max(v.videoWidth || maxSide, v.videoHeight || maxSide));
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.max(1, Math.round((v.videoWidth || maxSide) * scale));
-    canvas.height = Math.max(1, Math.round((v.videoHeight || maxSide) * scale));
-    const ctx = canvas.getContext('2d');
-
-    const frames = [];
-    for (let i = 0; i < count; i++) {
-      const t = duration * (i + 0.5) / count;
-      await seekVideo(v, t);
-      ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
-      frames.push({ t: fmtClock(t), dataUrl: canvas.toDataURL('image/jpeg', 0.8) });
-    }
-    return frames;
-  } finally {
-    URL.revokeObjectURL(objUrl);
-  }
-}
-
-function renderFrameStrip(frames) {
-  if (!videoEls.strip) return;
-  videoEls.strip.innerHTML = '';
-  for (const f of frames) {
-    const wrap = document.createElement('div');
-    wrap.className = 'thumb';
-    const img = document.createElement('img');
-    img.src = f.dataUrl;
-    img.alt = f.t;
-    const cap = document.createElement('span');
-    cap.textContent = f.t;
-    wrap.append(img, cap);
-    videoEls.strip.appendChild(wrap);
-  }
-  videoEls.framesCard.classList.remove('hidden');
-}
-
-function renderVideoResult(r) {
-  if (!videoEls.resultCard) return;
-  if (!r || !r.ok) {
-    videoEls.reply.textContent = '没看成：' + ((r && r.error) || '未知原因');
-    videoEls.synopsis.textContent = '';
-    videoEls.timeline.innerHTML = '';
-    videoEls.onScreen.textContent = '';
-  } else {
-    videoEls.reply.textContent = r.reply || '（她没说话）';
-    const a = r.analysis || {};
-    videoEls.synopsis.textContent = a.synopsis || '';
-    videoEls.onScreen.textContent = a.onScreen ? '画面文字：' + a.onScreen : '';
-    videoEls.timeline.innerHTML = '';
-    for (const t of (a.timeline || [])) {
-      const li = document.createElement('li');
-      li.textContent = `${t.t || '?'}  ${t.what || ''}`;
-      videoEls.timeline.appendChild(li);
-    }
-
-    // 听出来的声音
-    const audioEl = document.getElementById('videoAudio');
-    if (audioEl) {
-      const audio = a.audio;
-      if (!audio || !audio.ok) {
-        audioEl.textContent = '';
-      } else {
-        const bits = [];
-        if (audio.transcript) bits.push('听到的话：' + audio.transcript);
-        if (audio.summary) bits.push('声音概况：' + audio.summary);
-        if (Array.isArray(audio.events) && audio.events.length) {
-          bits.push('声音事件：' + audio.events.map((e) => `${e.t} ${e.desc}`).join('；'));
-        }
-        audioEl.textContent = bits.join('\n');
-      }
-    }
-  }
-  videoEls.resultCard.classList.remove('hidden');
-}
-
-function acceptPickedFile(file) {
-  if (!file) return;
-  pickedVideo = file;
-  videoEls.hint.textContent = `${file.name} · ${(file.size / 1048576).toFixed(1)} MB`;
-  videoEls.go.disabled = false;
-}
-
-async function analyzePickedVideo() {
-  if (!pickedVideo) return;
-  const count = Number(videoEls.frames.value) || 8;
-  const wantAudio = videoEls.audio ? videoEls.audio.checked : true;
-  videoEls.go.disabled = true;
-  try {
-    let r;
-    if (wantAudio) {
-      // 传原片：服务器才能抽音轨（浏览器那条路只有帧，听不到声音）
-      videoEls.hint.textContent = '正在上传原片…0%';
-      setProgress(0);
-      const up = await uploadVideoFile(pickedVideo, (frac) => {
-        const pct = Math.round(frac * 100);
-        videoEls.hint.textContent = `正在上传原片…${pct}%（${(pickedVideo.size / 1048576).toFixed(0)} MB）`;
-        setProgress(frac);
-      });
-      videoEls.hint.textContent = '上传完了，服务器在抽帧、听音轨（几十秒）…';
-      setProgress(0.99);
-      r = await apiJson('/api/video/analyze-file', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ uploadId: up.uploadId, text: videoEls.text.value.trim(), frames: count }),
-      });
-    } else {
-      videoEls.hint.textContent = `正在本机抽 ${count} 帧…`;
-      const frames = await sampleVideoFrames(pickedVideo, count);
-      renderFrameStrip(frames);
-      videoEls.hint.textContent = `抽到 ${frames.length} 帧，正在看（几十秒）…`;
-      r = await apiJson('/api/video/analyze', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ frames, text: videoEls.text.value.trim() }),
-      });
-    }
-    renderVideoResult(r);
-    videoEls.hint.textContent = r && r.ok ? '看完了' : '没看成';
-  } catch (err) {
-    videoEls.hint.textContent = '出错：' + (err && err.message || err);
-  } finally {
-    hideProgress();
-    videoEls.go.disabled = false;
-  }
 }
 
 // ------------------------------------------------- 视频创作（studio）----
@@ -1900,67 +1706,6 @@ if (studioEls.sceneList) {
   studioEls.sceneList.addEventListener('click', onSceneListClick);
 }
 
-function setProgress(frac) {
-  if (!videoEls.progress || !videoEls.bar) return;
-  videoEls.progress.classList.remove('hidden');
-  videoEls.bar.style.width = Math.max(0, Math.min(1, frac)) * 100 + '%';
-}
-
-function hideProgress() {
-  if (!videoEls.progress || !videoEls.bar) return;
-  videoEls.progress.classList.add('hidden');
-  videoEls.bar.style.width = '0%';
-}
-
-async function analyzeUrlVideo() {
-  const link = videoEls.url.value.trim();
-  if (!/^https?:\/\//i.test(link)) {
-    videoEls.hint.textContent = '链接要 http(s) 开头';
-    return;
-  }
-  const count = Number(videoEls.frames.value) || 8;
-  videoEls.urlGo.disabled = true;
-  videoEls.hint.textContent = '服务器正在下载并抽帧（可能要一分钟）…';
-  try {
-    const r = await apiJson('/api/video/url', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ url: link, text: videoEls.text.value.trim(), frames: count }),
-    });
-    renderVideoResult(r);
-    videoEls.hint.textContent = r && r.ok ? '看完了' : '没看成';
-  } catch (err) {
-    videoEls.hint.textContent = '出错：' + (err && err.message || err);
-  } finally {
-    videoEls.urlGo.disabled = false;
-  }
-}
-
-if (videoEls.pick) {
-  videoEls.pick.addEventListener('click', () => videoEls.file.click());
-  videoEls.file.addEventListener('change', () => {
-    acceptPickedFile(videoEls.file.files && videoEls.file.files[0]);
-  });
-  ['dragenter', 'dragover'].forEach((ev) => {
-    videoEls.drop.addEventListener(ev, (e) => {
-      e.preventDefault();
-      videoEls.drop.classList.add('over');
-    });
-  });
-  ['dragleave', 'drop'].forEach((ev) => {
-    videoEls.drop.addEventListener(ev, (e) => {
-      e.preventDefault();
-      videoEls.drop.classList.remove('over');
-    });
-  });
-  videoEls.drop.addEventListener('drop', (e) => {
-    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-    acceptPickedFile(f);
-  });
-  videoEls.go.addEventListener('click', analyzePickedVideo);
-  videoEls.urlGo.addEventListener('click', analyzeUrlVideo);
-}
-
 /** 切栏：聊天 / 记忆 / 人格 / 账号。 */
 function setView(name) {
   document.querySelectorAll('.view').forEach((s) => s.classList.toggle('active', s.id === 'view-' + name));
@@ -1969,7 +1714,7 @@ function setView(name) {
     t.classList.toggle('active', on);
     t.setAttribute('aria-selected', on ? 'true' : 'false');
   });
-  const titles = { chat: '聊天', memory: '记忆', video: '视频', persona: '人格', admin: '账号' };
+  const titles = { chat: '聊天', memory: '记忆', video: '做视频', persona: '人格', admin: '账号' };
   if (viewTitle) viewTitle.textContent = titles[name] || '';
   if (name === 'memory') loadMemoryView();
   if (name === 'persona') loadPersonaView();
@@ -2094,8 +1839,8 @@ setInterval(refreshHealth, 15000);
 boot();
 
 // ------------------------------------------------------------- 表情包 ----
-// 发一张表情不经过模型：只 POST 一条消息进历史，然后把气泡插到聊天里。
-// 这样它和"说话"是两条路，表情不会被模型改写，也不会多花 token。
+// 表情现在只是"这条消息的一部分"：点一张 → 变成输入框上方的 chip，
+// 和文字一起走一次 /api/message。不再单独发一轮，也不会被模型改写。
 
 const stickerEls = {
   btn: document.getElementById('stickerBtn'),
@@ -2104,7 +1849,6 @@ const stickerEls = {
   search: document.getElementById('stickerSearch'),
   close: document.getElementById('stickerClose'),
   hint: document.getElementById('stickerHint'),
-  look: document.getElementById('stickerLook'),
   tabAll: document.getElementById('stickerTabAll'),
   tabFav: document.getElementById('stickerTabFav'),
 };
@@ -2123,7 +1867,7 @@ function renderStickerGrid(items) {
     }
     return;
   }
-  if (stickerEls.hint) stickerEls.hint.textContent = `共 ${items.length} 张 · 点一张直接发出去`;
+  if (stickerEls.hint) stickerEls.hint.textContent = `共 ${items.length} 张 · 点一张放进输入框，和文字一起发`;
   for (const it of items) {
     const btn = document.createElement('button');
     btn.type = 'button';
@@ -2152,7 +1896,7 @@ function renderStickerGrid(items) {
     });
     btn.appendChild(star);
 
-    btn.addEventListener('click', () => sendSticker(it, btn));
+    btn.addEventListener('click', () => pickSticker(it));
     stickerEls.grid.appendChild(btn);
   }
 }
@@ -2255,41 +1999,16 @@ async function loadStickers(q) {
   }
 }
 
-async function sendSticker(item, btn) {
-  if (btn) btn.disabled = true;
-  const look = Boolean(stickerEls.look && stickerEls.look.checked);
-  if (stickerEls.hint) stickerEls.hint.textContent = look ? '先让它看一眼这张图…' : '发出去了，等它接话…';
-  try {
-    const r = await apiJson('/api/stickers/send', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ id: item.id, mood: item.mood, name: item.name, look }),
-    });
-    if (!r || !r.ok) {
-      if (stickerEls.hint) stickerEls.hint.textContent = '没发出去：' + ((r && r.error) || '未知原因');
-      return;
-    }
-    addMessage('user', `[表情] ${item.mood || item.name || ''}`, '', { sticker: item.id });
-    toggleStickerPanel(false);
-
-    // 收藏指令先读出来：addReplySeries 会把标记从正文剥掉
-    const marks = parseReplyMarks(r.reply || '');
-
-    // 表情也算一轮对话，模型会接着说话；回复里的表情标记由 addReplySeries 铺成图片泡
-    if (r.reply) {
-      const meta = typeof r.ms === 'number' ? `${(r.ms / 1000).toFixed(1)} 秒 · ${formatClock(Date.now())}` : formatClock(Date.now());
-      await addReplySeries(r.reply, meta, {});
-    } else if (r.error) {
-      addMessage('error', '它没接上话：' + r.error, formatClock(Date.now()));
-    }
-
-    // 它说「把这张收起来」：收藏的就是刚发出去的那张
-    if (marks.favorite) await favoriteSentSticker(item);
-  } catch (err) {
-    if (stickerEls.hint) stickerEls.hint.textContent = '发送失败：' + ((err && err.message) || err);
-  } finally {
-    if (btn) btn.disabled = false;
-  }
+/**
+ * 点一张表情：只是放进输入框上方当 chip，跟文字一起发。
+ * 以前「点一下 = 单独发一轮」，正是"文字 + 表情要回两次"的根因。
+ */
+function pickSticker(item) {
+  if (!item || !item.id) return;
+  pickedSticker = { id: item.id, mood: item.mood || item.name || '' };
+  renderAttachChips();
+  toggleStickerPanel(false);
+  if (currentUser) inputEl.focus();
 }
 
 /** 全部 / 收藏 两个小标签页：切页只换请求参数，不改发送逻辑。 */
@@ -2317,6 +2036,3 @@ if (stickerEls.search) {
 }
 if (stickerEls.tabAll) stickerEls.tabAll.addEventListener('click', () => setStickerTab(false));
 if (stickerEls.tabFav) stickerEls.tabFav.addEventListener('click', () => setStickerTab(true));
-
-// 页面一开就悄悄备一份表情目录，正常聊天才能让模型输出表情 id；失败不影响聊天
-preloadStickerCatalog();
