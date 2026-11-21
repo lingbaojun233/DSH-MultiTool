@@ -19,6 +19,7 @@
 | → id | string | 表情标识，取图用 |
 | → mood | string | 表情名，如"停止工作" |
 | → bytes | int | 压缩后体积 |
+| → sticker | object | `/v1/pick` 挑中的那一张（含 id / mood / bytes） |
 
 ## 例子
 
