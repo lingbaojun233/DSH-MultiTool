@@ -1792,6 +1792,7 @@ async function loadStickers(q) {
 
 async function sendSticker(item, btn) {
   if (btn) btn.disabled = true;
+  if (stickerEls.hint) stickerEls.hint.textContent = '发出去了，等它接话…';
   try {
     const r = await apiJson('/api/stickers/send', {
       method: 'POST',
@@ -1804,6 +1805,14 @@ async function sendSticker(item, btn) {
     }
     addMessage('user', `[表情] ${item.mood || item.name || ''}`, '', { sticker: item.id });
     toggleStickerPanel(false);
+
+    // 表情也算一轮对话，模型会接着说话；把它的回复按多气泡铺开
+    if (r.reply) {
+      const meta = typeof r.ms === 'number' ? `${(r.ms / 1000).toFixed(1)} 秒 · ${formatClock(Date.now())}` : formatClock(Date.now());
+      await addReplySeries(r.reply, meta, {});
+    } else if (r.error) {
+      addMessage('error', '它没接上话：' + r.error, formatClock(Date.now()));
+    }
   } catch (err) {
     stickerEls.hint.textContent = '发送失败：' + (err && err.message || err);
   } finally {

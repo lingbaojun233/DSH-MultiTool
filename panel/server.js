@@ -663,7 +663,8 @@ const handler = async (req, res) => {
       return res.end(buf);
     }
 
-    // 发一张表情：不进模型，只作为一条消息记进历史（刷新后还在）
+    // 发一张表情：记进历史，并且当成一轮对话交给模型 ——
+    // 否则它根本不知道你发了图，只会对着空气继续上一句话。
     if (req.method === 'POST' && url.pathname === '/api/stickers/send') {
       const user = await currentUser(req);
       if (!user) return sendJson(res, 401, { ok: false, error: '未登录或会话已过期' });
@@ -679,7 +680,34 @@ const handler = async (req, res) => {
         sticker: id,
         ts: Date.now(),
       });
-      return sendJson(res, 200, { ok: true, id, label });
+
+      // 把"我发了什么图"翻译成模型能读的一句话。图本身进不了上下文，
+      // 但表情名是语义标签，足够它接话。
+      const prompt = `（我发了一张表情包，表情叫「${label}」。就当我发了这张图，自然地接一句，别说你看到的是文字。）`;
+      const io = await postJson(IO_BASE, '/v1/input',
+        { text: prompt, sessionId: 'panel' },
+        { authorization: req.headers.authorization || '' }, 600000);
+
+      const reply = (io.data && io.data.answer) || '';
+      if (reply) {
+        appendHistory(user.id, {
+          role: 'assistant',
+          text: reply,
+          ms: io.data && io.data.ms,
+          usage: (io.data && io.data.usage) || null,
+          ts: Date.now(),
+        });
+      }
+      log(`sticker send id=${id} label=${label} reply=${reply ? 'yes' : 'no'} io=${io.status}`);
+      return sendJson(res, 200, {
+        ok: true,
+        id,
+        label,
+        reply,
+        ms: (io.data && io.data.ms) || null,
+        ioOk: Boolean(io.data && io.data.ok),
+        error: reply ? undefined : ((io.data && (io.data.error || io.data.code)) || `io HTTP ${io.status}`),
+      });
     }
 
     // 视频创作：DSH 只写分镜，ffmpeg 渲染（模型不生成像素）
