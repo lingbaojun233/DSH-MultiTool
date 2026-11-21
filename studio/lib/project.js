@@ -91,6 +91,9 @@ function sceneKey(scene, cfg) {
     // 文字卡的入场/出场淡化同样决定画面：改这个值必须重渲文字卡，否则新旧混一集。
     // v2 = 淡到风格底色 + 跨 xfade 中点（v1 是淡到黑，缓存必须区分开）
     edge: String(scene.kind || 'text') === 'text' ? `v2|${Number(cfg.textEdgeFade) || 0}|${cfg.styleId || ''}` : null,
+    // 画质档也决定画面（low = 540p 渲染后放大）：不进键的话"草稿渲过的项目"
+    // 在改成 medium 之后会继续复用草稿片段，成片刻糊的。
+    renderQuality: String(cfg.renderQuality || ''),
     w: cfg.width, h: cfg.height, fps: cfg.fps,
   };
   return sha1(JSON.stringify(payload));
@@ -118,6 +121,10 @@ function createProject(root, input = {}) {
     style: String(input.style || ''),
     // 项目级文字卡淡化覆盖（秒）。null = 用全局配置 textEdgeFade。
     textEdgeFade: input.textEdgeFade == null ? null : Number(input.textEdgeFade),
+    // 项目级字幕开关：true/false 钉死，null = 跟随 config.subtitles（默认开）。
+    // 字幕样式覆盖（字号/颜色）放 subtitleStyle，见 lib/subtitles.js 的 resolveStyle()。
+    subtitles: input.subtitles == null ? null : Boolean(input.subtitles),
+    subtitleStyle: input.subtitleStyle && typeof input.subtitleStyle === 'object' ? input.subtitleStyle : null,
     scenes: [],
     cache: {},       // sceneKey -> { clip, at }
     audioCache: {},  // audioKey -> { wav, ms, at }

@@ -29,8 +29,8 @@ function readJson(file, fallback) {
 const CFG = Object.assign({
   port: 8773,
   dataDir: 'C:\\Apps\\DSH-MultiTool\\data\\stickers',
-  defaultLimit: 60,
-  maxLimit: 200,
+  defaultLimit: 200,   // 有 157 张，默认返回全部；之前 60 导致面板只显示前 60
+  maxLimit: 500,
   ffmpeg: 'C:\\Apps\\DSH-MultiTool\\tools\\ffmpeg\\bin\\ffmpeg.exe',
   // 借视频模块的视觉能力（它持有 key，sticker 不该再存一份）
   videoUrl: 'http://127.0.0.1:8769',

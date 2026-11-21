@@ -3738,7 +3738,7 @@ function stickerCatalog() {
 async function preloadStickerCatalog() {
   if (stickerList.length) return;
   try {
-    const data = await apiJson('/api/stickers?limit=80');
+    const data = await apiJson('/api/stickers?limit=300');
     // 期间用户可能已经打开面板搜过一次，别拿旧结果盖掉
     if (stickerList.length) return;
     if (data && data.ok && Array.isArray(data.items) && data.items.length) stickerList = data.items;
@@ -3752,7 +3752,7 @@ async function loadStickers(q) {
   if (stickerEls.hint) stickerEls.hint.textContent = stickerFavOnly ? '正在找收藏…' : '正在找…';
   try {
     const fav = stickerFavOnly ? '&favorite=1' : '';
-    const data = await apiJson(`/api/stickers?q=${encodeURIComponent(stickerQuery)}&limit=60${fav}`);
+    const data = await apiJson(`/api/stickers?q=${encodeURIComponent(stickerQuery)}&limit=300${fav}`);
     if (!data || !data.ok) {
       if (stickerEls.hint) stickerEls.hint.textContent = '表情包服务没响应（模块可能没起）';
       return;

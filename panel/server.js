@@ -1023,7 +1023,8 @@ const handler = async (req, res) => {
     // 表情包：列表 + 取图 + 发一张（发不经过模型，只写进历史）
     if (req.method === 'GET' && url.pathname === '/api/stickers') {
       const q = url.searchParams.get('q') || '';
-      const limit = url.searchParams.get('limit') || '60';
+      // 之前写死 60，表情有 157 张却只显示 60 个。默认放宽到 300，前端也可显式传 limit。
+      const limit = url.searchParams.get('limit') || '300';
       const fav = url.searchParams.get('favorite') === '1' ? '&favorite=1' : '';
       const r = await fetch(`${STICKER_BASE}/v1/list?q=${encodeURIComponent(q)}&limit=${encodeURIComponent(limit)}${fav}`,
         { signal: AbortSignal.timeout(15000) });

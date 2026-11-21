@@ -285,6 +285,9 @@ async function normalizeClip({ ffmpeg, inFile, outFile, w, h, fps, seconds = 0 }
 async function renderManim({
   python, work, index, code, sceneName = null, quality = '-qm',
   timeoutMs = null, seconds = 0, w = 0, h = 0, fps = 0,
+  // renderW/renderH = manim **实际渲染**的分辨率；w/h = normalizeClip 的**产出**规格。
+  // 草稿档（renderQuality:low）要的是"少画像素、再放大回 1080p"，所以两者必须能分开传。
+  renderW = 0, renderH = 0,
   ffmpeg = null, timeoutBaseMs = 20000, timeoutPerSecondMs = 3000,
 }) {
   const started = Date.now();
@@ -317,8 +320,11 @@ async function renderManim({
 
   const q = String(quality || '-qm');
   const args = ['-m', 'manim', 'render', q, '--disable_caching', '--media_dir', mediaDir];
-  // 分辨率/帧率显式给：项目是 1080p30，manim 的 -qm 默认 720p30，不覆盖就得再缩放一次
-  if (Number(w) > 0 && Number(h) > 0) args.push('-r', `${Number(w)},${Number(h)}`);
+  // 分辨率/帧率显式给：项目是 1080p30，manim 的 -qm 默认 720p30，不覆盖就得再缩放一次。
+  // 传了 renderW/renderH 就用它渲染，产出规格仍按 w/h（由 normalizeClip 统一）。
+  const rw = Number(renderW) > 0 ? Number(renderW) : Number(w);
+  const rh = Number(renderH) > 0 ? Number(renderH) : Number(h);
+  if (rw > 0 && rh > 0) args.push('-r', `${rw},${rh}`);
   if (Number(fps) > 0) args.push('--fps', String(Number(fps)));
   args.push('-o', 'out.mp4', script, name);
 
