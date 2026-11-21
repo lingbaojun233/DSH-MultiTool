@@ -61,10 +61,12 @@ DEEPSEEK_API_KEY=sk-你的key
 面板注册要邀请码，安装脚本已经随机生成，写在：
 
 ```text
-<安装目录>\secrets\register-code.txt
+<安装目录>\secrets\invite-code.txt
 ```
 
 安装结尾的控制台也会把它打印出来。打开面板 → 注册 → 填邀请码 → 登录。
+
+> 邀请码只从这个文件读，不再写在 `start-server.cmd` 里。早期提交曾硬编码过生产邀请码与 PFX 口令 —— clone 过旧版本的话请重新拉取并轮换。
 
 ---
 
@@ -177,7 +179,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1 -Root D:\DSH
 C:\Apps\DSH-MultiTool\
 ├─ core\             DSH 核心（runtime\node、app、home）
 ├─ io\ panel\ memory\ separator\ video\ speak\ listen\ studio\ sticker\   九个服务
-├─ secrets\          internal-token.txt / breezeblue.key / register-code.txt
+├─ secrets\          internal-token.txt / breezeblue.key / invite-code.txt / panel-cert.pass
 ├─ data\             记忆库、面板历史、渲染产物
 ├─ logs\             每个服务一个日志
 ├─ tools\            可选：ffmpeg / python311 / piper

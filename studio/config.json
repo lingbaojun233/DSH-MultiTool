@@ -27,5 +27,9 @@
     "personaUrl":  "http://127.0.0.1:8767",
     "personaTimeoutMs":  6000,
     "defaultStyle":  "whiteboard",
-    "textEdgeFade":  0.15
+    "textEdgeFade":  0.15,
+    "maxAiVideo": 2,
+    "wanTimeoutMs":  480000,
+    "wanKeyPath":  "C:\\Apps\\DSH-MultiTool\\secrets\\wan.key",
+    "wanKeyJson":  "C:\\Apps\\DSH-MultiTool\\video\\secrets.json"
 }

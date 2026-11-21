@@ -25,7 +25,9 @@ function sha1(text) {
 }
 
 function readJson(file, fallback) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
+  // 同样容忍 BOM：项目 JSON 被外部工具（记事本/PowerShell）改过后可能带 BOM，
+  // 带 BOM 时 JSON.parse 会抛，项目就读不出来了 —— 那是最坏的情况（缓存全丢）。
+  try { return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '')); } catch { return fallback; }
 }
 
 function writeJson(file, obj) {
@@ -68,6 +70,8 @@ function sceneKey(scene, cfg) {
     python: String(scene.python || ''),
     // manim 脚本也进缓存键：改了代码必须重渲，不能复用旧动画
     manim: scene.manim || null,
+    // AI 生成画面：prompt 变了就是另一条片子，必须重生成；size 也影响产物
+    video: scene.video || null,
     draw: scene.draw || null,
     steps: Array.isArray(scene.steps) ? scene.steps : null,
     seconds: Number(scene.seconds) || 0,
@@ -189,7 +193,7 @@ function normalizeScene(raw) {
   const hex = (v, fallback) => (/^#[0-9a-f]{6}$/i.test(String(v || '')) ? String(v) : fallback);
   const bg = raw.bg || {};
   const seconds = Math.min(12, Math.max(1, Number(raw.seconds) || 3));
-  let kind = ['text', 'rich', 'plot', 'manim'].includes(raw.kind) ? raw.kind : 'text';
+  let kind = ['text', 'rich', 'plot', 'manim', 'aivideo'].includes(raw.kind) ? raw.kind : 'text';
   // manim 场景：模型写一段 Manim 脚本，渲染时整段交给 manim（不再走静帧 + zoompan）。
   // 脚本没有/不是字符串就把 kind 退回 text —— 否则每次渲染都会白跑一次注定失败的 manim。
   const manimSrc = raw.manim && typeof raw.manim === 'object' ? raw.manim : null;
@@ -197,10 +201,22 @@ function normalizeScene(raw) {
   const manimScene = manimSrc && /^[\p{L}_][\p{L}\p{N}_]{0,63}$/u.test(String(manimSrc.scene || ''))
     ? String(manimSrc.scene) : null;
   const manim = manimCode ? { code: manimCode.slice(0, 8000), scene: manimScene } : null;
+  // AI 生成画面（aivideo 场）：prompt 是英文画面描述（主体+动作+风格+镜头），
+  // size 是分辨率，wan 目前只认 1280*720 这一档实测可用，别的值回落到默认。
+  // 没有 prompt 就没有"要生成什么"，这一场只能退回文字卡 —— 别让渲染去白等 100 秒。
+  const videoSrc = raw.video && typeof raw.video === 'object' ? raw.video : null;
+  const videoPrompt = videoSrc && typeof videoSrc.prompt === 'string' ? videoSrc.prompt.trim() : '';
+  const video = videoPrompt ? {
+    prompt: videoPrompt.slice(0, 240),
+    size: /^\d{2,5}\*\d{2,5}$/.test(String(videoSrc.size || '')) ? String(videoSrc.size) : '1280*720',
+  } : null;
   // kind 只是"偏好"。有脚本就是 manim 场 —— 以前这里只在 kind==='manim' 时才认，
   // 结果"规划成 text/rich 但确实给了 manim 脚本"的场次会白白丢掉动画。
+  // manim 优先于 aivideo：两种素材都有时，精确动画比生成画面更可控（引擎链也是这个顺序）。
   if (manim) kind = 'manim';
+  else if (video) kind = 'aivideo';
   if (kind === 'manim' && !manim) kind = 'text';
+  if (kind === 'aivideo' && !video) kind = 'text';
   // 表情叠加：坐标用 0~1 相对值，渲染器自己换算成像素
   const stickers = (Array.isArray(raw.stickers) ? raw.stickers : [])
     .filter((s) => s && /^[0-9a-f]{6,40}$/i.test(String(s.id || '')))
@@ -227,6 +243,7 @@ function normalizeScene(raw) {
     // rich 场景用绘图指令（GDI+），html 是早期留给无头浏览器的路，保留但不再主推
     python: raw.python ? String(raw.python).slice(0, 4000) : null,
     manim,
+    video,
     draw: raw.draw && Array.isArray(raw.draw.shapes) ? {
       title: String(raw.draw.title || raw.text || '').slice(0, 60),
       bg1: raw.draw.bg1 || '#101a33',

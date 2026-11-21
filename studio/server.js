@@ -29,11 +29,14 @@ let Overlay = null;
 let GdiScene = null;
 let Pyplot = null;
 let Manim = null;
+let Wan = null;
 try { HTMLScene = require('./lib/html-scene.js'); } catch { HTMLScene = null; }
 try { Overlay = require('./lib/overlay.js'); } catch { Overlay = null; }
 try { GdiScene = require('./lib/gdi-scene.js'); } catch { GdiScene = null; }
 try { Pyplot = require('./lib/pyplot.js'); } catch { Pyplot = null; }
 try { Manim = require('./lib/manim.js'); } catch { Manim = null; }
+// AI 视频（wan3.0-video）：可选依赖，模块缺失时 aivideo 场自动降级文字卡，不影响整体启动
+try { Wan = require('./lib/wanvideo.js'); } catch { Wan = null; }
 
 // 所有"分步静帧 → 片段"的路径统一走 buildStepClip（带淡入淡出 + 轻微推近），
 // 不再用 html-scene 里那版硬切。这里覆盖一次，调用点就不用逐个改。
@@ -48,7 +51,10 @@ const DIR = __dirname;
 const HOST = '127.0.0.1';
 
 function readJson(file, fallback) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
+  // 去 BOM：PowerShell 的 Set-Content -Encoding UTF8（5.1）会写 BOM，
+  // 带 BOM 的 JSON.parse 直接抛异常 → 整个配置被悄悄忽略、回落到默认值。
+  // 踩过一次（config.json 被 BOM 污染，maxAiVideo 设 2 却按 4 跑），这里兜住。
+  try { return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '')); } catch { return fallback; }
 }
 
 const CFG = Object.assign({
@@ -96,6 +102,12 @@ const CFG = Object.assign({
   // 文字卡标题的入场/出场淡化（秒）。0 关闭。
   // 为什么要它：xfade 是 0.4 秒重叠，两张文字卡在这个窗口里同时全亮 → 标题叠字。
   textEdgeFade: 0.15,
+  // AI 生成画面（wan3.0-video）的成本护栏：一集最多几条。
+  // 每条 5 秒、要等约 100 秒、还占网关额度 —— 不设上限，模型一口气写 8 场就能把额度烧光。
+  // 超出的场次在渲染时降级成文字卡并记日志（见 renderProject 的 planAiVideoQuota）。
+  maxAiVideo: 4,
+  // 一条 AI 视频的总超时（提交 + 轮询 + 下载）。实测 100 秒出片，留到 8 分钟。
+  wanTimeoutMs: 480000,
 }, readJson(path.join(DIR, 'config.json'), {}));
 
 // 把静帧模式交给渲染层（在 require 之后、任何 sceneClip 之前）
@@ -111,6 +123,13 @@ if (!CFG.imageDir) CFG.imageDir = path.join(CFG.outDir, 'images');
 // 人设→风格的缓存：跟成片放一起（data/studio/persona-style.json），
 // 按 persona.version 失效，见 lib/styles.js 的 resolvePersonaStyle。
 if (!CFG.styleCacheFile) CFG.styleCacheFile = path.join(CFG.outDir, 'persona-style.json');
+
+// AI 视频的密钥：**不写进代码、不进日志**，只从 secrets 读。
+// 优先 config.wanKeyPath（服务器上是 C:\Apps\DSH-MultiTool\secrets\wan.key），
+// 再退到同目录的 qwen.key，最后退到老 video 模块的 secrets.json（同一个 key）。
+// 这样"新装一个 wan.key"和"沿用旧 key"都能跑，不用改配置。
+if (!CFG.wanKeyPath) CFG.wanKeyPath = path.join(DIR, '..', 'secrets', 'wan.key');
+if (!CFG.wanKeyJson) CFG.wanKeyJson = path.join(DIR, '..', 'video', 'secrets.json');
 
 // ---- 旁白驱动时长的三个常量（秒）----
 // NARRATION_PAD：旁白念完之后留的余量。0.6 秒够一次换气，再短听着像被掐断。
@@ -415,13 +434,22 @@ function buildSkeletonPrompt(prompt, total, opts = {}) {
     `给这个主题写分镜：${prompt}`,
     `总时长约 ${total} 秒。`,
     '{"title":"标题","scenes":[{"text":"这一场标题（≤14字）","narration":"旁白（≤30字，口语）","seconds":4,"visual":"manim"}]}',
+    'aivideo 场的形状：{"text":"…","narration":"…","seconds":5,"visual":"aivideo","video":{"prompt":"anime style, cel shading, wide shot, blue-haired ice fairy flying over a snowy forest","size":"1280*720"}}',
     '',
-    '## 画面引擎（只有两种取值）',
-    '- visual 只能是 manim 或 text。**至少 80% 的场次必须是 manim**（3 场至少 2 场、5 场至少 4 场、8 场至少 7 场）。',
+    '## 画面引擎（三种取值：manim / aivideo / text）',
+    '- visual 只能是 manim、aivideo 或 text。manim 仍是主力：除 aivideo 与开头结论外都用 manim。',
+    '- visual 选 aivideo 的情况：需要人物、场景、动作、氛围（故事、情节、拟人化演示）',
+    '- visual 选 manim 的情况：公式、坐标、曲线、精确动画、推导过程',
+    `- 一条视频里 aivideo 最多 ${Math.max(0, Number(CFG.maxAiVideo) || 0)} 场（每条生成要 100 秒且占额度），其余用 manim`,
     '- manim：用 Manim 演一段真动画 —— 曲线生长、切线滑动、公式逐项变形、点在轨迹上跑、坐标轴里量出结论。',
     '- text：纯文字卡（渐变底 + 一行大字），只用于开场、转场、下结论；一集最多 1~2 场。',
     '- 不要写 plot / draw / rich：这两条旧路子已停用（写了也会被当成 text，白占一场）。',
     '- 讲"变化过程 / 运动 / 逐渐逼近"的场次必须用 manim，不要拿一张静止的图糊过去。',
+    '',
+    '## aivideo 场的 video.prompt（生成画面的唯一依据）',
+    '- 必须英文：说清主体 + 动作 + 风格 + 镜头，例如 "anime style, cel shading, wide shot, a girl flying over a snowy plain, wind blowing"。',
+    '- **≤120 字符**，只写一句，不要引号、不要中文、不要换行；不要把公式/坐标轴/文字写进去（那些用 manim）。',
+    '- size 固定写 "1280*720"；seconds 写 5（生成片段就是 5 秒，长了会自动截断）。',
     '',
     `- 场数 3~${CFG.maxScenes}；每场 3~8 秒；加起来接近 ${total} 秒。`,
     '- narration 是给人听的：口语、一句一个意思，下一场接上一场。',
@@ -510,8 +538,16 @@ function buildVisualPrompt(scene, kind, style) {
       '',
     );
   }
+  // AI 生成画面：这里不问 manim 脚本，只要一条英文 prompt（生成模型只认这个）
+  if (String(kind || '').toLowerCase() === 'aivideo') {
+    return buildAiVideoPrompt(scene, hint).join('\n');
+  }
   const body = [
     '{"manim":{"scene":"TangentAnim","code":"from manim import *\\nclass TangentAnim(Scene):\\n    def construct(self):\\n        ..."}}',
+    '',
+    '## 这一场为什么是 manim 而不是 aivideo',
+    '- visual 选 aivideo 的情况：需要人物、场景、动作、氛围（故事、情节、拟人化演示）——如果这一场其实是这种，说明规划写错了，仍按 manim 画能画的部分。',
+    '- visual 选 manim 的情况：公式、坐标、曲线、精确动画、推导过程。',
     '',
     '## 脚本硬约束（违反会被拒收，直接降级成文字卡）',
     '- 只写 `from manim import *` + 一个 `class <英文类名>(Scene):` 和它的 `def construct(self):`；manim.scene 必须与类名逐字一致',
@@ -543,6 +579,47 @@ function buildVisualPrompt(scene, kind, style) {
 
 
 /**
+ * 单场 AI 画面的提示词：把这一场的中文描述翻成**一条英文生成 prompt**。
+ *
+ * 为什么不直接把中文塞给 wan：实测生成模型对英文主体/镜头词敏感得多，
+ * 而且中文 prompt 一长就容易出抽象画面。所以这里限定：英文、≤120 字符、
+ * 必须含主体 + 动作 + 风格 + 镜头 —— 四个要素缺一个，生成结果就会飘。
+ */
+function buildAiVideoPrompt(scene, hint) {
+  const lines = [
+    '只输出 JSON，第一个字符必须是 {，不要解释。',
+    `这一场用 AI 视频模型生成画面：标题「${scene.text || ''}」，旁白「${scene.narration || ''}」`,
+    `这一场 ${Number(scene.seconds) || 5} 秒（生成片段固定 5 秒，长的部分会截断）。`,
+    '',
+    '## 输出形状',
+    '{"video":{"prompt":"anime style, cel shading, wide shot, a girl in a white coat flying over a snowy plain","size":"1280*720"}}',
+    '',
+    '## prompt 硬要求',
+    '- **必须是英文**，只写一句，不要引号、不要换行、不要中文、不要解释。',
+    '- **≤120 字符**（写长了会被截断，风格词就丢了）。',
+    '- 四个要素都要有：主体（谁/什么）+ 动作（在做什么）+ 风格（anime style / cel shading / cinematic / watercolor…）+ 镜头（wide shot / close-up / tracking shot…）。',
+    '- 描述"看得见的东西"：人物外貌、环境、光线、氛围。不要写抽象概念、不要写公式和坐标轴、不要把标题文字写进去。',
+    '- 一条 prompt 只讲一个连续镜头（5 秒讲不了两件事）；需要多个画面就拆成另外几场。',
+    '',
+    '## 什么时候不该用 aivideo',
+    '- 公式、坐标轴、曲线、推导过程 → 这些必须是 manim，生成模型画不出准确的图。',
+    `- 一条视频里 aivideo 最多 ${Math.max(0, Number(CFG.maxAiVideo) || 0)} 场（每条生成要 100 秒且占额度），其余用 manim。`,
+  ];
+  if (hint) {
+    lines.push(
+      '',
+      '## 这一场要的画面（最高优先级）',
+      hint.slice(0, 600),
+      '',
+      '把上面这段翻成英文 prompt：主体、动作、风格、镜头都要对得上，不要换成别的场景。',
+    );
+  }
+  return lines;
+}
+
+
+
+/**
  * 去掉 MathTex/Tex 参数外面多包的一层 $...$。
  *
  * 为什么需要：MathTex 本身就在数学模式里，再包 $ 会让 LaTeX 直接编译失败。
@@ -567,9 +644,31 @@ async function planTwoStage(prompt, opts = {}) {
 
   let visuals = 0;
   let textCards = 0;
+  let aiVideos = 0;
+  const aiLimit = Math.max(0, Number(CFG.maxAiVideo) || 0);
   for (const s of scenes) {
-    // 只认 manim / text。以前这里还认 plot 和 draw，模型于是很爱写它们 —— 现在一律当文字卡。
-    const kind = String(s.visual || '').trim().toLowerCase() === 'manim' ? 'manim' : 'text';
+    // 三种取值：manim / aivideo / text。plot、draw 这两条旧路子已经停用，
+    // 模型写了也会被当成 text（白占一场），所以提示词里连提都不提它们。
+    const visual = String(s.visual || '').trim().toLowerCase();
+    if (visual === 'aivideo' || (s.video && s.video.prompt)) {
+      // 护栏在规划阶段先拦一次：省得模型一口气写 8 场 aivideo，渲染时才逐场降级
+      if (aiVideos >= aiLimit) {
+        log(`场「${s.text}」超出本集 aivideo 上限 ${aiLimit} 场，规划阶段降级文字卡`);
+        textCards += 1;
+        continue;
+      }
+      const aiPrompt = normalizeAiPrompt(s.video && s.video.prompt);
+      if (!aiPrompt) {
+        log(`场「${s.text}」标了 aivideo 但没给 video.prompt，降级文字卡`);
+        textCards += 1;
+        continue;
+      }
+      s.video = { prompt: aiPrompt, size: (s.video && s.video.size) || '1280*720' };
+      s.kind = 'aivideo';
+      aiVideos += 1;
+      continue;
+    }
+    const kind = visual === 'manim' ? 'manim' : 'text';
     if (kind === 'text') { textCards += 1; continue; }
     const r = await askJson(buildVisualPrompt(s, kind, style), { ...opts, sessionId: 'studio-visual' });
     if (!r.ok) { log(`场「${s.text}」视觉生成失败，降级文字卡`); textCards += 1; continue; }
@@ -594,8 +693,8 @@ async function planTwoStage(prompt, opts = {}) {
     }
   }
   const ratio = scenes.length ? Math.round((visuals / scenes.length) * 100) : 0;
-  log(`两段式规划：${scenes.length} 场，manim ${visuals} 场（${ratio}%），文字卡 ${textCards} 场`);
-  return { ok: true, json: { title: skel.json.title || '', scenes }, visuals, manimRatio: ratio };
+  log(`两段式规划：${scenes.length} 场，manim ${visuals} 场（${ratio}%），aivideo ${aiVideos} 场，文字卡 ${textCards} 场`);
+  return { ok: true, json: { title: skel.json.title || '', scenes }, visuals, aiVideos, manimRatio: ratio };
 }
 
 // ------------------------------------------------ 三种创作入口（两个新口） --
@@ -616,6 +715,13 @@ function decideTool(scene) {
   if (raw === 'manim' || raw === 'text') {
     return { tool: raw, reason: `用户指定：${raw}` };
   }
+  const videoPrompt = normalizeAiPrompt(scene && scene.video && scene.video.prompt);
+  if (raw === 'aivideo' || videoPrompt) {
+    return {
+      tool: 'aivideo',
+      reason: videoPrompt ? '分镜里给了 video.prompt，直接按它生成画面' : '用户指定：aivideo',
+    };
+  }
   const hint = String((scene && scene.visual_hint) || '').trim();
   if (hint) return { tool: 'manim', reason: '用户写了「画什么」，按画面描述生成 manim' };
   const text = `${(scene && scene.text) || ''} ${(scene && scene.narration) || ''}`.toLowerCase();
@@ -631,6 +737,54 @@ function clampSceneSeconds(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return 8;
   return Math.min(10, Math.max(3, Math.round(n * 10) / 10));
+}
+
+/**
+ * AI 画面 prompt 的规范化：压成一行、去引号、守住 120 字符。
+ *
+ * 为什么必须在这里截：生成模型对 prompt 长度敏感（长了会丢风格/镜头词），
+ * 而模型又很爱写 200 字符的长句。截断比整场降级好 —— 至少画面还是对的。
+ */
+function normalizeAiPrompt(value) {
+  let text = String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
+  text = text.replace(/^["'`]+|["'`]+$/g, '').trim();
+  if (!text) return '';
+  if (/[\u4e00-\u9fff]/.test(text)) {
+    // 不拒收（画得出来总比文字卡好），但明确记一笔：英文 prompt 效果稳定得多
+    log(`ai 画面 prompt 含中文，效果可能不稳：${text.slice(0, 40)}…`);
+  }
+  return text.slice(0, 120);
+}
+
+/** 这一场手里有没有 AI 画面素材（和 sceneEngines 用同一个判据）。 */
+function isAiVideoScene(scene) {
+  return Boolean(scene && scene.video && typeof scene.video.prompt === 'string' && scene.video.prompt.trim());
+}
+
+/**
+ * 成本护栏：一集最多 maxAiVideo 条 aivideo。
+ *
+ * 返回 { allowed:Set<场次下标>, degraded:[场次下标], total, max }。
+ * 为什么按"场次顺序"分配名额，而不是按"这次渲到第几条"：
+ *   同一集反复渲染时要稳定。缓存里已有的那几条继续复用，超出的永远是同样几场降级，
+ *   不会这次降第 5 场、下次降第 3 场，成片风格跟着跳。
+ */
+function planAiVideoQuota(scenes, max) {
+  const limit = Math.max(0, Math.floor(Number(max) || 0));
+  const allowed = new Set();
+  const degraded = [];
+  let used = 0;
+  const list = Array.isArray(scenes) ? scenes : [];
+  for (let i = 0; i < list.length; i++) {
+    if (!isAiVideoScene(list[i])) continue;
+    if (used < limit) {
+      allowed.add(i);
+      used += 1;
+    } else {
+      degraded.push(i);
+    }
+  }
+  return { allowed, degraded, total: used + degraded.length, max: limit };
 }
 
 /**
@@ -687,7 +841,9 @@ async function fillScenes(inputScenes, opts = {}) {
   const warnings = [];
   let manimCount = 0;
   let textCount = 0;
+  let aiVideoCount = 0;
   let fallbackCount = 0;
+  const aiLimit = Math.max(0, Number(CFG.maxAiVideo) || 0);
 
   for (let i = 0; i < inputScenes.length; i++) {
     const src = inputScenes[i] || {};
@@ -700,6 +856,7 @@ async function fillScenes(inputScenes, opts = {}) {
       tool: String(src.tool || '').trim().toLowerCase(),
       kind: 'text',
       manim: null,
+      video: null,
       status: 'text',
       note: '',
     };
@@ -709,6 +866,43 @@ async function fillScenes(inputScenes, opts = {}) {
     if (decided.tool === 'text') {
       textCount += 1;
       base.status = 'text';
+      scenes.push(base);
+      continue;
+    }
+
+    // ---- AI 画面：不要 manim 脚本，只要一条英文 prompt ----
+    if (decided.tool === 'aivideo') {
+      if (aiVideoCount >= aiLimit) {
+        base.status = 'fallback';
+        base.note = `本集 aivideo 已到上限（${aiLimit} 场），这一场出文字卡`;
+        warnings.push(`第 ${i + 1} 场：${base.note}`);
+        fallbackCount += 1;
+        textCount += 1;
+        scenes.push(base);
+        continue;
+      }
+      // 用户已经写了 video.prompt 就直接用；只写了中文「画什么」才让模型翻英文
+      let aiPrompt = normalizeAiPrompt(src.video && src.video.prompt);
+      let aiSize = (src.video && src.video.size) || '1280*720';
+      if (!aiPrompt) {
+        const r = await askJson(buildVisualPrompt(base, 'aivideo', style), { ...opts, sessionId: 'studio-aivideo' });
+        const got = r.ok && r.json && r.json.video && typeof r.json.video === 'object' ? r.json.video : null;
+        aiPrompt = normalizeAiPrompt(got && got.prompt);
+        if (got && got.size) aiSize = got.size;
+        if (!aiPrompt) {
+          base.status = 'fallback';
+          base.note = r.ok ? '模型没给出 video.prompt，这一场出文字卡' : `画面描述生成失败（${r.error}），这一场出文字卡`;
+          warnings.push(`第 ${i + 1} 场：${base.note}`);
+          fallbackCount += 1;
+          textCount += 1;
+          scenes.push(base);
+          continue;
+        }
+      }
+      base.kind = 'aivideo';
+      base.video = { prompt: aiPrompt, size: /^\d{2,5}\*\d{2,5}$/.test(String(aiSize)) ? String(aiSize) : '1280*720' };
+      base.status = 'aivideo';
+      aiVideoCount += 1;
       scenes.push(base);
       continue;
     }
@@ -757,11 +951,11 @@ async function fillScenes(inputScenes, opts = {}) {
   }
 
   const ratio = scenes.length ? Math.round((manimCount / scenes.length) * 100) : 0;
-  log(`分镜补全：${scenes.length} 场，manim ${manimCount} 场（${ratio}%），文字卡 ${textCount} 场，降级 ${fallbackCount} 场`);
+  log(`分镜补全：${scenes.length} 场，manim ${manimCount} 场（${ratio}%），aivideo ${aiVideoCount} 场，文字卡 ${textCount} 场，降级 ${fallbackCount} 场`);
   return {
     ok: true,
     scenes,
-    stats: { total: scenes.length, manim: manimCount, text: textCount, fallback: fallbackCount, manimRatio: ratio },
+    stats: { total: scenes.length, manim: manimCount, aivideo: aiVideoCount, text: textCount, fallback: fallbackCount, manimRatio: ratio },
     warnings,
   };
 }
@@ -775,23 +969,29 @@ function estimateRender(scenes) {
   const list = Array.isArray(scenes) ? scenes : [];
   let manim = 0;
   let text = 0;
+  let aivideo = 0;
   let chars = 0;
   let sum = 0;
   for (const s of list) {
     // 还没补代码的分镜（写稿刚拆完）也要按 tool 预估：否则会报"0 场 manim"，
     // 用户看到的渲染时间会小得离谱。
+    const isAi = Boolean(s && (s.kind === 'aivideo' || s.tool === 'aivideo' || (s.video && s.video.prompt)));
     const isManim = Boolean(s && (s.kind === 'manim' || (s.manim && s.manim.code) || s.tool === 'manim'));
-    if (isManim) manim += 1; else text += 1;
+    if (isAi) aivideo += 1;
+    else if (isManim) manim += 1;
+    else text += 1;
     chars += String((s && s.narration) || '').length;
     sum += Number((s && s.seconds) || 0);
   }
   const videoSeconds = Math.max(0, sum - CFG.fade * Math.max(0, list.length - 1));
-  const renderSeconds = Math.round(manim * 20 + text * 3 + chars * 0.22);
+  // aivideo 一条要等 ~100 秒（实测），比 manim 慢得多，预估里必须体现，否则用户以为秒出
+  const renderSeconds = Math.round(manim * 20 + text * 3 + aivideo * 110 + chars * 0.22);
   const credits = Math.round(chars * 0.185 * 10) / 10;
   return {
     scenes: list.length,
     manim,
     text,
+    aivideo,
     seconds: Number(videoSeconds.toFixed(1)),
     renderSeconds,
     renderMinutes: Math.round((renderSeconds / 60) * 10) / 10,
@@ -1198,7 +1398,7 @@ function styleCfg(style) {
  *     manim 分支不跑、rich 分支（要求 kind==='rich' || manimFailed）也不跑 →
  *     场景里的 draw.shapes 就**被吞掉了**，最后出的是文字卡（坐标轴没了）。
  * 现在改成按"手里到底有什么素材"排序，kind 只当作附加线索：
- *   manim 脚本 > matplotlib 代码 > draw 图元 > html > 文字卡
+ *   manim 脚本 > AI 生成画面 > matplotlib 代码 > draw 图元 > html > 文字卡
  * 有 draw 就一定会排在链条里，前一个引擎失败就轮到它。
  */
 /**
@@ -1208,6 +1408,7 @@ function styleCfg(style) {
 function engineLabel(eng) {
   if (eng === 'manim') return 'manim';
   if (eng === 'text') return '文字卡';
+  if (eng === 'aivideo') return 'AI 画面';
   if (eng === 'plot') return '图表';
   if (eng === 'draw') return '图形';
   if (eng === 'html') return '讲解画面';
@@ -1217,17 +1418,67 @@ function engineLabel(eng) {
 function sceneEngines(s) {
   const sc = s || {};
   const hasManim = Boolean(sc.manim && typeof sc.manim.code === 'string' && sc.manim.code.trim());
+  // AI 生成画面的判据和 project.js 的 normalizeScene 一致：有 video.prompt 才算
+  const hasVideo = Boolean(sc.video && typeof sc.video.prompt === 'string' && sc.video.prompt.trim());
   const hasPython = Boolean(sc.python && String(sc.python).trim());
   const hasDraw = Boolean(sc.draw && Array.isArray(sc.draw.shapes) && sc.draw.shapes.length);
   const hasHtml = Boolean(sc.html && String(sc.html).trim());
   const out = [];
   if (hasManim) out.push('manim');
+  if (hasVideo) out.push('aivideo');
   if (hasPython) out.push('plot');
   if (hasDraw) out.push('draw');
   if (hasHtml) out.push('html');
   out.push('text');
   return out;
 }
+
+/**
+ * 把 AI 生成的片段对到本项目的规格（宽高/fps/时长）。
+ *
+ * wan 只出 5 或 10 秒，而这一场可能是 3 秒（截断）也可能被旁白拉长到 12 秒（补足）。
+ * 直接复用 manim 那条 normalizeClip：缩放补边 + 克隆末帧补足 + -t 截断，
+ * 已经是目标规格且时长够就只复制，不多花一次编码。
+ * Manim 模块缺失时（比如只装了 ffmpeg 的精简部署）退回到本地 ffmpeg 命令，别让 aivideo 白生成。
+ */
+async function fitAiVideoClip({ inFile, work, index, seconds, w, h, fps }) {
+  const out = path.join(work, `wan-${index}-norm.mp4`);
+  if (Manim && typeof Manim.normalizeClip === 'function') {
+    const norm = await Manim.normalizeClip({ ffmpeg: CFG.ffmpeg, inFile, outFile: out, w, h, fps, seconds });
+    return norm && norm.ok
+      ? { ok: true, file: norm.file, reencoded: Boolean(norm.reencoded) }
+      : { ok: false, error: `WAN_NORMALIZE_FAILED: ${(norm && norm.error || '').slice(0, 200)}` };
+  }
+  const vf = [
+    `scale=${w}:${h}:force_original_aspect_ratio=decrease:flags=lanczos`,
+    `pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=black`,
+    'setsar=1',
+    `fps=${fps}`,
+    'tpad=stop_mode=clone:stop_duration=2',
+    'format=yuv420p',
+  ].join(',');
+  const r = await R.run(CFG.ffmpeg, [
+    '-hide_banner', '-loglevel', 'error', '-y', '-i', inFile,
+    '-vf', vf, '-t', String(Number(seconds) || 5),
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', out,
+  ], 180000);
+  if (r.code !== 0 || !fs.existsSync(out)) {
+    return { ok: false, error: `WAN_NORMALIZE_FAILED: ${String(r.err || r.out || '').slice(-200)}` };
+  }
+  return { ok: true, file: out, reencoded: true };
+}
+
+/** AI 视频密钥：只从 secrets 读，返回 { key, source }；source 只用于日志（不含密钥）。 */
+function wanKeyInfo() {
+  if (!Wan) return { key: '', source: '' };
+  return Wan.resolveKey({
+    envKey: process.env.WAN_API_KEY || '',
+    keyPath: CFG.wanKeyPath,
+    keyFiles: [path.join(DIR, '..', 'secrets', 'qwen.key')],
+    jsonFiles: [CFG.wanKeyJson],
+  });
+}
+
 
 /**
  * 跑一个引擎，返回 { ok, file, error, applied }。失败只返回错误，不抛。
@@ -1257,6 +1508,36 @@ async function renderSceneEngine({ eng, s, index, style, work }) {
       ` 风格=${styled.style.id} 换色=${styled.applied.colors} 背景=${styled.applied.background} 线宽=${styled.applied.stroke} 字体=${styled.applied.font}` +
       `${mm.partialFreed ? ` 清缓存 ${Math.round(mm.partialFreed / 1048576)}MB` : ''}`);
     return { ok: true, file: mm.file, applied: styled.applied };
+  }
+  if (eng === 'aivideo') {
+    if (!Wan) return { ok: false, error: 'WAN_MODULE_MISSING' };
+    const keyInfo = wanKeyInfo();
+    if (!keyInfo.key) {
+      return {
+        ok: false,
+        error: 'WAN_KEY_MISSING: 没有密钥（配 config.wanKeyPath 指向 secrets\\wan.key，或放 secrets\\qwen.key）',
+      };
+    }
+    // 密钥来源只打路径，密钥本身永远不进日志
+    log(`scene#${index} ai 画面生成中（prompt=${String(s.video.prompt).slice(0, 60)}… 密钥来自 ${path.basename(keyInfo.source)}）`);
+    const clip = await Wan.generateClip({
+      key: keyInfo.key,
+      prompt: s.video.prompt,
+      seconds: s.seconds,
+      size: s.video.size,
+      work, index,
+      timeoutMs: CFG.wanTimeoutMs,
+      ffmpeg: CFG.ffmpeg,
+    });
+    if (!clip.ok) {
+      return { ok: false, error: clip.error, taskId: clip.taskId, ms: clip.ms };
+    }
+    // 5/10 秒的产物对到本场秒数：短的克隆末帧补足、长的截断，规格统一到项目宽高
+    const norm = await fitAiVideoClip({ inFile: clip.file, work, index, seconds: s.seconds, w, h, fps });
+    if (!norm.ok) return { ok: false, error: norm.error };
+    log(`scene#${index} ai 画面完成 ${clip.ms}ms（task=${clip.taskId} ${clip.width}x${clip.height} ${clip.duration}s ${Math.round(clip.bytes / 1024)}KB）` +
+      `${norm.reencoded ? ' → 已对齐项目规格' : ''}`);
+    return { ok: true, file: norm.file, taskId: clip.taskId, ms: clip.ms };
   }
   if (eng === 'plot') {
     if (!Pyplot || !fs.existsSync(CFG.python)) return { ok: false, error: 'PYPLOT_UNAVAILABLE' };
@@ -1518,6 +1799,15 @@ async function renderProject(project, opts = {}, scope = 'auto') {
       }
     }
 
+    // ---- 2.5) AI 画面配额：一集最多 maxAiVideo 条 ----
+    // 每条要等 ~100 秒、还占网关额度。超出的场次在这里就定死降级，
+    // 渲染循环里直接跳过 aivideo 引擎 —— 而不是"渲到一半才发现超预算"。
+    const aiQuota = planAiVideoQuota(finalPlan.scenes, CFG.maxAiVideo);
+    if (aiQuota.total > aiQuota.allowed.size) {
+      log(`成本护栏：本集 aivideo ${aiQuota.total} 场，上限 ${aiQuota.max} 场；`
+        + `第 ${aiQuota.degraded.map((i) => i + 1).join('、')} 场降级为文字卡（省额度/时间）`);
+    }
+
     // ---- 3) 画面片段：能复用就复用 ----
     const clips = [];
     const durations = [];
@@ -1540,7 +1830,12 @@ async function renderProject(project, opts = {}, scope = 'auto') {
       } else {
         // 按"手里有什么素材"排引擎链（sceneEngines），逐个试，谁先成用谁。
         // 有 draw 就一定会被轮到 —— 不会再出现"有 draw 却被 manim 分支吞掉"。
-        const chain = sceneEngines(s);
+        let chain = sceneEngines(s);
+        // 成本护栏之外的场次不许再调生成接口：直接把它从链条里摘掉，
+        // 后面的 manim/plot/draw/html 照常有机会，最后落到文字卡。
+        if (chain.includes('aivideo') && !aiQuota.allowed.has(i)) {
+          chain = chain.filter((e) => e !== 'aivideo');
+        }
         const firstEng = chain[0] || 'text';
         progressUpdate(project.id, {
           phase: 'scenes', current: i, done: i, total: totalScenes,
@@ -1934,7 +2229,7 @@ const server = http.createServer(async (req, res) => {
         title,
         scenes: r.scenes.map((s) => ({
           text: s.text, narration: s.narration, seconds: s.seconds,
-          kind: s.kind, manim: s.manim || null,
+          kind: s.kind, manim: s.manim || null, video: s.video || null,
         })),
         style: body.style || '',
         voice: body.voice || '',
@@ -1973,6 +2268,72 @@ const server = http.createServer(async (req, res) => {
         textEdgeFade: CFG.textEdgeFade,
         maxScenes: CFG.maxScenes,
         maxTotalSeconds: CFG.maxTotalSeconds,
+        // AI 画面：模块在不在、密钥有没有（只说"有没有"，绝不回显密钥）、一集上限
+        wan: Boolean(Wan),
+        wanKey: Boolean(wanKeyInfo().key),
+        maxAiVideo: Math.max(0, Number(CFG.maxAiVideo) || 0),
+      });
+    }
+
+    // ------------------------------------------- 独立生成一段 AI 视频 ---
+    // 插件 gen_video 走这里：给一句画面描述，等 ~100 秒，拿回一个 mp4。
+    // 不走分镜、不建项目，就是"给我一段画面"。
+    // 密钥由 studio 从 secrets 读（插件运行在 DSH 进程里，不碰 key、也不该知道在哪）。
+    if (req.method === 'POST' && p === '/v1/aivideo') {
+      const body = JSON.parse(await readBody(req) || '{}');
+      const prompt = normalizeAiPrompt(body.prompt);
+      if (!prompt) return json(res, 400, { ok: false, error: 'PROMPT_REQUIRED' });
+      if (!Wan) return json(res, 503, { ok: false, error: 'WAN_MODULE_MISSING' });
+      const keyInfo = wanKeyInfo();
+      if (!keyInfo.key) {
+        return json(res, 503, {
+          ok: false, error: 'WAN_KEY_MISSING',
+          hint: '把 key 放到 config.wanKeyPath 指的文件（默认 secrets\\wan.key），或沿用 secrets\\qwen.key / video\\secrets.json',
+        });
+      }
+      const id = crypto.randomUUID().slice(0, 8);
+      const aiDir = path.join(CFG.outDir, 'aivideo');
+      const work = path.join(aiDir, `w-${id}`);
+      fs.mkdirSync(aiDir, { recursive: true });
+      log(`/v1/aivideo 开始：prompt=${prompt.slice(0, 60)}…（密钥来自 ${path.basename(keyInfo.source)}）`);
+      const clip = await Wan.generateClip({
+        key: keyInfo.key,
+        prompt,
+        seconds: body.seconds,
+        size: body.size,
+        work,
+        index: id,
+        timeoutMs: CFG.wanTimeoutMs,
+        ffmpeg: CFG.ffmpeg,
+      });
+      if (!clip.ok) {
+        try { fs.rmSync(work, { recursive: true, force: true }); } catch { }
+        log(`/v1/aivideo 失败：${String(clip.error).slice(0, 240)}`);
+        return json(res, 502, { ok: false, error: clip.error, taskId: clip.taskId || '', ms: clip.ms || 0 });
+      }
+      const outFile = path.join(aiDir, `ai-${id}.mp4`);
+      try {
+        fs.copyFileSync(clip.file, outFile);
+      } catch (err) {
+        log(`/v1/aivideo 落盘失败：${err && err.message || err}`);
+        return json(res, 500, { ok: false, error: `COPY_FAILED: ${err && err.message || err}` });
+      }
+      try { fs.rmSync(work, { recursive: true, force: true }); } catch { }
+      let bytes = clip.bytes;
+      try { bytes = fs.statSync(outFile).size; } catch { }
+      log(`/v1/aivideo ok ${Math.round(bytes / 1024)}KB ${clip.ms}ms task=${clip.taskId}（${clip.width}x${clip.height} ${clip.duration}s）`);
+      return json(res, 200, {
+        ok: true,
+        path: outFile,
+        file: outFile,
+        taskId: clip.taskId,
+        ms: clip.ms,
+        bytes,
+        seconds: clip.duration,
+        width: clip.width,
+        height: clip.height,
+        prompt,
+        size: clip.size,
       });
     }
 
@@ -2062,7 +2423,9 @@ module.exports = {
   planWithNarration, wavDurationMs, parseWav, measureAudioMs, padWavToSeconds, guardAudioTail,
   normalizePlan, renderPlan, renderProject, start, server, CFG, P, S,
   sceneEngines, resolveStyleFor, styleCfg,
-  buildSkeletonPrompt, buildVisualPrompt, buildScriptSplitPrompt,
+  buildSkeletonPrompt, buildVisualPrompt, buildScriptSplitPrompt, buildAiVideoPrompt,
+  // AI 画面（wan3.0-video）：配额是纯函数，单测直接调；wanKeyInfo 只回来源不回密钥
+  planAiVideoQuota, isAiVideoScene, normalizeAiPrompt, wanKeyInfo, fitAiVideoClip,
   // 三种创作入口 / 人设绑定（测试脚本直接调，不必起服务）
   splitScript, fillScenes, decideTool, estimateRender, saveDraftProject,
   resolveBinding, fetchPersona, fetchVoiceBinding, tonePromptLines,

@@ -1,13 +1,14 @@
 # studio — 视频创作模块
 
-DSH 想做一个视频时用它。**模型不生成任何像素**：它只写"分镜 JSON + manim 脚本"，
-画面由 Manim 渲染，文字卡由 ffmpeg 渲染。
+DSH 想做一个视频时用它。**模型不生成任何像素**：它只写"分镜 JSON + manim 脚本 + 英文画面描述"，
+精确动画由 Manim 渲染，文字卡由 ffmpeg 渲染，人物/场景类画面交给 AI 视频生成（wan3.0-video）。
 
-## 现在的画面只有两条路
+## 画面有三条路
 
 | 场次类型 | 谁出像素 | 用在哪 |
 | --- | --- | --- |
-| `manim` | Manim（数学动画） | **默认，≥80% 场次** |
+| `manim` | Manim（数学动画） | **默认**：公式、坐标、曲线、精确动画、推导 |
+| `aivideo` | wan3.0-video（AI 生成，约 100 秒/条） | 人物、场景、动作、氛围（故事 / 拟人化演示），**一集最多 `maxAiVideo`（默认 4）条** |
 | `text` | ffmpeg（渐变底 + 一行大字） | 开场 / 转场 / 结论，一集 1~2 场 |
 
 `plot`（matplotlib）、`draw`（GDI+ 图元）、`html`（无头浏览器）的**渲染分支还在**，
@@ -16,9 +17,9 @@ DSH 想做一个视频时用它。**模型不生成任何像素**：它只写"�
 ## 一集是怎么出来的
 
 ```text
-分镜骨架（manim/text）           POST /v1/plan 或 /v1/create
-  ↓ 逐场生成 manim 脚本（一次只问一场）
-Manim 渲染（-qm，1080p30） →
+分镜骨架（manim/aivideo/text）    POST /v1/plan 或 /v1/create
+  ↓ manim 场逐场生成脚本（一次只问一场）；aivideo 场生成一条英文 prompt
+Manim 渲染（-qm，1080p30） / wan 生成 5~10 秒片段（串行，~100 秒/条）
   ↓ 规格统一（缩放/补帧/截断）+ 风格注入（配色/背景/线宽/字体）
 单场 mp4
   ↓ xfade 0.4 秒串联 + 旁白（speak）+ BGM
@@ -37,10 +38,18 @@ Manim 渲染（-qm，1080p30） →
   "scenes": [
     {"kind": "manim", "text": "这一场标题", "narration": "旁白", "seconds": 8,
      "manim": {"scene": "DerivativeFormula", "code": "from manim import *\nclass DerivativeFormula(Scene):\n    def construct(self):\n        ..."}},
-    {"kind": "text", "text": "一句短话", "narration": "旁白", "seconds": 3}
+    {"kind": "text", "text": "一句短话", "narration": "旁白", "seconds": 3},
+    {"kind": "aivideo", "text": "雪原飞行", "narration": "旁白", "seconds": 5,
+     "video": {"prompt": "anime style, cel shading, wide shot, a girl flying over a snowy plain", "size": "1280*720"}}
   ]
 }
 ```
+
+- `video.prompt` 的要求：**英文**、一句、**≤120 字符**，说清主体 + 动作 + 风格 + 镜头；
+  公式/坐标轴/标题文字**不要**写进去（那些用 manim）。`size` 默认 `1280*720`。
+- `aivideo` 的成本护栏：一集最多 `maxAiVideo` 条（config，默认 4 = 20 秒）。
+  超出的场次在渲染时**降级成文字卡并记日志**（`成本护栏：本集 aivideo N 场，上限 4 场；第 5 场降级…`）。
+  这样模型一口气写 8 场也不会把额度烧光。
 
 - `style` 可省，省了按人设决定（见下）。项目里写死就按写死的渲。
 - `manim.code` 的硬约束（提示词里也这么要求）：
@@ -50,7 +59,7 @@ Manim 渲染（-qm，1080p30） →
   - **坐标轴不要 `include_numbers=True`**（刻度数字是 DecimalNumber，逐帧排 TeX，慢且易失败）
   - 不要自己设背景色：渲染器按风格注入 `self.camera.background_color`
 - `kind` 只是偏好。**真正的引擎按"手里有什么素材"决定**：
-  `manim 脚本 > matplotlib 代码 > draw 图元 > html > 文字卡`，前一个失败自动退到下一个。
+  `manim 脚本 > AI 生成画面 > matplotlib 代码 > draw 图元 > html > 文字卡`，前一个失败自动退到下一个。
   所以"有 draw 却被 manim 分支吞掉"这种事不会发生了（`sceneEngines()`）。
 
 ## 风格预设（studio/styles/*.json）
@@ -113,10 +122,24 @@ POST /v1/create  {prompt,seconds,voice,bgm,style} → 一步到底（内部走�
 POST /v1/project {title,scenes,style}  → 建项目
 POST /v1/project/patch   {id,patches}  → 只发改动
 POST /v1/project/render  {id,scope,style} → 出片（style 会写回项目）
+POST /v1/aivideo {prompt,seconds,size} → 独立生成一条 AI 片段（插件 gen_video 用它）
+                                      → {ok, path, taskId, ms, bytes, seconds, width, height}
 ```
 
 `/v1/create` 现在和 `/v1/plan` 走同一套两段式提示词（以前是另一套 rich/draw 提示词，
 两条路迟早会走偏，所以删了）。
+
+### AI 视频（wan3.0-video）的配置与密钥
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `wanKeyPath` | `<root>\secrets\wan.key` | 密钥文件；也接受 `secrets\qwen.key`、`video\secrets.json` 的 `apiKey`、`WAN_API_KEY` 环境变量 |
+| `wanTimeoutMs` | `480000` | 一条的总超时（提交 + 轮询 + 下载） |
+| `maxAiVideo` | `4` | 一集最多几条（每条 5 秒、约 100 秒生成时间） |
+
+**密钥不进代码、不进日志**：日志里只出现 `密钥来自 wan.key` 这种来源文件名。
+接口只用百炼原生路径（`/api/v1/services/aigc/video-generation/video-synthesis` +
+`/api/v1/tasks/{id}`），`/compatible-mode/v1/videos` 之类一律 `url error`，别再试。
 
 ## 三层缓存
 

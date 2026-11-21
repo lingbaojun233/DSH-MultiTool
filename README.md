@@ -24,7 +24,7 @@ start http://127.0.0.1:8766/
 然后做两件事就完整可用了：
 
 1. 把模型 Key 写进 `C:\Apps\DSH-MultiTool\core\home\.env` → `DEEPSEEK_API_KEY=sk-...`
-2. 用邀请码注册账号。邀请码在 `C:\Apps\DSH-MultiTool\secrets\register-code.txt`（安装结尾也会打印）
+2. 用邀请码注册账号。邀请码在 `C:\Apps\DSH-MultiTool\secrets\invite-code.txt`（安装结尾也会打印）
 
 装到别处、换端口：
 
@@ -90,7 +90,7 @@ DEEPSEEK_API_KEY=sk-...
 ### 邀请码（谁能注册）
 
 ```text
-<安装目录>\secrets\register-code.txt
+<安装目录>\secrets\invite-code.txt
 ```
 
 想换邀请码：改这个文件，然后重启 Separator 任务（面板左侧「注册」页立刻生效）。
@@ -198,7 +198,7 @@ C:\Apps\DSH-MultiTool\
 ├─ listen\                语音识别（8771）
 ├─ studio\                视频创作引擎（8772）
 ├─ sticker\               表情包（8773）
-├─ secrets\               internal-token / breezeblue.key / register-code
+├─ secrets\               internal-token / breezeblue.key / invite-code / panel-cert.pass
 ├─ data\                  记忆库、面板历史、渲染产物（部署不覆盖）
 ├─ logs\                  每个服务一个日志
 └─ tools\                 可选外部工具：ffmpeg / python311 / piper
@@ -278,5 +278,7 @@ cd C:\Apps\DSH-MultiTool\core\home\profiles\headless
 ### 安全
 
 - 凭据不进仓库：`core\home\.env`、`secrets\`、`video\secrets.json` 都在 `.gitignore` 里。
+- 面板的 PFX 口令与 Separator 的邀请码只从 `secrets\` 下的文件读取（`panel-cert.pass` / `invite-code.txt`），`start-server.cmd` 里不再硬编码。
+- **2026-11-21 轮换提醒**：早期提交里 `panel\start-server.cmd`、`separator\start-server.cmd` 曾硬编码生产环境的 PFX 口令与邀请码。如果你 clone 过这些旧版本，请重新拉取，并在自己的部署里轮换这两个凭据（生产侧已轮换、旧邀请码已失效）。
 - SSH 只允许公钥登录。
 - 面板注册默认需要邀请码（`invite` 模式）。

@@ -538,26 +538,35 @@ if (-not (Test-Path -LiteralPath (Join-Path $SecretsDir 'README.md'))) {
         'internal-token.txt  shared secret between plugins and the io module (generated)',
         'breezeblue.key      BreezeBlue speech API key - fill in to enable text-to-speech',
         'qwen.key            Qwen API key - needed by the video module',
-        'register-code.txt   invite code for the web panel register form (generated)'
+        'invite-code.txt     invite code for the web panel register form (generated)',
+        'panel-cert.pass     PFX passphrase for data\panel-cert.pfx (only when HTTPS is on)'
     ) | Set-Content -LiteralPath (Join-Path $SecretsDir 'README.md') -Encoding ASCII
 }
 
-$codeFile = Join-Path $SecretsDir 'register-code.txt'
+$codeFile = Join-Path $SecretsDir 'invite-code.txt'
 if (-not (Test-Path -LiteralPath $codeFile) -or $Force) {
     # Re-installing over an existing install must not silently change the code
-    # users already have. A brand-new install gets a fresh random one instead of
-    # inheriting the value shipped in separator\start-server.cmd.
+    # users already have: adopt the legacy register-code.txt, then any value an
+    # older installer injected into separator\start-server.cmd. A brand-new
+    # install gets a fresh random one. The code never goes into a repo file:
+    # separator\start-server.cmd only reads it from this secrets file.
     $adopted = ''
+    $legacyFile = Join-Path $SecretsDir 'register-code.txt'
+    if ($rootExisted -and -not $Force -and (Test-Path -LiteralPath $legacyFile)) {
+        $rawLegacy = Get-Content -LiteralPath $legacyFile -Raw
+        if ($null -ne $rawLegacy) { $adopted = ([string]$rawLegacy).Trim() }
+    }
     $sepCmd = Join-Path $Root 'separator\start-server.cmd'
-    if ($rootExisted -and -not $Force -and (Test-Path -LiteralPath $sepCmd)) {
-        $m = [regex]::Match((Get-Content -Raw -LiteralPath $sepCmd), 'DSH_REGISTER_CODE=([A-Za-z0-9]+)')
+    if (-not $adopted -and $rootExisted -and -not $Force -and (Test-Path -LiteralPath $sepCmd)) {
+        $m = [regex]::Match((Get-Content -Raw -LiteralPath $sepCmd), 'DSH_REGISTER_CODE=([A-Za-z0-9]{6,})')
         if ($m.Success) { $adopted = $m.Groups[1].Value }
     }
-    $code = if ($adopted) { $adopted } else { New-RandomToken 8 }
+    $code = if ($adopted) { $adopted } else { New-RandomToken 10 }
     Set-Content -LiteralPath $codeFile -Value $code -Encoding ASCII -NoNewline
-    Write-Ok ('register-code.txt ' + $(if ($adopted) { 'adopted existing: ' } else { 'generated: ' }) + $code)
+    Write-Ok ('invite-code.txt ' + $(if ($adopted) { 'adopted existing: ' } else { 'generated: ' }) + $code)
 }
-$InviteCode = (Get-Content -LiteralPath $codeFile -Raw).Trim()
+$rawInvite = Get-Content -LiteralPath $codeFile -Raw
+$InviteCode = if ($null -eq $rawInvite) { '' } else { ([string]$rawInvite).Trim() }
 
 # Model credentials. The DSH core reads DSH_HOME\.env, so this is the one file a
 # new user must edit before chatting works.
@@ -695,7 +704,6 @@ Set-ManagedEnv 'separator' @{
     DSH_SEPARATOR_PORT = $Ports.separator
     DSH_MEMORY_URL     = (Url $Ports.memory)
     DSH_REGISTER_MODE  = 'invite'
-    DSH_REGISTER_CODE  = $InviteCode
 }
 
 $panelVars = @{ DSH_PANEL_PORT = $Ports.panel }
@@ -704,7 +712,8 @@ foreach ($k in $commonUrls.Keys) { $panelVars[$k] = $commonUrls[$k] }
 # second install on the same machine would inherit the shipped 8443 and die with
 # EADDRINUSE while the first install still holds it.
 $panelCert = Join-Path $Root 'data\panel-cert.pfx'
-if (-not (Test-Path -LiteralPath $panelCert)) { $panelVars['DSH_PANEL_TLS_PORT'] = '0' }
+$panelPassFile = Join-Path $SecretsDir 'panel-cert.pass'
+if ((-not (Test-Path -LiteralPath $panelCert)) -or (-not (Test-Path -LiteralPath $panelPassFile))) { $panelVars['DSH_PANEL_TLS_PORT'] = '0' }
 Set-ManagedEnv 'panel' $panelVars
 
 $portLine = 'ports applied: io=' + $Ports.io + ' panel=' + $Ports.panel + ' memory=' + $Ports.memory + ' separator=' + $Ports.separator + ' video=' + $Ports.video + ' speak=' + $Ports.speak + ' listen=' + $Ports.listen + ' studio=' + $Ports.studio + ' sticker=' + $Ports.sticker

@@ -1562,7 +1562,18 @@ function setStudioBusy(on) {
 /** 分镜 → 交给 studio 的场景数组。tool=text 时把旧代码丢掉，别让文字卡带着动画。 */
 function studioPlanFromScenes() {
   const scenes = studioScenes.map((s) => {
-    const useManim = s.tool !== 'text' && s.manim && s.manim.code;
+    const useManim = s.tool !== 'text' && s.tool !== 'aivideo' && s.manim && s.manim.code;
+  if (s.tool === 'aivideo') {
+    // AI 生成场：把用户写的「画什么」当生成提示词；没写就用标题兜底
+    return {
+      kind: 'aivideo',
+      text: String(s.text || ''),
+      narration: String(s.narration || ''),
+      seconds: Number(s.seconds) || 5,
+      tool: 'aivideo',
+      video: { prompt: String(s.visual_hint || s.text || '').slice(0, 400), size: '1280*720' },
+    };
+  }
     return {
       text: String(s.text || '').trim(),
       narration: String(s.narration || '').trim(),
@@ -1658,7 +1669,8 @@ function studioToolSelect(value) {
   select.dataset.field = 'tool';
   const options = [
     ['', '自动'],
-    ['manim', 'manim'],
+    ['manim', 'manim（公式/图表）'],
+    ['aivideo', 'AI 生成视频（人物/场景）'],
     ['text', '文字卡'],
   ];
   for (const [val, label] of options) {

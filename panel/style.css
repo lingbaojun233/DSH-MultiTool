@@ -646,3 +646,21 @@ body.studio-busy { cursor: progress; }
 .sticker-star.on { color: #ffd25a; opacity: 1; }
 .bubble-media { padding: 4px; background: transparent !important; border: none !important; }
 .bubble-sticker { width: 140px; height: 140px; object-fit: contain; border-radius: 8px; display: block; }
+
+/* --------------------------------------------------- 下拉框宽度修复 ---- */
+/* 视频创作的「风格」「音色」下拉原来跟秒数输入框共用 .field.small（90px），
+   选项文字被截断成「大肥鱼（迷…」。这里让含 select 的字段自己撑开。 */
+.field:has(select) { flex: 1 1 240px; min-width: 240px; }
+.field select { width: 100%; min-width: 0; text-overflow: ellipsis; }
+/* 秒数这类窄输入仍然保持紧凑，但别低于 90px */
+.field.small { flex: 0 0 96px; min-width: 96px; }
+
+/* --------------------------------------- 下拉框宽度修复（第二版，覆盖特异性）----
+   上一版 .field:has(select) 特异性 0,1,1 输给了 .field.small 的 0,2,0，
+   所以「风格/音色」下拉实际还是 96px。这里用 .field.small:has(select)（0,2,1）压过它。
+   规则：带下拉的字段按内容撑开（最小 220px），带输入框的仍是 96px。 */
+.field.small:has(select) { flex: 0 1 auto; min-width: 220px; }
+.field.small:has(input) { flex: 0 0 96px; min-width: 96px; }
+/* 不支持 :has() 的浏览器兜底：直接按 class 给宽度（studio 的风格/音色下拉都带这两个类） */
+.field.small select.studio-style, .field.small select.studio-voice { min-width: 200px; }
+.field.small:has(select.studio-style), .field.small:has(select.studio-voice) { min-width: 220px; }
