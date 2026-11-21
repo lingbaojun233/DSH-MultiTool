@@ -4,15 +4,16 @@
   "height": 1080,
   "fps": 30,
   "fade": 0.4,
-  "maxScenes": 8,
+  "maxScenes": 80,
   "minSceneSeconds": 2,
-  "maxTotalSeconds": 60,
+  "maxTotalSeconds": 900,
   "ffmpeg": "C:\\Apps\\DSH-MultiTool\\tools\\ffmpeg\\bin\\ffmpeg.exe",
   "font": "C:\\Windows\\Fonts\\msyh.ttc",
   "ioUrl": "http://127.0.0.1:8765",
   "speakUrl": "http://127.0.0.1:8770",
   "outDir": "C:\\Apps\\DSH-MultiTool\\data\\studio",
   "bgmDir": "C:\\Apps\\DSH-MultiTool\\data\\studio\\bgm",
+  "projectDir": "C:\\Apps\\DSH-MultiTool\\data\\studio\\projects",
   "planTimeoutMs": 180000,
   "renderTimeoutMs": 600000
 }

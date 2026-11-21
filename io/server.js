@@ -129,8 +129,11 @@ const server = http.createServer(async (req, res) => {
     const sessionId = String(body.sessionId || 'adhoc');
     const type = String(body.type || '');
     if (!type) return json(res, 400, { ok: false, error: 'TYPE_REQUIRED' });
+    // 两种形状都收：{type, payload:{...}} 是契约，扁平 {type, path, text} 也常见。
+    // 宿主宽容一点，插件就不用为了适配某个宿主写特例。
+    const { sessionId: _ignored, type: _t, payload, ...flat } = body;
     const queue = actionQueue.get(sessionId) || [];
-    queue.push({ type, ...(body.payload || {}) });
+    queue.push({ type, ...flat, ...(payload || {}) });
     actionQueue.set(sessionId, queue.slice(-20));
     log(`action ${type} session=${sessionId}`);
     return json(res, 200, { ok: true, queued: queue.length });

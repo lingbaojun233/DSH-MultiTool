@@ -1,0 +1,230 @@
+'use strict';
+/**
+ * project.js -- 视频"项目"的存储与分段缓存。
+ *
+ * 为什么要有这一层：
+ *   长科普视频动辄 50+ 场。以前每次改一个字都要把整片重渲一遍（几十秒到几分钟），
+ *   而其中 99% 的画面根本没变。这里的做法是：每个场景单独渲成一个小片段并缓存，
+ *   缓存键由"决定这张画面的所有参数"算出来 —— 参数没变就复用，变了才重渲。
+ *
+ * 同样的道理用在旁白上：旁白按 (文本, 音色) 缓存。只改台词时，画面一个字节都不用重画，
+ * 只需要重合成那几句 + 重新混音（秒级）。
+ *
+ * 目录结构：
+ *   projects/<id>/project.json     项目定义（分镜 + 缓存索引）
+ *   projects/<id>/cache/clip-*.mp4 单场片段（缓存）
+ *   projects/<id>/cache/tts-*.wav  单场旁白（缓存）
+ *   projects/<id>/out/<renderId>.mp4  成片
+ */
+const fs = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
+
+function sha1(text) {
+  return crypto.createHash('sha1').update(String(text)).digest('hex').slice(0, 16);
+}
+
+function readJson(file, fallback) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
+}
+
+function writeJson(file, obj) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  // 先写临时文件再改名：进程被杀时不会留下半截 JSON，把整个项目读坏
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 1), 'utf8');
+  fs.renameSync(tmp, file);
+}
+
+function projectDir(root, id) {
+  return path.join(root, id);
+}
+
+function projectFile(root, id) {
+  return path.join(projectDir(root, id), 'project.json');
+}
+
+function cacheDir(root, id) {
+  return path.join(projectDir(root, id), 'cache');
+}
+
+function outDir(root, id) {
+  return path.join(projectDir(root, id), 'out');
+}
+
+function newId() {
+  return 'p-' + crypto.randomUUID().slice(0, 8);
+}
+
+/**
+ * 画面缓存键：只要这组参数不变，渲出来的片段就一定一样。
+ * 特意不含 narration —— 改台词不该让画面重画（这正是"只重做声音"能省时间的原因）。
+ */
+function sceneKey(scene, cfg) {
+  const payload = {
+    text: String(scene.text || ''),
+    seconds: Number(scene.seconds) || 0,
+    textSize: scene.textSize || null,
+    textColor: scene.textColor || null,
+    bg: scene.bg || null,
+    image: scene.image || null,
+    motion: scene.motion || null,
+    w: cfg.width, h: cfg.height, fps: cfg.fps,
+  };
+  return sha1(JSON.stringify(payload));
+}
+
+/** 旁白缓存键：文本 + 音色。换台词只影响这一场的音频。 */
+function audioKey(text, voice) {
+  return sha1(JSON.stringify({ text: String(text || ''), voice: String(voice || '') }));
+}
+
+function createProject(root, input = {}) {
+  const id = newId();
+  const now = new Date().toISOString();
+  const project = {
+    id,
+    title: String(input.title || '未命名项目').slice(0, 80),
+    width: Number(input.width) || 1920,
+    height: Number(input.height) || 1080,
+    fps: Number(input.fps) || 30,
+    fade: input.fade == null ? 0.4 : Number(input.fade),
+    voice: String(input.voice || ''),
+    bgm: String(input.bgm || ''),
+    scenes: [],
+    cache: {},       // sceneKey -> { clip, at }
+    audioCache: {},  // audioKey -> { wav, ms, at }
+    renders: [],     // [{ renderId, file, bytes, seconds, at, scope }]
+    createdAt: now,
+    updatedAt: now,
+  };
+  saveProject(root, project);
+  return project;
+}
+
+function loadProject(root, id) {
+  return readJson(projectFile(root, id), null);
+}
+
+function saveProject(root, project) {
+  project.updatedAt = new Date().toISOString();
+  writeJson(projectFile(root, project.id), project);
+  return project;
+}
+
+function listProjects(root) {
+  try {
+    return fs.readdirSync(root)
+      .filter((name) => fs.existsSync(path.join(root, name, 'project.json')))
+      .map((name) => {
+        const p = loadProject(root, name);
+        if (!p) return null;
+        const last = (p.renders || [])[p.renders.length - 1] || null;
+        return {
+          id: p.id,
+          title: p.title,
+          scenes: (p.scenes || []).length,
+          updatedAt: p.updatedAt,
+          lastRender: last ? { renderId: last.renderId, seconds: last.seconds, at: last.at } : null,
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 应用增量修改。AI 只发"第几场改哪个字段"，不用重发整个分镜 ——
+ * 一场 60 字的分镜，改一个字只花十几 token，而不是整份 JSON。
+ */
+function applyPatches(project, patches) {
+  const touched = [];
+  for (const p of Array.isArray(patches) ? patches : []) {
+    if (!p || typeof p !== 'object') continue;
+    if (p.op === 'insert') {
+      const at = Math.max(0, Math.min(project.scenes.length, Number(p.index)));
+      const scene = normalizeScene(p.scene || {});
+      project.scenes.splice(at, 0, scene);
+      touched.push(at);
+      continue;
+    }
+    const index = Number(p.index);
+    if (!Number.isInteger(index) || index < 0 || index >= project.scenes.length) continue;
+    if (p.op === 'delete') {
+      project.scenes.splice(index, 1);
+      touched.push(index);
+      continue;
+    }
+    // 默认 op = patch：只覆盖给出的字段
+    const merged = Object.assign({}, project.scenes[index], p.patch || {});
+    project.scenes[index] = normalizeScene(merged);
+    touched.push(index);
+  }
+  return touched;
+}
+
+function normalizeScene(raw) {
+  const hex = (v, fallback) => (/^#[0-9a-f]{6}$/i.test(String(v || '')) ? String(v) : fallback);
+  const bg = raw.bg || {};
+  const seconds = Math.min(12, Math.max(1, Number(raw.seconds) || 3));
+  return {
+    text: String(raw.text || '').slice(0, 60),
+    narration: String(raw.narration || '').slice(0, 200),
+    seconds: Number(seconds.toFixed(2)),
+    bg: { c0: hex(bg.c0, '#101a33'), c1: hex(bg.c1, '#3a2a5a') },
+    image: raw.image ? String(raw.image).slice(0, 200) : null,
+    motion: raw.motion || null,
+    textSize: Number(raw.textSize) || null,
+    textColor: raw.textColor || null,
+  };
+}
+
+/** 哪些场的缓存还能用（供渲染前预估"这次要重渲几场"）。 */
+function planReuse(project, cfg, force = false) {
+  const reuse = [];
+  const rebuild = [];
+  for (let i = 0; i < project.scenes.length; i++) {
+    const key = sceneKey(project.scenes[i], cfg);
+    const hit = project.cache[key];
+    const exists = hit && fs.existsSync(hit.clip);
+    if (!force && exists) reuse.push({ index: i, key, clip: hit.clip });
+    else rebuild.push({ index: i, key });
+  }
+  return { reuse, rebuild };
+}
+
+function gcCache(project, keepKeys) {
+  // 只保留当前分镜还在用的片段，避免项目目录无限增长。
+  // 注意：这里只删文件、不动 project.cache 之外的任何东西 —— 缓存丢了顶多重渲，不能丢项目数据。
+  const keep = new Set(keepKeys);
+  const kept = {};
+  for (const [key, val] of Object.entries(project.cache || {})) {
+    if (keep.has(key)) kept[key] = val;
+    else { try { fs.unlinkSync(val.clip); } catch { } }
+  }
+  project.cache = kept;
+  return kept;
+}
+
+module.exports = {
+  sha1,
+  newId,
+  projectDir,
+  projectFile,
+  cacheDir,
+  outDir,
+  createProject,
+  loadProject,
+  saveProject,
+  listProjects,
+  applyPatches,
+  normalizeScene,
+  sceneKey,
+  audioKey,
+  planReuse,
+  gcCache,
+  readJson,
+  writeJson,
+};

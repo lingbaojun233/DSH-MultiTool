@@ -15,6 +15,7 @@ const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 const R = require('./lib/render.js');
+const P = require('./lib/project.js');
 
 const DIR = __dirname;
 const HOST = '127.0.0.1';
@@ -29,18 +30,24 @@ const CFG = Object.assign({
   height: 1080,
   fps: 30,
   fade: 0.4,
-  maxScenes: 8,
+  // 长片（科普/讲解）动辄几十场、好几分钟。旧默认 8 场/60 秒是短视频口径，
+  // 现在放开到 80 场/15 分钟 —— 真正的瓶颈是渲染时间，不是这些上限。
+  maxScenes: 80,
   minSceneSeconds: 2,
-  maxTotalSeconds: 60,
+  maxTotalSeconds: 900,
   ffmpeg: 'C:\\Apps\\DSH-MultiTool\\tools\\ffmpeg\\bin\\ffmpeg.exe',
   font: 'C:\\Windows\\Fonts\\msyh.ttc',
   ioUrl: 'http://127.0.0.1:8765',
   speakUrl: 'http://127.0.0.1:8770',
   outDir: 'C:\\Apps\\DSH-MultiTool\\data\\studio',
   bgmDir: 'C:\\Apps\\DSH-MultiTool\\data\\studio\\bgm',
+  // 项目（含分段缓存）放在 outDir 下的 projects\，和成片并列
+  projectDir: 'C:\\Apps\\DSH-MultiTool\\data\\studio\\projects',
   planTimeoutMs: 180000,
   renderTimeoutMs: 600000,
 }, readJson(path.join(DIR, 'config.json'), {}));
+
+if (!CFG.projectDir) CFG.projectDir = path.join(CFG.outDir, 'projects');
 
 // 图片素材目录：分镜里 image 只是文件名时，render.js 要去某个目录下找图。
 // 必须放在 CFG 合并之后补默认值 —— 默认值依赖 CFG.outDir，而 config.json 可能改了 outDir。
@@ -409,102 +416,229 @@ function pickBgm(nameOrPath) {
   return null;
 }
 
+
+/**
+ * 一次性渲染（旧接口 /v1/render 与 /v1/create 走这里）。
+ * 内部生成一个临时项目、scope='all' 全量渲染 —— 和项目模式共用同一套渲染代码，
+ * 避免"两条路径行为不一致"这种最难查的 bug。
+ */
 async function renderPlan(plan, opts = {}) {
-  const jobId = crypto.randomUUID();
-  const work = path.join(os.tmpdir(), `studio-${jobId.slice(0, 8)}`);
-  fs.mkdirSync(work, { recursive: true });
-  fs.mkdirSync(CFG.outDir, { recursive: true });
-  const started = Date.now();
-
-  // ---- 第一遍：先把旁白全部合成出来，并量出每句的真实时长 ----
-  // 为什么必须先做：场景时长要由旁白决定。先渲画面再配旁白，旁白就只能"往既定长度里塞"，
-  // 长了压到下一场、短了留白 —— 这正是改造前的毛病。
-  const speechFiles = new Array(plan.scenes.length).fill(null);
-  const narrationMs = new Array(plan.scenes.length).fill(0);
-  for (let i = 0; i < plan.scenes.length; i++) {
-    const line = plan.scenes[i].narration;
-    if (!line) continue;                        // 这场没旁白：时长听原计划
-    const wav = path.join(work, `tts-${i}.wav`);
-    const got = await fetchSpeech(line, opts.voice, wav);
-    if (!got) { log(`scene#${i} 旁白合成失败，该场按原计划时长渲染`); continue; }
-    speechFiles[i] = got;
-    // 量不出来只记 0：最多少 0.6 秒余量，不至于整片失败
-    narrationMs[i] = await measureAudioMs(got);
-  }
-
-  // ---- 第二遍：按旁白重算时长，然后才动手渲画面 ----
-  const finalPlan = planWithNarration(plan, narrationMs);
-  const scenes = finalPlan.scenes;
-
-  const stills = [];
-  const clips = [];
-  const durations = scenes.map((s) => s.seconds);
-
-  for (let i = 0; i < scenes.length; i++) {
-    const s = scenes[i];
-    const still = await R.sceneStill({
-      ffmpeg: CFG.ffmpeg, work, index: i, scene: s,
-      w: CFG.width, h: CFG.height, font: CFG.font,
-      // imageDir/image/motion 是给 lib/render.js 新能力留的口子：
-      // 多传的参数对方的函数签名没接住就自然忽略，不依赖对方先改完
-      imageDir: CFG.imageDir,
-      image: s.image || undefined,
-      motion: s.motion || undefined,
-    });
-    if (!still.ok) return { ok: false, error: `SCENE_STILL_FAILED#${i}: ${(still.error || '').slice(0, 300)}` };
-    stills.push(still.png);
-
-    const clip = await R.sceneClip({
-      ffmpeg: CFG.ffmpeg, work, index: i, stillPng: still.png,
-      seconds: s.seconds, w: CFG.width, h: CFG.height, fps: CFG.fps,
-      image: s.image || undefined,
-      motion: s.motion || undefined,
-    });
-    if (!clip.ok) return { ok: false, error: `SCENE_CLIP_FAILED#${i}: ${(clip.error || '').slice(0, 300)}` };
-    clips.push(clip.file);
-  }
-
-  const joined = path.join(work, 'joined.mp4');
-  const cat = await R.concatClips({ ffmpeg: CFG.ffmpeg, clips, durations, out: joined, fade: CFG.fade });
-  if (!cat.ok) return { ok: false, error: `CONCAT_FAILED: ${(cat.error || '').slice(0, 300)}` };
-
-  // 旁白插入点：按"累计起点 - 每次转场的 fade"算（xfade 是重叠转场，进下一场时时间轴已经提前了）
-  // wav 在第一遍就合成好了，这里只排位置，不重复请求 speak
-  const narrations = [];
-  let at = 0;
-  for (let i = 0; i < scenes.length; i++) {
-    if (speechFiles[i]) narrations.push({ file: speechFiles[i], at: Math.max(0, at), ms: narrationMs[i] });
-    at += scenes[i].seconds - CFG.fade;
-  }
-
-  // 音轨铺到片尾：否则 mixAudio 的 -shortest 会把成片剪到"最后一句念完"（末场直接消失）。
-  // 补的是 work 里的临时 wav，不碰用户素材；ms 只是给 guardAudioTail 用的，mixAudio 不读它。
-  const tailGuarded = guardAudioTail(narrations, finalPlan.totalSeconds);
-  if (tailGuarded) log(`音轨补静音到 ${finalPlan.totalSeconds}s，避免成片被 -shortest 剪短`);
-
-  const bgm = pickBgm(opts.bgm);
-  const outFile = path.join(CFG.outDir, `${jobId}.mp4`);
-  const mixed = await R.mixAudio({
-    ffmpeg: CFG.ffmpeg, videoIn: joined, narrations, bgm,
-    totalSeconds: finalPlan.totalSeconds, out: outFile,
+  const norm = normalizePlan(plan);
+  const project = P.createProject(CFG.projectDir, {
+    title: norm.title || '一次性渲染',
+    width: CFG.width, height: CFG.height, fps: CFG.fps, fade: CFG.fade,
+    voice: opts.voice || '', bgm: opts.bgm || '',
   });
-  if (!mixed.ok) return { ok: false, error: `AUDIO_FAILED: ${(mixed.error || '').slice(0, 300)}` };
+  project.scenes = norm.scenes.map((s) => P.normalizeScene(s));
+  P.saveProject(CFG.projectDir, project);
 
-  try { fs.rmSync(work, { recursive: true, force: true }); } catch { }
-  const stat = fs.statSync(outFile);
+  const r = await renderProject(project, opts, 'all');
+  if (!r.ok) return r;
   return {
     ok: true,
-    file: outFile,
-    jobId,
-    bytes: stat.size,
-    seconds: finalPlan.totalSeconds,
-    // 把重算后的分镜也返回：每场带 actualSeconds / narrationMs，面板能解释"这为什么变长"
-    plan: finalPlan,
-    narrationCount: narrations.length,
-    overBudget: finalPlan.overBudget,
-    bgm: bgm ? path.basename(bgm) : null,
-    ms: Date.now() - started,
+    file: r.file,
+    jobId: r.renderId,
+    bytes: r.bytes,
+    seconds: r.seconds,
+    plan: r.plan,
+    narrationCount: r.narrationCount,
+    overBudget: r.overBudget,
+    ms: r.ms,
   };
+}
+
+// ------------------------------------------------------- 项目渲染（增量） --
+
+/**
+ * 拿一段旁白：命中缓存直接返回，否则合成并写进缓存。
+ * 缓存键是 (文本, 音色)，所以"只改台词"时只有改到的那几场需要重新合成。
+ */
+async function getSpeechCached(project, scene, voice, cdir) {
+  const text = String(scene.narration || '');
+  if (!text) return null;
+  const key = P.audioKey(text, voice);
+  const hit = project.audioCache[key];
+  if (hit && fs.existsSync(hit.wav)) return { wav: hit.wav, ms: hit.ms, key, cached: true };
+
+  const wav = path.join(cdir, `tts-${key}.wav`);
+  const got = await fetchSpeech(text, voice, wav);
+  if (!got) return null;
+  const ms = await measureAudioMs(got);
+  project.audioCache[key] = { wav, ms, at: new Date().toISOString() };
+  return { wav: got, ms, key, cached: false };
+}
+
+/**
+ * 把旁白塞进已定的画面长度里（audio-only 重做时用）。
+ * 画面不能动，所以：短了就留白（mix 时 apad 处理），长了就用 atempo 加速到装得下。
+ * 加速上限 1.25 倍 —— 再快人声就不自然了，宁可让它略超一点。
+ */
+async function fitNarration(wav, ms, maxSeconds, work, index) {
+  const limit = Math.max(0.5, maxSeconds - 0.25) * 1000;
+  if (!ms || ms <= limit) return { wav, ms };
+  const tempo = Math.min(1.25, ms / limit);
+  if (tempo <= 1.01) return { wav, ms };
+  const out = path.join(work, `fit-${index}.wav`);
+  const r = await R.run(CFG.ffmpeg, [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-i', wav, '-filter:a', `atempo=${tempo.toFixed(3)}`, out,
+  ], 120000);
+  if (r.code !== 0 || !fs.existsSync(out)) {
+    log(`scene#${index} 旁白压缩失败，保持原速（可能轻微超出该场）`);
+    return { wav, ms };
+  }
+  const newMs = Math.round(ms / tempo);
+  log(`scene#${index} 旁白 ${Math.round(ms)}ms -> ${newMs}ms（atempo=${tempo.toFixed(2)}）以塞进 ${maxSeconds}s`);
+  return { wav: out, ms: newMs };
+}
+
+/**
+ * 渲染一个项目。
+ *   scope='auto'  内容优先：旁白决定每场时长，只有受影响的场需要重画（默认）
+ *   scope='all'   全部重画（换了分辨率/字体/需要绝对一致时用）
+ *   scope='audio' 画面优先：所有片段必须已存在，只重做旁白与混音 —— 秒级完成
+ *
+ * 返回里带 reuse/rendered 两个计数，调用方一眼能看出"这次省了多少"。
+ */
+async function renderProject(project, opts = {}, scope = 'auto') {
+  const started = Date.now();
+  const voice = opts.voice || project.voice || '';
+  const cdir = P.cacheDir(CFG.projectDir, project.id);
+  const odir = P.outDir(CFG.projectDir, project.id);
+  fs.mkdirSync(cdir, { recursive: true });
+  fs.mkdirSync(odir, { recursive: true });
+
+  const work = path.join(os.tmpdir(), `studio-${crypto.randomUUID().slice(0, 8)}`);
+  fs.mkdirSync(work, { recursive: true });
+
+  try {
+    if (!project.scenes.length) return { ok: false, error: 'NO_SCENES' };
+
+    // ---- 1) 旁白 ----
+    const speeches = [];
+    const narrationMs = project.scenes.map(() => 0);
+    for (let i = 0; i < project.scenes.length; i++) {
+      const s = project.scenes[i];
+      if (!s.narration) { speeches.push(null); continue; }
+      const got = await getSpeechCached(project, s, voice, cdir);
+      speeches.push(got);
+      narrationMs[i] = got ? got.ms : 0;
+    }
+
+    // ---- 2) 时长 ----
+    let finalPlan;
+    if (scope === 'audio') {
+      // 画面优先：沿用分镜里已有的 seconds，不让旁白改节奏
+      const total = project.scenes.reduce((a, s) => a + s.seconds, 0) - CFG.fade * (project.scenes.length - 1);
+      finalPlan = { scenes: project.scenes.map((s) => Object.assign({}, s, { actualSeconds: s.seconds })), totalSeconds: Number(Math.max(0.5, total).toFixed(2)) };
+    } else {
+      finalPlan = planWithNarration({ scenes: project.scenes }, narrationMs);
+      // 把重算后的时长写回项目：下次 audio-only 才有据可依
+      for (let i = 0; i < project.scenes.length; i++) {
+        project.scenes[i].seconds = finalPlan.scenes[i].seconds;
+        project.scenes[i].actualSeconds = finalPlan.scenes[i].actualSeconds;
+        project.scenes[i].narrationMs = finalPlan.scenes[i].narrationMs;
+      }
+    }
+
+    // ---- 3) 画面片段：能复用就复用 ----
+    const clips = [];
+    const durations = [];
+    let reused = 0;
+    let rendered = 0;
+    for (let i = 0; i < finalPlan.scenes.length; i++) {
+      const s = finalPlan.scenes[i];
+      const key = P.sceneKey(s, CFG);
+      const hit = project.cache[key];
+      const hasClip = hit && fs.existsSync(hit.clip);
+      const canReuse = scope !== 'all' && hasClip;
+      if (canReuse) {
+        clips.push(hit.clip);
+        reused += 1;
+      } else {
+        const still = await R.sceneStill({
+          ffmpeg: CFG.ffmpeg, work, index: i, scene: s,
+          w: CFG.width, h: CFG.height, font: CFG.font,
+          imageDir: CFG.imageDir, image: s.image || undefined, motion: s.motion || undefined,
+        });
+        if (!still.ok) return { ok: false, error: `SCENE_STILL_FAILED#${i}: ${(still.error || '').slice(0, 300)}` };
+        const clip = await R.sceneClip({
+          ffmpeg: CFG.ffmpeg, work, index: i, stillPng: still.png,
+          seconds: s.seconds, w: CFG.width, h: CFG.height, fps: CFG.fps,
+          image: s.image || undefined, motion: s.motion || undefined,
+        });
+        if (!clip.ok) return { ok: false, error: `SCENE_CLIP_FAILED#${i}: ${(clip.error || '').slice(0, 300)}` };
+        const dest = path.join(cdir, `clip-${key}.mp4`);
+        fs.copyFileSync(clip.file, dest);
+        project.cache[key] = { clip: dest, at: new Date().toISOString() };
+        clips.push(dest);
+        rendered += 1;
+      }
+      durations.push(s.seconds);
+    }
+
+    // ---- 4) 拼接（可缓存：画面没变就不用重拼）----
+    // 只换声音时最值钱的一步：拼接要跑一次全片编码，几十秒的片子就是 1~3 秒白花。
+    const joinedKey = P.sha1(JSON.stringify({ clips: clips.map((c) => path.basename(c)), durations, fade: CFG.fade, w: CFG.width, h: CFG.height, fps: CFG.fps }));
+    let joined = null;
+    if (project.joined && project.joined.key === joinedKey && fs.existsSync(project.joined.file) && scope !== 'all') {
+      joined = project.joined.file;
+      log(`复用拼接结果 ${path.basename(joined)}`);
+    } else {
+      joined = path.join(cdir, `joined-${joinedKey}.mp4`);
+      const cat = await R.concatClips({ ffmpeg: CFG.ffmpeg, clips, durations, out: joined, fade: CFG.fade });
+      if (!cat.ok) return { ok: false, error: `CONCAT_FAILED: ${(cat.error || '').slice(0, 300)}` };
+      project.joined = { key: joinedKey, file: joined, at: new Date().toISOString() };
+    }
+
+    // ---- 5) 旁白排位 ----
+    const narrations = [];
+    let at = 0;
+    for (let i = 0; i < finalPlan.scenes.length; i++) {
+      const sp = speeches[i];
+      if (sp) {
+        let wav = sp.wav;
+        let ms = sp.ms;
+        if (scope === 'audio') {
+          // 只重做声音时，画面长度是既定的，旁白要自己塞进去
+          const fitted = await fitNarration(wav, ms, finalPlan.scenes[i].seconds, work, i);
+          wav = fitted.wav; ms = fitted.ms;
+        }
+        narrations.push({ file: wav, at: Math.max(0, at), ms });
+      }
+      at += finalPlan.scenes[i].seconds - CFG.fade;
+    }
+    guardAudioTail(narrations, finalPlan.totalSeconds);
+
+    // 成片落在 outDir 根下（面板按 jobId 直接取 /api/studio/video?id=），
+    // 项目目录里只留缓存与记录，避免两处路径含义不一致。
+    const renderId = crypto.randomUUID();
+    const outFile = path.join(CFG.outDir, `${renderId}.mp4`);
+    const mixed = await R.mixAudio({
+      ffmpeg: CFG.ffmpeg, videoIn: joined, narrations,
+      bgm: pickBgm(opts.bgm || project.bgm), totalSeconds: finalPlan.totalSeconds, out: outFile,
+    });
+    if (!mixed.ok) return { ok: false, error: `AUDIO_FAILED: ${(mixed.error || '').slice(0, 300)}` };
+
+    const stat = fs.statSync(outFile);
+    const record = {
+      renderId, file: outFile, bytes: stat.size,
+      seconds: finalPlan.totalSeconds, at: new Date().toISOString(),
+      scope, reused, rendered, ms: Date.now() - started,
+    };
+    project.renders = (project.renders || []).concat([record]).slice(-10);
+    P.saveProject(CFG.projectDir, project);
+    log(`project ${project.id} render scope=${scope} reused=${reused} rendered=${rendered} ${Math.round(stat.size / 1024)}KB ${Date.now() - started}ms`);
+
+    return {
+      ok: true, ...record,
+      plan: finalPlan,
+      narrationCount: narrations.length,
+      overBudget: finalPlan.overBudget || false,
+    };
+  } finally {
+    try { fs.rmSync(work, { recursive: true, force: true }); } catch { }
+  }
 }
 
 // ------------------------------------------------------------------ routes --
@@ -513,6 +647,73 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1');
   const p = url.pathname;
   try {
+    // ---------------------------------------------------- 项目（长片） ---
+    // 项目 = 分镜 + 分段缓存。AI 每次只发改动（patch），不用重发整份分镜；
+    // 渲染时能复用的片段直接复用，所以"改一场"只花一场的时间。
+    if (req.method === 'POST' && p === '/v1/project') {
+      const body = JSON.parse(await readBody(req) || '{}');
+      const project = P.createProject(CFG.projectDir, {
+        title: body.title || '未命名项目',
+        width: Number(body.width) || CFG.width,
+        height: Number(body.height) || CFG.height,
+        fps: Number(body.fps) || CFG.fps,
+        fade: body.fade == null ? CFG.fade : Number(body.fade),
+        voice: body.voice || '',
+        bgm: body.bgm || '',
+      });
+      if (Array.isArray(body.scenes) && body.scenes.length) {
+        project.scenes = body.scenes.slice(0, CFG.maxScenes).map((s) => P.normalizeScene(s));
+        P.saveProject(CFG.projectDir, project);
+      }
+      log(`project created ${project.id} scenes=${project.scenes.length}`);
+      return json(res, 200, { ok: true, project });
+    }
+
+    if (req.method === 'GET' && p === '/v1/project/list') {
+      return json(res, 200, { ok: true, projects: P.listProjects(CFG.projectDir) });
+    }
+
+    if (req.method === 'GET' && p === '/v1/project') {
+      const id = String(url.searchParams.get('id') || '');
+      const project = P.loadProject(CFG.projectDir, id);
+      if (!project) return json(res, 404, { ok: false, error: 'NOT_FOUND' });
+      return json(res, 200, { ok: true, project });
+    }
+
+    // 增量修改：patches 里每项 {op:'patch'|'insert'|'delete', index, patch|scene}
+    if (req.method === 'POST' && p === '/v1/project/patch') {
+      const body = JSON.parse(await readBody(req) || '{}');
+      const project = P.loadProject(CFG.projectDir, String(body.id || ''));
+      if (!project) return json(res, 404, { ok: false, error: 'NOT_FOUND' });
+      const touched = P.applyPatches(project, body.patches || body.patch || []);
+      if (project.scenes.length > CFG.maxScenes) project.scenes = project.scenes.slice(0, CFG.maxScenes);
+      P.saveProject(CFG.projectDir, project);
+      // 告诉调用方"这次会重渲几场"，让 AI 能解释为什么快/慢
+      const preview = P.planReuse(project, CFG);
+      log(`project ${project.id} patched touched=${touched.length} rebuild=${preview.rebuild.length}`);
+      return json(res, 200, {
+        ok: true,
+        touched,
+        scenes: project.scenes.length,
+        willRebuild: preview.rebuild.map((b) => b.index),
+        willReuse: preview.reuse.map((r) => r.index),
+      });
+    }
+
+    if (req.method === 'POST' && p === '/v1/project/render') {
+      const body = JSON.parse(await readBody(req) || '{}');
+      const project = P.loadProject(CFG.projectDir, String(body.id || ''));
+      if (!project) return json(res, 404, { ok: false, error: 'NOT_FOUND' });
+      const scope = ['auto', 'all', 'audio'].includes(body.scope) ? body.scope : 'auto';
+      if (scope === 'audio' && project.scenes.some((s) => !project.cache[P.sceneKey(s, CFG)])) {
+        // 还有场次没渲过，没法只做声音 —— 明确报错，别偷偷改成全量
+        return json(res, 409, { ok: false, error: 'CLIPS_MISSING', hint: '先 scope=auto 渲一次画面，再单独重做声音' });
+      }
+      const result = await renderProject(project, { voice: body.voice || project.voice, bgm: body.bgm || project.bgm }, scope);
+      return json(res, 200, result);
+    }
+
+    // ---------------------------------------------------- 一次性渲染 ---
     if (req.method === 'GET' && p === '/v1/health') {
       return json(res, 200, {
         ok: true,
@@ -597,5 +798,5 @@ if (require.main === module) start();
 // 只导出纯逻辑与被复用的实现，供本地验证脚本直接调用
 module.exports = {
   planWithNarration, wavDurationMs, parseWav, measureAudioMs, padWavToSeconds, guardAudioTail,
-  normalizePlan, renderPlan, start, server, CFG,
+  normalizePlan, renderPlan, renderProject, start, server, CFG, P,
 };
