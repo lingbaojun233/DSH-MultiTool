@@ -22,6 +22,12 @@ const DB_FILE = process.env.DSH_SEPARATOR_DB || path.join(DATA_DIR, 'separator.d
 const HOST = process.env.DSH_SEPARATOR_HOST || '127.0.0.1';
 const PORT = Number(process.env.DSH_SEPARATOR_PORT || 8768);
 const SESSION_DAYS = 30;
+// 注册策略。面板一旦对公网开放，"谁都能注册"就等于"谁都能花你的模型钱"。
+//   open   = 任何人可注册（只适合内网/自己用）
+//   invite = 必须填对邀请码
+//   closed = 只有管理员能建号（走 /v1/admin/*）
+const REGISTER_MODE = String(process.env.DSH_REGISTER_MODE || 'open').toLowerCase();
+const REGISTER_CODE = String(process.env.DSH_REGISTER_CODE || '');
 const SCRYPT = { N: 16384, r: 8, p: 1, keylen: 32 };
 
 function openDb() {
@@ -145,6 +151,15 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'POST' && url.pathname === '/v1/auth/register') {
       const body = JSON.parse(await readBody(req) || '{}');
+      if (REGISTER_MODE === 'closed') {
+        return sendJson(res, 403, { ok: false, code: 'E_REGISTER_CLOSED', message: '本实例已关闭注册，找管理员开号' });
+      }
+      if (REGISTER_MODE === 'invite') {
+        const code = String(body.code || body.inviteCode || '');
+        if (!REGISTER_CODE || code !== REGISTER_CODE) {
+          return sendJson(res, 403, { ok: false, code: 'E_BAD_INVITE', message: '邀请码不对' });
+        }
+      }
       const username = String(body.username || '').trim().toLowerCase();
       const password = String(body.password || '');
       const displayName = String(body.displayName || body.display_name || username).trim() || username;

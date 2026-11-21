@@ -23,6 +23,8 @@ const authUsername = document.getElementById('authUsername');
 const authPassword = document.getElementById('authPassword');
 const authDisplayRow = document.getElementById('authDisplayRow');
 const authDisplayName = document.getElementById('authDisplayName');
+const authInviteRow = document.getElementById('authInviteRow');
+const authInvite = document.getElementById('authInvite');
 const authError = document.getElementById('authError');
 const authSubmit = document.getElementById('authSubmit');
 const authSwitch = document.getElementById('authSwitch');
@@ -156,6 +158,8 @@ function showAuth(mode, message) {
   authSwitch.textContent = register ? '去登录' : '注册一个';
 
   authDisplayRow.classList.toggle('hidden', !register);
+  // 邀请码只在注册时出现；服务端是 closed 模式时填了也没用，所以不做额外判断
+  if (authInviteRow) authInviteRow.classList.toggle('hidden', !register);
   authPassword.autocomplete = register ? 'new-password' : 'current-password';
   if (register) authPassword.setAttribute('minlength', '6');
   else authPassword.removeAttribute('minlength');
@@ -1640,6 +1644,7 @@ authForm.addEventListener('submit', async (event) => {
   const username = authUsername.value.trim();
   const password = authPassword.value;
   const displayName = authDisplayName.value.trim();
+  const invite = authInvite ? authInvite.value.trim() : '';
 
   if (!username || !password) {
     setAuthError('请填写用户名和密码');
@@ -1662,7 +1667,7 @@ authForm.addEventListener('submit', async (event) => {
     const res = await fetch(register ? '/api/auth/register' : '/api/auth/login', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(register ? { username, password, displayName } : { username, password }),
+      body: JSON.stringify(register ? { username, password, displayName, code: invite } : { username, password }),
       cache: 'no-store',
     });
     const data = await res.json().catch(() => ({}));

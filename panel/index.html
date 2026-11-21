@@ -228,6 +228,11 @@
         <span>显示名（可留空）</span>
         <input id="authDisplayName" name="displayName" autocomplete="nickname" maxlength="32">
       </label>
+      <!-- 邀请码：面板对公网开放时，注册需要它（服务端 DSH_REGISTER_MODE=invite） -->
+      <label id="authInviteRow" class="auth-field hidden">
+        <span>邀请码</span>
+        <input id="authInvite" name="code" autocomplete="off" spellcheck="false" placeholder="找管理员要">
+      </label>
       <div id="authError" class="auth-error hidden" role="alert"></div>
       <button id="authSubmit" class="primary" type="submit">登录</button>
       <div class="auth-switch">

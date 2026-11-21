@@ -19,6 +19,7 @@
  */
 
 const http = require('node:http');
+const https = require('node:https');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -430,14 +431,52 @@ function saveUpload(req, res, name, declaredSize) {
   req.pipe(ws);
 }
 
-const server = http.createServer(async (req, res) => {
+/**
+ * 登录/注册限速。对公网开放之后，这是必需项：
+ * 没有它，攻击者可以拿字典无限次试密码，scrypt 再慢也架不住。
+ * 按来源 IP 计数，窗口过了自动清零（内存实现，重启即清空，够用）。
+ */
+const authAttempts = new Map(); // ip -> { count, resetAt }
+const AUTH_WINDOW_MS = 10 * 60 * 1000;
+const AUTH_MAX_ATTEMPTS = 10;
+
+function clientIp(req) {
+  // 面板是最外层，直接取 socket；如果以后放在反代后面，再补 x-forwarded-for 处理
+  const raw = (req.socket && req.socket.remoteAddress) || 'unknown';
+  return raw.replace(/^::ffff:/, '');
+}
+
+function allowAuth(ip) {
+  const now = Date.now();
+  const hit = authAttempts.get(ip);
+  if (!hit || now > hit.resetAt) {
+    authAttempts.set(ip, { count: 1, resetAt: now + AUTH_WINDOW_MS });
+    return true;
+  }
+  hit.count += 1;
+  return hit.count <= AUTH_MAX_ATTEMPTS;
+}
+
+const handler = async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || HOST}`);
+
+  // 基础安全头：公网暴露时这几个是最低成本、最有效的
+  try {
+    res.setHeader('x-content-type-options', 'nosniff');
+    res.setHeader('x-frame-options', 'SAMEORIGIN');
+    res.setHeader('referrer-policy', 'no-referrer');
+  } catch { }
 
   try {
     // 用户态：注册/登录/退出/会话校验都代理到 separator，浏览器只与面板同源
     if (url.pathname === '/api/auth' || url.pathname.startsWith('/api/auth/')) {
       if (req.method !== 'GET' && req.method !== 'POST') {
         return sendJson(res, 405, { ok: false, error: 'method not allowed' });
+      }
+      // 只对"会验证密码/创建账号"的接口限速；/me 和 /logout 不限
+      const guarded = url.pathname.startsWith('/api/auth/login') || url.pathname.startsWith('/api/auth/register');
+      if (guarded && !allowAuth(clientIp(req))) {
+        return sendJson(res, 429, { ok: false, code: 'E_TOO_MANY', error: '尝试太频繁了，等十分钟再试' });
       }
       const sub = url.pathname.slice('/api/auth'.length);
       const raw = req.method === 'POST' ? await readBody(req) : null;
@@ -724,7 +763,36 @@ const server = http.createServer(async (req, res) => {
   } catch (err) {
     return sendJson(res, 500, { ok: false, error: err.message });
   }
-});
+};
+
+const server = http.createServer(handler);
+
+// ---- 可选 HTTPS ---------------------------------------------------------
+// 公网直连必须走 TLS：一是密码不能明文过网，二是浏览器只在"安全上下文"
+// （https 或 localhost）里给麦克风权限 —— 上了 https，手机上也能按着说话。
+// 用 PFX（Windows 自签证书导出格式）省掉 pem 转换。
+const TLS_PORT = Number(process.env.DSH_PANEL_TLS_PORT || 0);
+// HTTPS 默认监听所有网卡（要对公网开放）；HTTP 那个口保持 127.0.0.1，只给隧道/本机用。
+const TLS_HOST = process.env.DSH_PANEL_TLS_HOST || '0.0.0.0';
+const TLS_PFX = process.env.DSH_PANEL_PFX || path.join(DATA_DIR, 'panel-cert.pfx');
+const TLS_PASS = process.env.DSH_PANEL_PFX_PASS || '';
+
+let tlsServer = null;
+if (TLS_PORT > 0) {
+  if (fs.existsSync(TLS_PFX)) {
+    try {
+      tlsServer = https.createServer({ pfx: fs.readFileSync(TLS_PFX), passphrase: TLS_PASS }, handler);
+      tlsServer.on('tlsClientError', (err) => log(`tls client error: ${err.message}`));
+      tlsServer.listen(TLS_PORT, TLS_HOST, () => {
+        log(`listening on https://${TLS_HOST}:${TLS_PORT} (pfx=${path.basename(TLS_PFX)})`);
+      });
+    } catch (err) {
+      log(`TLS disabled, cannot load ${TLS_PFX}: ${err.message}`);
+    }
+  } else {
+    log(`TLS requested (port ${TLS_PORT}) but ${TLS_PFX} is missing`);
+  }
+}
 
 server.listen(PORT, HOST, () => {
   ensureDataDir();
@@ -734,6 +802,7 @@ server.listen(PORT, HOST, () => {
 
 function shutdown(signal) {
   log(`shutting down (${signal})`);
+  if (tlsServer) tlsServer.close();
   server.close(() => process.exit(0));
 }
 
