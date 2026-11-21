@@ -227,7 +227,7 @@ const server = http.createServer(async (req, res) => {
       const only = url.searchParams.get('user_id');
       const deletedParam = url.searchParams.get('deleted') === '1';
       let events = db.prepare(
-        'SELECT id, ts, channel, group_id, speaker_id, speaker_name, kind, content, evidence, confidence, salience, user_id, deleted FROM events WHERE deleted = ' + (deletedParam ? 1 : 0) + ' ORDER BY id DESC LIMIT ?',
+        'SELECT id, ts, channel, group_id, speaker_id, speaker_name, kind, content, evidence, confidence, salience, user_id, counterpart, deleted FROM events WHERE deleted = ' + (deletedParam ? 1 : 0) + ' ORDER BY id DESC LIMIT ?',
       ).all(limit);
       if (only) {
         const uid = Number(only);
@@ -246,7 +246,7 @@ const server = http.createServer(async (req, res) => {
       if (uid) { where.push('(user_id = ? OR user_id IS NULL)'); params.push(Number(uid)); }
       params.push(limit);
       const rows = db.prepare(
-        `SELECT id, subject, predicate, object, confidence, support, status, evidence_event_ids, first_seen, last_seen, user_id
+        `SELECT id, subject, predicate, object, confidence, support, status, evidence_event_ids, first_seen, last_seen, user_id, counterpart
            FROM facts WHERE ${where.join(' AND ')} ORDER BY id DESC LIMIT ?`,
       ).all(...params);
       return sendJson(res, 200, { ok: true, count: rows.length, facts: rows });
