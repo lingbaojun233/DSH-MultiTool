@@ -2270,12 +2270,15 @@ async function renderSceneEngine({ eng, s, index, style, work, renderQuality }) 
       }
     }
     const styled = S.applyToManimCode(manimCode, style);
-    // 动画时长对齐旁白：把 run_time / self.wait 的数字拉伸或压缩到这一场的秒数（只动数字，不动结构）
+    // 动画时长对齐旁白：把 run_time / self.wait 的数字拉伸或压缩到这一场的秒数（只动数字，不动结构）。
+    // 压缩下限由 config.animCompressFloor 控制（默认 0.85 = 最多快 15%），放不下不再强压。
     const aligned = Rhythm
-      ? Rhythm.alignManimCode(styled.code, Number(s.seconds) || 0)
+      ? Rhythm.alignManimCode(styled.code, Number(s.seconds) || 0, CFG.animCompressFloor)
       : { code: styled.code, before: 0, after: 0, action: 'off' };
     if (Rhythm && aligned.action !== 'none') {
-      log(`scene#${index} manim 时长对齐(${aligned.action}) ${aligned.before}s -> ${aligned.after}s（本场 ${s.seconds}s）`);
+      log(`scene#${index} manim 时长对齐(${aligned.action}) 自然 ${aligned.before}s -> 实际 ${aligned.after}s`
+        + `（本场 ${s.seconds}s，系数 ${Number(aligned.factor).toFixed(2)}`
+        + `${aligned.floorHit ? '，已到压缩下限 0.85，多出的部分会被截掉' : ''}）`);
     }
     // 画质档：medium=-qm@项目分辨率（默认），low=-ql@半分辨率（草稿，快约一倍），high=-qh
     const qp = Rhythm
@@ -2690,7 +2693,8 @@ async function renderProject(project, opts = {}, scope = 'auto') {
         label: `正在合成第 ${i + 1}/${sceneTotal} 句旁白`,
       });
       const raw = await getSpeechCached(project, s, voice, cdir, { retries: 2, delays: [3000, 8000] });
-      // 语速 1.08 + 裁掉句尾静音：TTS 句尾常带 200~600ms 静音，会让"说完到切画面"出现空拍。
+      // 语速 1.00（不加速）+ 裁掉两头静音：句首 200~300ms 静音会让字幕比人声早出现，
+      // 句尾 200~600ms 静音会让"说完到切画面"多出半拍。1.0 时 polishSpeech 直接跳过 atempo。
       // 这里做完，下面量到的毫秒数就是最终音频的长度（字幕对齐也用它）。
       const got = Rhythm && raw && raw.wav
         ? await Rhythm.polishSpeech(raw, {
@@ -2733,16 +2737,37 @@ async function renderProject(project, opts = {}, scope = 'auto') {
       const total = project.scenes.reduce((a, s) => a + s.seconds, 0) - CFG.fade * (project.scenes.length - 1);
       finalPlan = { scenes: project.scenes.map((s) => Object.assign({}, s, { actualSeconds: s.seconds })), totalSeconds: Number(Math.max(0.5, total).toFixed(2)) };
     } else {
+      // 动画自然时长（拉伸/压缩之前的脚本时长）先算出来：repadPlan 用它做
+      // "别把动画压成快进"的兜底（场时长 = max(旁白 + pad, 自然时长 × 压缩下限)）。
+      // estimateCodeSeconds 只数 run_time / self.wait，不执行代码，毫秒级、可缓存。
+      if (Rhythm) {
+        for (const s of project.scenes) {
+          const code = s.manim && s.manim.code ? String(s.manim.code) : '';
+          s.animNaturalSeconds = code ? Rhythm.estimateCodeSeconds(code) : 0;
+        }
+      }
       finalPlan = planWithNarration({ scenes: project.scenes }, narrationMs);
-      // 节奏对齐：场时长 = 旁白时长 + 固定小尾巴（默认 0.4s）。
+      // 节奏对齐：场时长 = max(旁白时长 + 小尾巴, 动画自然时长 × 0.85)。
       // planWithNarration 的老口径是 max(计划秒数, 旁白+0.6)：规划写 8 秒、旁白只有 3 秒时
       // 这一场会白留 5 秒空画面 —— 观众看到"话早说完了，画面还在那杵着"。
       if (Rhythm) finalPlan = Rhythm.repadPlan(finalPlan, narrationMs, CFG);
+      // 因为"动画不赶"而被拉长的场次要说清楚多留了多少秒（每场 1~2 秒是可接受的代价）
+      const grown = finalPlan.scenes.filter((s) => Number(s.animExtraSeconds) > 0.05);
+      if (grown.length) {
+        log(`动画兜底：${grown.length} 场为"动画不赶"加长（${
+          grown.map((s) => `#${finalPlan.scenes.indexOf(s) + 1} 自然${Number(s.animNaturalSeconds).toFixed(2)}s→场${s.seconds}s(+${s.animExtraSeconds}s)`).join('，')
+        }）`);
+      }
+      const clamped = finalPlan.scenes.filter((s) => s.animClamped);
+      if (clamped.length) {
+        log(`动画兜底：${clamped.length} 场动画太长被单场上限夹住（压缩比会低于 0.85，属极端情况）`);
+      }
       // 把重算后的时长写回项目：下次 audio-only 才有据可依
       for (let i = 0; i < project.scenes.length; i++) {
         project.scenes[i].seconds = finalPlan.scenes[i].seconds;
         project.scenes[i].actualSeconds = finalPlan.scenes[i].actualSeconds;
         project.scenes[i].narrationMs = finalPlan.scenes[i].narrationMs;
+        project.scenes[i].animNaturalSeconds = finalPlan.scenes[i].animNaturalSeconds;
       }
     }
 
@@ -2783,6 +2808,9 @@ async function renderProject(project, opts = {}, scope = 'auto') {
       if (frameStale) log(`scene#${i} 边框配置变了，重渲这一场（其它场照旧复用）`);
       if (canReuse) {
         clips.push(hit.clip);
+        // 复用片段时也要把"这一场动画多长"带回来：否则节奏表里动画/系数两列全是 0，
+        // 重跑一次就看不出"压缩比有没有到 0.85"（大部分真实使用都是复用）。
+        s.animSeconds = Number(hit.animSeconds) || 0;
         timeline.push({ scene: s, index: i });
         reused += 1;
         sceneResults.push({ index: i, engine: String(hit.engine || 'cache'), status: 'ok', note: '复用缓存' });
@@ -2967,6 +2995,8 @@ async function renderProject(project, opts = {}, scope = 'auto') {
         engine,
         style: style.id,
         at: new Date().toISOString(),
+        // 对齐后的动画时长（脚本自然时长 × 系数）：复用片段时节奏表靠它显示"动画/系数"
+        animSeconds: Number(s.animSeconds) || 0,
         // 表情结果也记进缓存索引：stickersSkipped=true 的片段下一轮会重渲一次，
         // 不能把"素材目录坏了"这种失败长期缓存住；overlayMs 用来估算每场多花多少秒。
         stickersApplied: stickerApplied,
@@ -3070,8 +3100,11 @@ async function renderProject(project, opts = {}, scope = 'auto') {
       })
       : null;
     if (subRes && subRes.rows && subRes.rows.length) {
-      // 节奏表：每场的 旁白/场/动画 三个数差 ≤0.5s 才算"节奏对上"
-      log(`节奏表（旁白/场/动画，秒）：${subRes.rows.map((r) => `#${r.index + 1} ${r.narration}/${r.scene}/${r.anim}`).join(' | ')}`);
+      // 节奏表：每场的 旁白/场/动画 三个数差 ≤0.5s 才算"节奏对上"；
+      // 最后两个数 自然/系数 用来看"动画有没有被压缩"（系数 <0.85 就是压得太狠）。
+      log(`节奏表（旁白/场/动画/动画自然/系数）：${subRes.rows
+        .map((r) => `#${r.index + 1} ${r.narration}/${r.scene}/${r.anim}/${r.natural}/${r.scale}`)
+        .join(' | ')}`);
     }
 
     // 成片落在 outDir 根下（面板按 jobId 直接取 /api/studio/video?id=），

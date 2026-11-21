@@ -1304,7 +1304,7 @@ async function loadMemoryView() {
  *   每 2 秒问一次 GET /api/studio/jobs/:id，卡片上更新「阶段 3/8」「已用 1 分 12 秒」。
  *   studio 还没有这套接口（回 404）时，回退老流程「拆分镜 → 补动画 → 建项目 → 渲染」，不白屏。
  *
- * 刷新不丢：GET /api/studio/jobs 恢复任务卡，GET /api/studio/library 恢复历史（重做/载入/删除）。
+ * 刷新不丢：GET /api/studio/jobs 恢复任务卡，GET /api/studio/library 恢复历史（重做/删除）。
  */
 
 const studioEls = {
@@ -1313,6 +1313,7 @@ const studioEls = {
   go: document.getElementById('studioGo'),
   hint: document.getElementById('studioHint'),
   startError: document.getElementById('studioStartError'),
+  redoNote: document.getElementById('studioRedoNote'),
   advToggle: document.getElementById('studioAdvToggle'),
   advBody: document.getElementById('studioAdvBody'),
   binding: document.getElementById('studioBinding'),
@@ -1321,6 +1322,10 @@ const studioEls = {
   scenesBox: document.getElementById('studioScenesBox'),
   sceneList: document.getElementById('sceneList'),
   sceneAdd: document.getElementById('sceneAdd'),
+  sceneRedoBar: document.getElementById('sceneRedoBar'),
+  sceneRedoFrom: document.getElementById('sceneRedoFrom'),
+  sceneRedoRun: document.getElementById('sceneRedoRun'),
+  sceneTotal: document.getElementById('sceneTotal'),
   fill: document.getElementById('studioFill'),
   sceneHint: document.getElementById('sceneHint'),
   editMeta: document.getElementById('studioEditMeta'),
@@ -1378,6 +1383,12 @@ let legacyProgressTimer = null;
 
 let studioLibrary = [];
 let studioLibBusy = false;
+// 重做模式：从任务卡/历史把分镜载入表格后进入，等用户改完再点「开始做」。
+// 来源记下来，给表格上方的「不改，直接重跑」用；recipe 是没有历史条目时的兜底配方。
+let studioRedoLibraryId = '';
+let studioRedoRecipe = null;
+let studioRedoTitle = '';
+let studioRedoChanged = false;
 // 首屏那张可选参考图：{ uploadId, name } —— 有图就挂到第一场，也放一份在请求体顶层
 let studioRefImage = null;
 
@@ -1393,6 +1404,11 @@ function studioSceneSeconds(scene) {
   const n = Number(scene && scene.seconds);
   if (!Number.isFinite(n)) return 5;
   return Math.min(SCENE_SECONDS_MAX, Math.max(SCENE_SECONDS_MIN, n));
+}
+
+/** 每场标题那行：`第 3 场 · 约 6.2 秒`（改秒数时跟着更新）。 */
+function studioSceneLabel(scene, index) {
+  return `第 ${Number(index) + 1} 场 · 约 ${studioSceneSeconds(scene).toFixed(1)} 秒`;
 }
 
 function studioSecondsTotal() {
@@ -1743,7 +1759,7 @@ function renderStudioScenes() {
     head.className = 'scene-head';
     const no = document.createElement('span');
     no.className = 'scene-no';
-    no.textContent = `第 ${index + 1} 场`;
+    no.textContent = studioSceneLabel(scene, index);
     const badge = document.createElement('span');
     badge.className = `scene-badge ${studioStatusClass(scene)}`;
     badge.textContent = studioStatusChar(scene);
@@ -1804,6 +1820,14 @@ function renderStudioScenes() {
 
 /** 分镜框那一行的标题：标题 + 场数 + 总时长。编辑时只动这行字。 */
 function updateStudioMeta() {
+  if (studioEls.sceneTotal) {
+    const count = studioScenes.length;
+    studioEls.sceneTotal.textContent = count
+      ? `共 ${count} 场 · 约 ${studioSecondsTotal().toFixed(1)} 秒`
+      : '共 0 场';
+  }
+  // 增删场后顶部的「已载入 N 场」也要跟着变
+  if (studioRedoActive()) updateStudioRedoUi();
   if (!studioEls.editMeta) return;
   const count = studioScenes.length;
   if (!count) {
@@ -1868,6 +1892,9 @@ function onStudioSceneEdit(event) {
   }
   // 用户动过表格 → 以后「开始做」优先用这份分镜
   studioScenesTouched = true;
+  const no = row.querySelector('.scene-no');
+  if (no) no.textContent = studioSceneLabel(scene, row.dataset.index);
+  markStudioRedoChanged();
   updateStudioMeta();
   updateStudioHint();
   // 状态标记跟着变（只更新这一行那个字符，不重建行）
@@ -2086,6 +2113,7 @@ function addSceneSticker(item) {
   stickers.push(Object.assign({ id }, studioStickerPlacement(scene, stickers.length)));
   scene.stickers = stickers;
   studioScenesTouched = true;
+  markStudioRedoChanged();
 
   // 只重画这一行的表情条，不重建整张表（输入框光标不跳）
   const row = studioEls.sceneList
@@ -2190,6 +2218,7 @@ async function onStudioImagePicked(event) {
       if (scene) {
         scene.image = String(data.uploadId);
         studioScenesTouched = true;
+        markStudioRedoChanged();
         const row = studioEls.sceneList ? studioEls.sceneList.querySelector(`.scene[data-index="${index}"]`) : null;
         const box = row ? row.querySelector('.scene-image') : null;
         if (box) renderSceneImageBox(box, scene, index);
@@ -2229,6 +2258,7 @@ function onStudioSceneImageClick(event) {
   if (!scene) return;
   scene.image = '';
   studioScenesTouched = true;
+  markStudioRedoChanged();
   const row = clear.closest('.scene');
   const box = row ? row.querySelector('.scene-image') : null;
   if (box) renderSceneImageBox(box, scene, index);
@@ -2250,6 +2280,7 @@ function onStudioSceneStickerClick(event) {
   if (!scene || !Array.isArray(scene.stickers) || !Number.isInteger(si)) return;
   scene.stickers.splice(si, 1);
   studioScenesTouched = true;
+  markStudioRedoChanged();
   const row = clear.closest('.scene');
   const box = row ? row.querySelector('.scene-stickers') : null;
   if (box) renderSceneStickerBox(box, scene, index);
@@ -2276,6 +2307,7 @@ function studioDeleteScene(event) {
   if (!Number.isFinite(index)) return;
   studioScenes.splice(index, 1);
   studioScenesTouched = true;
+  markStudioRedoChanged();
   renderStudioScenes();
   updateStudioMeta();
   updateStudioHint();
@@ -2297,6 +2329,7 @@ function studioAddScene() {
     dirty: true,
   });
   studioScenesTouched = true;
+  markStudioRedoChanged();
   renderStudioScenes();
   updateStudioMeta();
   updateStudioHint();
@@ -2387,6 +2420,7 @@ function adoptStudioScenes(data) {
   if (data.project && data.project.id) studioProjectId = String(data.project.id);
   renderStudioScenes();
   updateStudioMeta();
+  if (studioRedoActive()) updateStudioRedoUi();
 }
 
 /** 这些场需要重新翻译成动画：选了 manim（或自动）但还没有代码，或「画什么」被改过。 */
@@ -2435,6 +2469,11 @@ function updateStudioHint() {
   const usesScenes = studioScenes.length > 0 && (studioScenesTouched || (text && text === studioScenesFromText));
   const withRef = studioRefImage ? '（会带上参考图）' : '';
   if (usesScenes) {
+    // 重做模式：这次要跑的是载入进来的分镜，输入框里写别的不会覆盖它
+    if (studioRedoActive()) {
+      setStudioHintText(`这次按高级区的 ${studioScenes.length} 场分镜跑；输入框里写别的不影响它。`);
+      return;
+    }
     setStudioHintText(`会用高级区里的分镜（${studioScenes.length} 场）${withRef}；想重新写就把输入框改一句再点。`);
     return;
   }
@@ -2469,6 +2508,81 @@ function setStudioBusy(on) {
   const buttons = [studioEls.go, studioEls.fill, studioEls.sceneAdd];
   for (const el of buttons) if (el) el.disabled = studioBusy;
   document.body.classList.toggle('studio-busy', studioBusy);
+  updateStudioRedoUi();
+}
+
+// ---- 重做模式（两步式：先载入分镜给人改，再跑）-----------------------------
+
+function studioRedoActive() {
+  return Boolean(studioRedoLibraryId || studioRedoRecipe);
+}
+
+/**
+ * 重做模式的界面：顶部一行提示、表格上方「不改，直接重跑」、主按钮文案。
+ * 只改界面，不碰分镜内容。
+ */
+function updateStudioRedoUi() {
+  const active = studioRedoActive();
+  if (studioEls.sceneRedoBar) studioEls.sceneRedoBar.classList.toggle('hidden', !active);
+  if (studioEls.sceneRedoFrom) {
+    studioEls.sceneRedoFrom.textContent = active ? `重做《${studioRedoTitle || '未命名'}》` : '';
+  }
+  if (studioEls.redoNote) {
+    studioEls.redoNote.classList.toggle('hidden', !active);
+    if (active) {
+      studioEls.redoNote.textContent = studioRedoChanged
+        ? `已载入 ${studioScenes.length} 场分镜 · 改过了：点「按修改重做」就按你改的跑。`
+        : `已载入 ${studioScenes.length} 场分镜，改完点「开始做」就按你改的跑。`;
+    }
+  }
+  if (studioEls.go) {
+    studioEls.go.textContent = active && studioRedoChanged ? '按修改重做' : '开始做';
+  }
+  if (studioEls.sceneRedoRun) studioEls.sceneRedoRun.disabled = !active || studioBusy;
+}
+
+/** 进入重做模式：记下来源（历史 id 或浏览器配方），界面切成可改的状态。 */
+function enterStudioRedo(info) {
+  studioRedoLibraryId = String((info && info.libraryId) || '');
+  studioRedoRecipe = (info && info.recipe) || null;
+  studioRedoTitle = String((info && info.title) || studioTitle || '');
+  studioRedoChanged = false;
+  updateStudioRedoUi();
+}
+
+/** 退出重做模式：提交出去之后就不再是"正在重做"。 */
+function exitStudioRedo() {
+  if (!studioRedoActive()) return;
+  studioRedoLibraryId = '';
+  studioRedoRecipe = null;
+  studioRedoTitle = '';
+  studioRedoChanged = false;
+  updateStudioRedoUi();
+}
+
+/** 改了任一场：主按钮从「开始做」变成「按修改重做」，提示条也跟着变。 */
+function markStudioRedoChanged() {
+  if (!studioRedoActive() || studioRedoChanged) return;
+  studioRedoChanged = true;
+  updateStudioRedoUi();
+}
+
+/**
+ * 点了「重做」是想改东西：展开高级区 + 分镜表格，再滚到表格。
+ * 绝不在这里自动开始渲染。
+ */
+function revealStudioScenes() {
+  setStudioAdvanced(true);
+  if (studioEls.scenesBox) studioEls.scenesBox.open = true;
+  const scroll = () => {
+    if (!studioEls.scenesBox || typeof studioEls.scenesBox.scrollIntoView !== 'function') return;
+    studioEls.scenesBox.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+  if (window.requestAnimationFrame) {
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => window.setTimeout(scroll, 80)));
+  } else {
+    scroll();
+  }
 }
 
 // ---- 任务卡：排队 / 进行 / 完成 / 失败 -------------------------------------
@@ -2813,7 +2927,7 @@ function slimStudioPayload(payload) {
   return out;
 }
 
-// ---- 历史（library）：重做 / 载入到分镜表格 / 删除 -------------------------
+// ---- 历史（library）：重做（先载入分镜再改）/ 删除 -------------------------
 
 /** 任务卡和历史条目怎么对上：有 id 用 id，没有就按标题 + 时间就近认一条。 */
 function studioLibraryIdForJob(job) {
@@ -2901,7 +3015,7 @@ function renderStudioLibrary(note) {
 
     const ops = document.createElement('span');
     ops.className = 'lib-ops';
-    ops.append(libActionButton('rerun', '重做'), libActionButton('load', '载入'), libActionButton('del', '删除', 'danger'));
+    ops.append(libActionButton('rerun', '重做'), libActionButton('del', '删除', 'danger'));
     row.append(title, meta, ops);
     li.append(row);
 
@@ -2959,7 +3073,7 @@ async function toggleStudioLibItem(li, id) {
   });
 }
 
-/** 「重做」历史里的一条：让 studio 用它保存的配方再跑一遍，生成一张新任务卡。 */
+/** 「不改，直接重跑」：让 studio 用历史里保存的配方原样再跑一遍，生成一张新任务卡。 */
 async function rerunStudioLibrary(id) {
   if (studioBusy) return;
   setStudioBusy(true);
@@ -2974,21 +3088,27 @@ async function rerunStudioLibrary(id) {
         status: 'queued',
         createdAt: Date.now(),
       });
-      setStudioHintText('已经按这条历史重做了一份，新任务在最上面。');
+      setStudioHintText('已经按原样重跑了一份，新任务在最上面。');
       return;
     }
-    setStudioStartError('重做没成功：' + ((r.data && (r.data.error || r.data.message)) || `HTTP ${r.status}`));
+    setStudioStartError('重跑没成功：' + ((r.data && (r.data.error || r.data.message)) || `HTTP ${r.status}`));
   } catch (err) {
-    setStudioStartError('重做失败：' + ((err && err.message) || err));
+    setStudioStartError('重跑失败：' + ((err && err.message) || err));
   } finally {
     setStudioBusy(false);
   }
 }
 
-/** 「载入」：把历史里的分镜放回高级区表格，改完再点「开始做」。 */
-async function loadStudioLibraryItem(id) {
+/**
+ * 把历史里的分镜放回高级区表格（两步式重做的第一步）。
+ *  - {redo:true}：从「重做」进来 —— 进入重做模式、展开并滚到表格，不自动开跑
+ *  - 缺省：只载入（给别的入口复用）
+ * 输入框里已经有别的主题就不覆盖：这次要跑的是表格里的分镜。
+ */
+async function loadStudioLibraryItem(id, options) {
   if (studioLibBusy) return;
   studioLibBusy = true;
+  const redo = Boolean(options && options.redo);
   setStudioStartError('');
   try {
     const r = await studioRequest(`/api/studio/library/${encodeURIComponent(id)}`, null, 'GET');
@@ -3012,15 +3132,82 @@ async function loadStudioLibraryItem(id) {
     if (studioEls.seconds && seconds > 0) studioEls.seconds.value = String(seconds);
     if (request.style) setStudioSelectValue(studioEls.style, request.style);
     if (request.voice) setStudioSelectValue(studioEls.voice, request.voice);
-    setStudioAdvanced(true);
-    if (studioEls.scenesBox) studioEls.scenesBox.open = true;
-    setStudioSceneHint(`已载入《${studioTitle || '未命名'}》的 ${scenes.length} 场：改完回上面点「开始做」，就用这份分镜。`);
+    if (redo) enterStudioRedo({ libraryId: String(item.id || id), title: studioTitle });
     updateStudioHint();
+    setStudioSceneHint(`已载入《${studioTitle || '未命名'}》的 ${scenes.length} 场：改完回上面点「开始做」，就用这份分镜。`);
+    if (redo) {
+      // 用户点「重做」是想改东西：把表格摆到眼前，但不自动开始
+      revealStudioScenes();
+    }
   } catch (err) {
     setStudioStartError('载入失败：' + ((err && err.message) || err));
   } finally {
     studioLibBusy = false;
   }
+}
+
+/** 「重做」（两步式）：先把分镜载入表格给用户改，绝不自动开跑。 */
+async function redoStudioLibrary(id) {
+  return loadStudioLibraryItem(id, { redo: true });
+}
+
+/**
+ * 没有历史条目时的重做：用浏览器存的配方把分镜放回表格。
+ * 当时若是一句话/稿子直接做的，就没有分镜可改 —— 把原话放回输入框，让用户改一句。
+ */
+function redoStudioFromRecipe(recipe) {
+  const payload = (recipe && recipe.payload) || null;
+  if (!payload) return false;
+  const scenes = Array.isArray(payload.scenes) ? payload.scenes : [];
+  if (!scenes.length) {
+    const text = String(payload.prompt || payload.script || '');
+    const hasText = Boolean(studioEls.input && studioEls.input.value.trim());
+    // 输入框里有别的主题就不动它
+    if (studioEls.input && text && !hasText) studioEls.input.value = text;
+    if (studioEls.seconds && Number(payload.seconds) > 0) studioEls.seconds.value = String(payload.seconds);
+    if (payload.style) setStudioSelectValue(studioEls.style, payload.style);
+    if (payload.voice) setStudioSelectValue(studioEls.voice, payload.voice);
+    updateStudioHint();
+    setStudioHintText(hasText
+      ? '这条任务当时是直接按文字做的，没留分镜；输入框里已有别的主题，就没覆盖它。'
+      : '这条任务当时是直接按文字做的，没留分镜；原话已经填回输入框，改一句再点「开始做」。');
+    return false;
+  }
+  studioTitle = String(recipe.title || studioTitle || '').slice(0, 60);
+  adoptStudioScenes({ title: studioTitle, scenes });
+  studioScenesTouched = true;
+  studioScenesFromText = studioEls.input ? studioEls.input.value.trim() : '';
+  if (studioEls.input && !studioEls.input.value.trim()) studioEls.input.value = studioTitle;
+  if (studioEls.seconds && Number(payload.seconds) > 0) studioEls.seconds.value = String(payload.seconds);
+  if (payload.style) setStudioSelectValue(studioEls.style, payload.style);
+  if (payload.voice) setStudioSelectValue(studioEls.voice, payload.voice);
+  enterStudioRedo({ recipe: payload, title: studioTitle });
+  updateStudioHint();
+  setStudioSceneHint(`已载入 ${scenes.length} 场分镜：改完回上面点「开始做」，就用你改过的分镜。`);
+  revealStudioScenes();
+  return true;
+}
+
+/** 「重做」任务卡（两步式）：优先用 studio 历史里那条分镜，其次浏览器存的配方。 */
+async function redoStudioJob(job) {
+  if (!job || studioBusy || studioLibBusy) return;
+  setStudioStartError('');
+  const libId = studioLibraryIdForJob(job);
+  if (libId) return loadStudioLibraryItem(libId, { redo: true });
+  const recipe = studioRecipe(job.id);
+  if (recipe && recipe.payload) {
+    redoStudioFromRecipe(recipe);
+    return;
+  }
+  setStudioStartError('这条任务没留下分镜：用上面的输入框再写一次，或者从历史里重做。');
+}
+
+/** 「不改，直接重跑」：按进入重做时记下的来源原样跑，表格里的修改都不算。 */
+async function rerunStudioRedoSource() {
+  if (studioBusy) return;
+  if (studioRedoLibraryId) return rerunStudioLibrary(studioRedoLibraryId);
+  if (studioRedoRecipe) return submitStudioJob(studioRedoRecipe, studioRedoTitle || '重做');
+  setStudioStartError('没有可原样重跑的做法：改完点「开始做」就行。');
 }
 
 /** 删除历史里的这一条（成片不动，生成的 mp4 照样能下载）。 */
@@ -3040,7 +3227,7 @@ async function deleteStudioLibraryItem(id) {
   }
 }
 
-/** 历史区的点击：展开 / 重做 / 载入 / 删除（删除要点两下，免得误删）。 */
+/** 历史区的点击：展开 / 重做（载入分镜再改）/ 删除（删除要点两下，免得误删）。 */
 async function onStudioLibClick(event) {
   const btn = event.target.closest('[data-act]');
   if (!btn) return;
@@ -3049,8 +3236,7 @@ async function onStudioLibClick(event) {
   if (!id) return;
   const act = btn.dataset.act;
   if (act === 'open') return toggleStudioLibItem(li, id);
-  if (act === 'rerun') return rerunStudioLibrary(id);
-  if (act === 'load') return loadStudioLibraryItem(id);
+  if (act === 'rerun') return redoStudioLibrary(id);
   if (act === 'del') {
     if (btn.dataset.confirm !== '1') {
       btn.dataset.confirm = '1';
@@ -3133,6 +3319,8 @@ async function submitStudioJob(payload, title) {
       setStudioHintText('开工了。下面那张卡会自己更新，不用守在这儿。'
         + (studioPayloadHasAiVideo(payload) ? ' 注意：AI 视频额度已用完，标了 AI 画面的场会降级成文字卡。' : ''));
       if (studioEls.startError) studioEls.startError.classList.add('hidden');
+      // 已经提交出去了：重做模式到此结束，主按钮回到「开始做」
+      exitStudioRedo();
       return job;
     }
     // studio 还没这套接口 → 回退老流程（拆分镜 → 补动画 → 建项目 → 渲染），不白屏
@@ -3156,23 +3344,7 @@ async function submitStudioJob(payload, title) {
   }
 }
 
-/** 「重做」任务卡：优先用 studio 记住的配方（历史那条 rerun），其次浏览器存的请求。 */
-async function rerunStudioJob(job) {
-  if (!job || studioBusy) return;
-  const libId = studioLibraryIdForJob(job);
-  if (libId) {
-    await rerunStudioLibrary(libId);
-    return;
-  }
-  const recipe = studioRecipe(job.id);
-  if (recipe && recipe.payload) {
-    await submitStudioJob(recipe.payload, recipe.title || job.title);
-    return;
-  }
-  setStudioStartError('这条任务没留下做法：用上面的输入框再写一次。');
-}
-
-/** 卡片的点击：播放 / 下载 / 重做。 */
+/** 卡片的点击：播放 / 下载 / 重做（重做走两步式：先载入分镜给人改）。 */
 async function onStudioJobClick(event) {
   const btn = event.target.closest('[data-act]');
   if (!btn) return;
@@ -3180,7 +3352,7 @@ async function onStudioJobClick(event) {
   const job = card ? studioJobs.get(card.dataset.jobId) : null;
   if (!job) return;
   const act = btn.dataset.act;
-  if (act === 'rerun') return rerunStudioJob(job);
+  if (act === 'rerun') return redoStudioJob(job);
   if (act === 'play') {
     let video = card.querySelector('.job-video');
     if (!video) {
@@ -3374,6 +3546,7 @@ async function loadStudioView() {
   }
   if (!studioScenes.length) updateStudioMeta();
   updateStudioHint();
+  updateStudioRedoUi();
   renderStudioRefBox();
   await Promise.all([
     loadStudioJobs().catch(() => {}),
@@ -3436,6 +3609,7 @@ if (studioEls.libToggle) {
 }
 if (studioEls.fill) studioEls.fill.addEventListener('click', studioFillScenes);
 if (studioEls.sceneAdd) studioEls.sceneAdd.addEventListener('click', studioAddScene);
+if (studioEls.sceneRedoRun) studioEls.sceneRedoRun.addEventListener('click', rerunStudioRedoSource);
 if (studioEls.sceneList) {
   // 事件委托：行是动态生成的，绑一次就够。input 直接改数组，不重建 DOM。
   studioEls.sceneList.addEventListener('input', onStudioSceneEdit);

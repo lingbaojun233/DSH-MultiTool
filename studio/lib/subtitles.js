@@ -89,8 +89,10 @@ const DEFAULT_STYLE = {
   backAlpha: 0.55,       // 0=全透明 1=不透明
   marginBottomPx: 64,    // 距画面底部的像素
   marginSidePx: 96,
-  maxCharsPerCue: 16,    // 一条字幕最多几个字（再长就切）
-  minCueSec: 0.55,
+  // 一条字幕最多几个字。16 字硬切会断在词中间（用户实测："能把事／做完"），
+  // 现在按标点分句再合并到这个上限（18~22 是 CJK 单行的舒适区），可在 config.subtitleMaxChars 改。
+  maxCharsPerCue: 20,
+  minCueSec: 0.8,        // 一条字幕至少显示多久；太短的并入上一条
 };
 
 /** 取"这一集要不要字幕 / 字幕长什么样"，优先级：项目 > 风格 > 全局配置 > 默认。 */
@@ -106,6 +108,7 @@ function resolveStyle({ project, style, cfg }) {
     backAlpha: num(C.subtitleBackAlpha, DEFAULT_STYLE.backAlpha),
     marginBottomPx: num(C.subtitleMarginBottom, DEFAULT_STYLE.marginBottomPx),
     maxCharsPerCue: num(C.subtitleMaxChars, DEFAULT_STYLE.maxCharsPerCue),
+    minCueSec: num(C.subtitleMinCueSec, DEFAULT_STYLE.minCueSec),
   };
   const fromStyle = style && style.subtitleStyle && typeof style.subtitleStyle === 'object' ? style.subtitleStyle : {};
   const fromProject = project && project.subtitleStyle && typeof project.subtitleStyle === 'object' ? project.subtitleStyle : {};
@@ -119,6 +122,7 @@ function resolveStyle({ project, style, cfg }) {
   merged.backAlpha = Math.min(1, Math.max(0, num(pick('backAlpha'), DEFAULT_STYLE.backAlpha)));
   merged.marginBottomPx = num(pick('marginBottomPx'), DEFAULT_STYLE.marginBottomPx);
   merged.maxCharsPerCue = Math.max(6, num(pick('maxCharsPerCue'), DEFAULT_STYLE.maxCharsPerCue));
+  merged.minCueSec = Math.max(0, num(pick('minCueSec'), DEFAULT_STYLE.minCueSec));
   // 字体固定微软雅黑：服务器上只有它保证有中文字形，换字体等于出一排方框。
   merged.fontName = String(pick('fontName') || 'Microsoft YaHei');
   return { enabled, style: merged };
@@ -294,9 +298,34 @@ function estimateWords(text, durationSec) {
 
 // ------------------------------------------------------------ 分条 ----
 
+/**
+ * 分条规则（用户实测反馈："16 字硬切，出现『慢下来，反而能把事／做完』"）：
+ *
+ *   1) 先按标点切成子句：，。？！；：、—— 以及英文 , . ? ! ; :
+ *      （标点跟着**前一个**子句，所以标点永远不会出现在行首）
+ *   2) 相邻子句合并到接近上限（默认 20 字，可用 subtitleMaxChars 改到 18~22）；
+ *      上一句已经是句末标点且够长时不再往下吞，句号和句号之间尽量留一刀
+ *   3) 单个子句超过上限才在子句内部切，切点优先落在**词组边界**：
+ *      「的/了/是/和/与/就/才…」之后、「把/被/在/对/从…」之前；
+ *      不在数字、英文单词、引号/括号内部切
+ *   4) 太短的条（默认 < 0.8 秒）并入上一条，不够的字数上限放宽到 max+6
+ *
+ * 这套规则比"每 16 字硬切"多出来的复杂性都是必要的：中文字幕的断点一旦落在词中间，
+ * 观众读到的是两个残句，比多一行/少一行难看得多。
+ */
+
 const CJK = /[\u3400-\u9fff\uf900-\ufaff]/;
-const PUNCT_SENT = /[。！？；…!?;]$/;     // 句末：一定断
-const PUNCT_SOFT = /[，、：,;:—]$/;         // 句中停顿：优先在这里断
+const PUNCT_SENT = /[。！？…!?;.]$/;        // 句末：强烈建议断
+const PUNCT_CLAUSE = /[，。？！；：、,.;:?!—]/;  // 任何可以切开的位置
+// 切在它**后面**是天然的停顿（语气助词/结构助词/连词）
+const PARTICLE_AFTER = '的了是在和与就才着过地得而并也都又再';
+// 切在它**前面**是天然的停顿（介词/把字句/被动句）
+const PARTICLE_BEFORE = '把被将对从向为让给在';
+
+/** 一个词在屏幕上占几个字（去掉空白后按 Unicode 码点数）。 */
+function wordLen(w) {
+  return Array.from(String((w && w.word) || '').replace(/\s+/g, '')).length;
+}
 
 /** 词数组 → 一行文字（中文不加空格，英文单词之间补一个）。 */
 function joinWords(list) {
@@ -310,97 +339,199 @@ function joinWords(list) {
   return text.trim();
 }
 
+/** 词数组一共几个字（行首行尾空白不算；英文词之间的空格也不算）。 */
 function charCount(list) {
-  return Array.from(joinWords(list).replace(/\s+/g, '')).length;
+  return (Array.isArray(list) ? list : []).reduce((a, w) => a + wordLen(w), 0);
+}
+
+/** 是不是"只有标点、没有实词"的词（接口有时把标点单独当一个 token）。 */
+function isPunctOnly(w) {
+  const s = String((w && w.word) || '').trim();
+  if (!s) return false;
+  return !/[\p{L}\p{N}]/u.test(s) && PUNCT_CLAUSE.test(s);
 }
 
 /**
- * 一句话按字数上限**均衡**切几段。
- *
- * 为什么不是"攒够 maxChars 就断"：那样 18 个字会被切成 16+2，
- * 屏幕上先出现一整行、再闪一个两个字的小尾巴 —— 观众会以为字幕出错了。
- * 做法：先算要切几段，再在"累计字数最接近目标值"的词边界切；
- * 落在逗号/冒号这种句中停顿处的边界额外加分（-1.5 权重），所以优先断在标点后面。
+ * 1) 按标点把词流切成子句（标点留在前一句末尾）。
+ * 纯标点 token 一律挂到前一句：既不单独成条，也不会跑到行首。
  */
-function splitBalanced(words, maxChars) {
-  const total = charCount(words);
-  if (total <= maxChars || words.length < 2) return [words];
-  const parts = Math.ceil(total / maxChars);
-  const cum = [];
-  let acc = 0;
-  for (const w of words) {
-    acc += Array.from(joinWords([w]).replace(/\s+/g, '')).length;
-    cum.push(acc);
-  }
+function splitClauses(words) {
+  const list = Array.isArray(words) ? words : [];
   const out = [];
-  let start = 0;
-  let consumed = 0;
-  let left = parts;
-  while (left > 1 && start < words.length - 1) {
-    const target = consumed + (total - consumed) / left;
-    let best = -1;
-    let bestScore = Infinity;
-    for (let i = start; i < words.length - 1; i++) {
-      const isPunct = PUNCT_SOFT.test(String(words[i].word || ''));
-      const score = Math.abs(cum[i] - target) - (isPunct ? 1.5 : 0);
-      if (score < bestScore) {
-        bestScore = score;
-        best = i;
-      }
+  let cur = [];
+  for (const w of list) {
+    if (!String((w && w.word) || '').trim()) continue;
+    const tail = String(w.word).trim().slice(-1);
+    const isPunct = PUNCT_CLAUSE.test(tail);
+    if (isPunctOnly(w)) {
+      // 纯标点 token：挂到当前/前一句，然后按它断开（逐字时间戳路径里每个标点都是独立 token）
+      if (cur.length) cur.push(w);
+      else if (out.length) out[out.length - 1].push(w);
+      if (isPunct && cur.length) { out.push(cur); cur = []; }
+      continue;
     }
-    if (best < 0) break;
-    out.push(words.slice(start, best + 1));
-    consumed = cum[best];
-    start = best + 1;
-    left -= 1;
+    cur.push(w);
+    if (isPunct) { out.push(cur); cur = []; }
   }
-  if (start <= words.length - 1) out.push(words.slice(start));
+  if (cur.length) out.push(cur);
   return out;
 }
 
 /**
- * 词 → 字幕条：先按句末标点断句，每句再均衡切段。
- * 返回 [{start,end,text}]，时间来自首词/末词。
+ * 判断"在第 i 个词后面切一刀"是否安全/自然。
+ *   safe=false：切在数字中间、英文单词中间、或未闭合的引号/括号里面
+ *   particle=true：切点正好落在"的/了/把/被…"这类词组边界上
  */
-function groupWords(words, maxChars) {
-  const max = Math.max(6, num(maxChars, 16));
-  const list = (Array.isArray(words) ? words : []).filter((w) => w && String(w.word || '').trim());
-  const sentences = [];
-  let cur = [];
-  for (const w of list) {
-    cur.push(w);
-    if (PUNCT_SENT.test(String(w.word || ''))) {
-      sentences.push(cur);
-      cur = [];
+function boundaryInfo(words, i) {
+  const left = String((words[i] && words[i].word) || '');
+  const right = String((words[i + 1] && words[i + 1].word) || '');
+  const lc = left.slice(-1);
+  const rc = right.slice(0, 1);
+  let safe = true;
+  // 数字/英文单词内部：`3|.14`、`Hel|lo`
+  if (/[A-Za-z0-9]/.test(lc) && /[A-Za-z0-9]/.test(rc)) safe = false;
+  // 引号/括号没闭合就切 = 把「引文」切成两半
+  const prefix = words.slice(0, i + 1).map((w) => String(w.word || '')).join('');
+  const open = (prefix.match(/[「『“"'（(《【]/g) || []).length;
+  const close = (prefix.match(/[」』”"')）)》】]/g) || []).length;
+  if (open > close) safe = false;
+  const particle = PARTICLE_AFTER.includes(lc) || PARTICLE_BEFORE.includes(rc);
+  return { safe, particle };
+}
+
+/**
+ * 3) 单个子句超上限 → 在子句内部按词组边界切（尽量均衡，优先标点/虚词边界）。
+ * 只切到"每段 ≤ max"，不会为了均衡把某段撑过上限。
+ */
+function splitLongClause(words, maxChars) {
+  const out = [];
+  let rest = (Array.isArray(words) ? words : []).slice();
+  let guard = 0;
+  while (rest.length > 1 && charCount(rest) > maxChars && guard < 20) {
+    guard += 1;
+    const total = charCount(rest);
+    const cum = [];
+    let acc = 0;
+    for (const w of rest) { acc += wordLen(w); cum.push(acc); }
+    const parts = Math.max(2, Math.ceil(total / maxChars));
+    const target = total / parts;
+    let best = -1;
+    let bestScore = Infinity;
+    for (let i = 0; i < rest.length - 1; i++) {
+      const c = cum[i];
+      if (c < 2 || c > maxChars) continue;          // 头一段不能短到只剩一个字，也不能超上限
+      if (total - c < 1) continue;
+      const info = boundaryInfo(rest, i);
+      let score = Math.abs(c - target);
+      if (info.particle) score -= 1.6;              // 落在"的/了/把/被"边界：强烈优先
+      if (!info.safe) score += 6;                   // 数字/英文/引号内部：能躲就躲
+      if (score < bestScore) { bestScore = score; best = i; }
     }
+    if (best < 0) {
+      // 找不到干净切点（比如一个 30 字的长数字串）：退化为按字数硬切
+      best = cum.findIndex((c) => c >= Math.min(maxChars, Math.max(2, Math.ceil(total / 2))));
+      if (best < 0) best = rest.length - 1;
+    }
+    out.push(rest.slice(0, best + 1));
+    rest = rest.slice(best + 1);
   }
-  if (cur.length) sentences.push(cur);
-  const cues = [];
-  for (const sent of sentences) {
-    const parts = splitBalanced(sent, max);
-    for (let pi = 0; pi < parts.length; pi++) {
-      let part = parts[pi];
-      // 切点落在标点后面时，下一段可能以"，"开头：把它挪回上一段结尾，
-      // 否则屏幕上会出现一条以逗号开头的字幕。
-      if (pi > 0 && part.length && /^[，、：,;:—]+$/.test(String(part[0].word || '').trim())) {
-        const prev = cues[cues.length - 1];
-        if (prev) {
-          prev.text = `${prev.text}${String(part[0].word).trim()}`;
-          prev.end = Math.max(prev.end, num(part[0].end, prev.end));
-        }
-        part = part.slice(1);
+  if (rest.length) out.push(rest);
+  return out;
+}
+
+/**
+ * 2) 合并相邻子句：总量不超上限就并；上一句是句末标点且已经够长时，不再往下吞。
+ * 这样「短句」会连成一行，「长句」在句号处自然收尾。
+ */
+function mergeAdjacent(parts, maxChars) {
+  const out = [];
+  for (const p of parts) {
+    if (!p.length) continue;
+    if (!out.length) { out.push(p.slice()); continue; }
+    const prev = out[out.length - 1];
+    const prevLen = charCount(prev);
+    const curLen = charCount(p);
+    const strongEnd = PUNCT_SENT.test(joinWords(prev));
+    const fits = prevLen + curLen <= maxChars;
+    const prevAlreadyOk = strongEnd ? prevLen >= Math.round(maxChars * 0.6) : false;
+    if (fits && !prevAlreadyOk) { prev.push(...p); continue; }
+    out.push(p.slice());
+  }
+  return out;
+}
+
+/** 4) 绝不把标点留在行首：把行首标点挪回上一条结尾。 */
+function fixLeadingPunct(cues) {
+  for (let i = 1; i < cues.length; i++) {
+    const m = /^[，、：；,;:—]+/.exec(cues[i].text);
+    if (!m) continue;
+    cues[i].text = cues[i].text.slice(m[0].length).trim();
+    cues[i - 1].text += m[0];
+  }
+  // 第一条也可能以标点开头（整句以标点起头）：直接清掉，别让行首出现标点
+  for (const c of cues) {
+    const m = /^[，、：；,;:—]+/.exec(c.text);
+    if (m) c.text = c.text.slice(m[0].length).trim();
+  }
+  return cues.filter((c) => c.text);
+}
+
+/**
+ * 4b) 太短的条并入上一条（默认 <0.8 秒太少：还没读完就没了）。
+ * 合并后文字上限放宽到 max+6 —— 一行 26 个中文字在 1080p 上仍然放得下。
+ */
+function mergeShortCues(cues, maxChars, minCueSec) {
+  const min = Math.max(0, num(minCueSec, 0));
+  if (!(min > 0)) return cues;
+  const out = [];
+  for (const c of cues) {
+    const prev = out[out.length - 1];
+    const dur = num(c.end, 0) - num(c.start, 0);
+    if (prev) {
+      const prevLen = Array.from(prev.text).length;
+      const curLen = Array.from(c.text).length;
+      if (dur < min && prevLen + curLen <= maxChars + 6) {
+        prev.text = `${prev.text}${c.text}`;
+        prev.end = Math.max(prev.end, num(c.end, 0));
+        continue;
       }
-      if (!part.length) continue;
-      const text = joinWords(part);
-      if (!text) continue;
-      cues.push({
-        start: Math.max(0, num(part[0].start, 0)),
-        end: Math.max(0, num(part[part.length - 1].end, 0)),
-        text,
-      });
     }
+    out.push({ start: num(c.start, 0), end: num(c.end, 0), text: c.text });
   }
-  return cues;
+  return out;
+}
+
+/**
+ * 词 → 字幕条：标点分句 → 合并到接近上限 → 超长才在子句内部按词组切 → 短条并入上一条。
+ * 返回 [{start,end,text}]，时间来自首词/末词（相对整条音频，含句首静音前的 0 点）。
+ *
+ * @param {Array} words      [{word,start,end}]
+ * @param {number} maxChars  一条最多几个字（默认 20）
+ * @param {Object} [opts]    {minCueSec} 太短的条并入上一条
+ */
+function groupWords(words, maxChars, opts = {}) {
+  const max = Math.max(6, num(maxChars, DEFAULT_STYLE.maxCharsPerCue));
+  const minCueSec = num(opts && opts.minCueSec, DEFAULT_STYLE.minCueSec);
+  const list = (Array.isArray(words) ? words : []).filter((w) => w && String(w.word || '').trim());
+  if (!list.length) return [];
+
+  const parts = [];
+  for (const cl of splitClauses(list)) {
+    if (charCount(cl) <= max) { parts.push(cl); continue; }
+    for (const sub of splitLongClause(cl, max)) parts.push(sub);
+  }
+
+  const cues = [];
+  for (const part of mergeAdjacent(parts, max)) {
+    const text = joinWords(part);
+    if (!text) continue;
+    cues.push({
+      start: Math.max(0, num(part[0].start, 0)),
+      end: Math.max(0, num(part[part.length - 1].end, 0)),
+      text,
+    });
+  }
+  return mergeShortCues(fixLeadingPunct(cues), max, minCueSec);
 }
 
 /**
@@ -449,16 +580,21 @@ function calibrate(words, audioSec, text) {
 /**
  * 对齐报告：每场的"旁白时长 / 场时长 / 动画时长"。
  * 差值就是节奏对不对的证据 —— 这三者差 ≤0.5 秒，观感才是"图文对上"。
+ *
+ * 另外带出 animNatural（脚本原本多长）和 scale（对齐系数 = 实际/自然）：
+ *   scale < 1 表示动画被压缩（加速），≥0.85 才算"不赶"；scale > 1 表示被拉慢。
  */
-function rhythmRow({ index, at, narrationMs, seconds, animSeconds }) {
+function rhythmRow({ index, at, narrationMs, seconds, animSeconds, animNaturalSeconds }) {
   const narration = Math.round(Number(narrationMs) || 0) / 1000;
   const scene = Math.round((Number(seconds) || 0) * 100) / 100;
   const anim = Math.round((Number(animSeconds) || 0) * 100) / 100;
+  const natural = Math.round((Number(animNaturalSeconds) || 0) * 100) / 100;
   const diffNarrationScene = Math.round(Math.abs(scene - narration) * 100) / 100;
   const diffAnimNarration = anim > 0 ? Math.round(Math.abs(anim - narration) * 100) / 100 : 0;
+  const scale = natural > 0.05 && anim > 0.05 ? Math.round((anim / natural) * 100) / 100 : 0;
   return {
     index, at: Math.round((Number(at) || 0) * 100) / 100,
-    narration, scene, anim,
+    narration, scene, anim, natural, scale,
     diffNarrationScene, diffAnimNarration,
   };
 }
@@ -501,6 +637,7 @@ async function buildCues({ timeline, speeches, fade, cfg, log }) {
     const row = rhythmRow({
       index: item.index, at: sceneAt, narrationMs,
       seconds: scene.seconds, animSeconds: scene.animSeconds,
+      animNaturalSeconds: scene.animNaturalSeconds,
     });
     rows.push(row);
     if (!sp || !narrationMs || !String(scene.narration || '').trim()) continue;
@@ -566,18 +703,23 @@ async function buildCues({ timeline, speeches, fade, cfg, log }) {
     const job = jobs[k];
     const got = results[k] || { words: estimateWords(job.text, job.narrationMs / 1000), source: 'estimate' };
     if (got.source === 'api' || got.source === 'api-cache') stats.api += 1; else stats.estimate += 1;
-    const cues = groupWords(got.words, maxChars);
+    const cues = groupWords(got.words, maxChars, { minCueSec: style.minCueSec });
     // 场窗口：字幕不能飘到上一场/下一场去。句尾稍许超出画面是正常的（旁白还在说），
     // 所以结束时间只压到"本场画面结束"，不压到下一场的起点之前 —— 下一场的字幕会自然接上。
     const sceneEnd = job.sceneAt + Math.max(0, num(job.scene && job.scene.seconds, 0));
+    const hardEnd = sceneEnd + 0.6;   // 允许压过场尾 0.6s（旁白尾巴）
+    const minCue = Math.max(0.2, num(style.minCueSec, 0.8));
     for (const c of cues) {
       // 场起始偏移 + 句首静音 + 句内偏移 = 这条字幕在成片里的绝对起点
       let start = job.sceneAt + job.leadSec + Math.max(0, c.start);
       let end = job.sceneAt + job.leadSec + Math.max(0, c.end);
       if (!(end > start)) end = start + 0.2;
-      if (end - start < 0.35) end = start + 0.35;
       if (start < job.sceneAt) start = job.sceneAt;
-      if (end > sceneEnd + 0.6) end = sceneEnd + 0.6;   // 允许压过场尾 0.6s（旁白尾巴）
+      // 一条至少显示 minCueSec（默认 0.8s，可在 config.subtitleMinCueSec 改）：
+      // 太短的话观众还没读完就切了；但也别越过场尾的 0.6s 余量。
+      if (end - start < minCue) end = Math.min(hardEnd, start + minCue);
+      if (end > hardEnd) end = hardEnd;
+      if (end <= start) end = start + 0.2;
       all.push({ start, end, text: c.text, sceneIndex: job.index, source: got.source });
     }
   }
@@ -755,6 +897,10 @@ module.exports = {
   forceStyle,
   estimateWords,
   groupWords,
+  splitClauses,
+  splitLongClause,
+  mergeAdjacent,
+  boundaryInfo,
   calibrate,
   normalizeWords,
   fetchWordTimings,

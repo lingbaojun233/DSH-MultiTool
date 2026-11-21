@@ -117,6 +117,8 @@
           </div>
           <p class="studio-hint muted" id="studioHint">一句话说题目就行；贴整段稿子也行，它自己看得出来。</p>
           <p id="studioStartError" class="studio-error hidden" role="alert"></p>
+          <!-- 重做模式：从任务卡/历史载入分镜后的一行提示；只提示，不自动开跑 -->
+          <p id="studioRedoNote" class="studio-redo-note hidden" role="status"></p>
         </section>
 
         <!-- 二、高级：默认收起，只给想精细控制的人 -->
@@ -141,11 +143,18 @@
             <!-- 分镜表格：保留改每一场的能力，但默认不展开 -->
             <details id="studioScenesBox" class="studio-scenes-box">
               <summary>分镜表格 · <span id="studioEditMeta" class="muted">还没有分镜</span></summary>
+              <!-- 重做时出现：不改表格，直接拿原配方再跑一份 -->
+              <div id="sceneRedoBar" class="scene-redo-bar hidden">
+                <span id="sceneRedoFrom" class="muted"></span>
+                <button id="sceneRedoRun" class="ghost scene-redo-run" type="button"
+                  title="用这条配方的原样再跑一份，表格里改的都不算">不改，直接重跑</button>
+              </div>
               <div id="sceneList" class="scene-list"></div>
               <div class="scene-foot">
                 <button id="sceneAdd" class="ghost" type="button">加一场</button>
                 <button id="studioFill" class="ghost" type="button"
                   title="把每场的「画什么」翻译成动画代码，先不渲染">补全动画</button>
+                <span class="scene-total" id="sceneTotal">共 0 场</span>
                 <span class="muted" id="sceneHint">每行都能改；改完回上面点「开始做」，就用你改过的分镜。</span>
               </div>
             </details>
@@ -160,7 +169,7 @@
               aria-expanded="false" aria-controls="studioLibBody">历史 <span class="chev" aria-hidden="true"></span></button>
           </div>
           <div id="studioLibBody" class="studio-lib-body hidden">
-            <p class="studio-lib-note muted">点标题看分镜；「载入」把分镜放回高级区，改完再点「开始做」。</p>
+            <p class="studio-lib-note muted">点标题看分镜；「重做」会把分镜放回高级区，改完再点「开始做」，或不改直接重跑。</p>
             <ul id="studioLibList" class="studio-lib-list"></ul>
             <p class="studio-lib-empty muted hidden" id="studioLibEmpty">还没有存过的分镜。</p>
           </div>
