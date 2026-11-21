@@ -232,6 +232,10 @@ function normalizeScene(raw, opts = {}) {
   // 以前归一化时没有这个字段：写进项目/配方的分镜里 visual_hint 直接消失，
   // 面板重做时「画什么」一栏空白，而且没有任何东西能判断旧代码该不该作废。
   const visualHint = String(raw.visual_hint || '').slice(0, 600);
+  // 这句「画什么」是不是 studio 自动回填的（写稿模式拆出来的场次没有 hint）。
+  // 面板据此把那行小字换成"这句是自动生成的，改它会让这一场重新生成动画"；
+  // 没有 manim 代码时一律 false —— 标记不能脱离代码单独存在。
+  const visualHintAuto = Boolean(raw.visualHintAuto) && Boolean(manimCode);
   const tool = String(raw.tool || '').trim().toLowerCase().slice(0, 16);
   // AI 生成画面（aivideo 场）：prompt 是英文画面描述（主体+动作+风格+镜头），
   // size 是分辨率，wan 目前只认 1280*720 这一档实测可用，别的值回落到默认。
@@ -277,6 +281,7 @@ function normalizeScene(raw, opts = {}) {
     // 用户写的「画什么」+ 显式工具选择：重做时要能原样回填给面板，也要能判断
     // 现有 manim 代码是不是为这句描述生成的（见 server.js 的 manimHintMatches）。
     visual_hint: visualHint,
+    visualHintAuto,
     tool,
     // 代码是按哪句「画什么」生成的（空串 = 没记录）。场景级字段，不进 sceneKey。
     manimHint,

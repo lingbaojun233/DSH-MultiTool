@@ -1302,6 +1302,11 @@ async function planTwoStage(prompt, opts = {}) {
     } else {
       s.manim = { code: clean.slice(0, 8000), scene: r.json.manim.scene || null };
       s.kind = 'manim';
+      // 主题模式写出来的分镜骨架通常没有 visual_hint（提示词里没要求给）。
+      // 代码已经生成好了却让「画什么」空着，面板上就是"有 ✓、画什么一片空白" ——
+      // 所以这里回填一句可读摘要，同时把戳打成同一句，重跑时才不会判成代码过期。
+      fillAutoHint(s, clean, `scene#${si}`);
+      s.manimHint = String(s.visual_hint || '');
       visuals += 1;
       log(`scene#${si} manim 生成 ${(ms / 1000).toFixed(1)} 秒（并发 ${concurrency}）`);
     }
@@ -1422,6 +1427,119 @@ function stampManimHint(scene) {
   return Object.assign({}, scene, {
     manimHint: fromOldBuild != null ? fromOldBuild : String(scene.visual_hint || ''),
   });
+}
+
+// ------------------------------------------- 「画什么」回填（写稿模式的补丁）--
+/**
+ * 写稿模式拆出来的场次只有 text/narration，没有 visual_hint。fillScenes 拿这两句
+ * 当材料生成了 manim 代码，却从来没把"这一场画什么"写回场景 —— 面板上「画什么」
+ * 一栏空着、状态却是 ✓：用户不知道它画的是什么，想改也只能从零描述一句。
+ *
+ * 这里补一条：**代码生成成功但 visual_hint 为空**时，回填一句可读的摘要，并打上
+ * visualHintAuto 标记（面板据此提示"这句是自动生成的"）。两种来源，优先从代码读：
+ *   1) 代码摘要：把代码里出现的主要元素（Axes / plot / Dot / Line / MathTex / Text…）
+ *      拼成一句话。它比标题更接近"实际画了什么"，用户照着改也更容易；
+ *   2) 标题/旁白摘要：代码里认不出元素时，退回 text（没有 text 就用 narration）。
+ * 回填值末尾固定加「（自动生成，可改写）」：一眼能看出这不是自己写的。
+ */
+const HINT_AUTO_SUFFIX = '（自动生成，可改写）';
+// 摘要正文上限：回填值总长按 60 字算，先减掉后缀；中文按字符切，别切半个字。
+const HINT_SUMMARY_MAX = 60 - Array.from(HINT_AUTO_SUFFIX).length;
+
+// manim 代码里"看得出画了什么"的元素 → 人话。按**在代码里第一次出现的位置**排序，
+// 摘要读起来就有先后（先坐标轴、再曲线、再点/连线）。只收常见的十几种：
+// 全量覆盖既做不到也没必要，认不出来的场次走标题/旁白兜底。
+const MANIM_ELEMENT_WORDS = [
+  { re: /\bNumberPlane\b/, word: '坐标网格' },
+  { re: /\bAxes\b/, word: '坐标轴' },
+  { re: /\bNumberLine\b/, word: '数轴' },
+  { re: /\.plot\s*\(/, word: '曲线' },
+  { re: /\bMathTex\b/, word: '公式' },
+  { re: /\bTex\b/, word: '公式' },
+  { re: /\bCircle\b/, word: '圆' },
+  { re: /\bSquare\b/, word: '方块' },
+  { re: /\bRectangle\b/, word: '矩形' },
+  { re: /\bPolygon\b/, word: '多边形' },
+  { re: /\bLine\b/, word: '连线' },
+  { re: /\bArrow\b/, word: '箭头' },
+  { re: /\bDot\b/, word: '点' },
+  { re: /\bBrace\b/, word: '标注框' },
+  { re: /\bSurroundingRectangle\b/, word: '高亮框' },
+  { re: /\bText\b/, word: '文字' },
+];
+
+/** 从一段 manim 代码里读出一句"画了什么"，最多 5 个元素；认不出就返回空串。 */
+function manimCodeSummary(code) {
+  const src = String(code == null ? '' : code);
+  if (!src.trim()) return '';
+  const hits = [];
+  for (const el of MANIM_ELEMENT_WORDS) {
+    const m = el.re.exec(src);
+    if (m && m.index >= 0) hits.push({ at: m.index, word: el.word });
+  }
+  hits.sort((a, b) => a.at - b.at);
+  const words = [];
+  for (const hit of hits) {
+    if (words.includes(hit.word)) continue;
+    words.push(hit.word);
+    if (words.length >= 5) break;
+  }
+  return words.join(' + ');
+}
+
+/** 标题/旁白的规范化摘要：空白压成一个空格，取 text（没有就用 narration），守住字数。 */
+function titleNarrationSummary(scene) {
+  const text = String((scene && scene.text) || '').replace(/\s+/g, ' ').trim();
+  const narration = String((scene && scene.narration) || '').replace(/\s+/g, ' ').trim();
+  return (text || narration).slice(0, HINT_SUMMARY_MAX);
+}
+
+/**
+ * 给一场回填「画什么」（只在 hint 为空时动手；用户/模型写过的绝不覆盖）。
+ * 返回 true = 真的回填了。
+ */
+function fillAutoHint(scene, code, label) {
+  if (!scene) return false;
+  if (String(scene.visual_hint || '').trim()) return false;
+  const fromCode = manimCodeSummary(code);
+  const fromTitle = fromCode ? '' : titleNarrationSummary(scene);
+  const body = fromCode || fromTitle || '这一场的动画';
+  const how = fromCode ? '「代码摘要」' : (fromTitle ? '「标题/旁白摘要」' : '「通用占位」');
+  scene.visual_hint = `${body}${HINT_AUTO_SUFFIX}`;
+  // 标记只在这一处置位：面板据此把那行小字换成"这句是自动生成的"。
+  scene.visualHintAuto = true;
+  log(`${label} 无 hint，回填${how}作为画什么：「${scene.visual_hint}」`);
+  return true;
+}
+
+/**
+ * 读旧数据时补「画什么」：hint 为空但有 manim 代码 → 用同一套规则回填。
+ *
+ * 为什么读的时候也要补（而不只是生成时补）：升级前存下的配方/项目里 hint 本来就是
+ * 空的，面板打开还是空白一片、重做也无从下手。这里只改**返回给调用方的视图**，
+ * 不动磁盘上的存档 —— 用户真的改了 hint 才会写新值。
+ *
+ * 同时补场景级 manimHint 戳：否则调用方（面板）拿着"有 hint、有代码、没戳"的场次
+ * 回来重做时，会被判成"代码是按别的描述生成的"而白白重新生成一次。
+ */
+function withAutoHints(scenes) {
+  // 调用方拿它串在"读不到这条"之后（rerun / 详情），空值必须原样透传，别变成 [] 掩盖 404
+  if (!scenes) return scenes;
+  const list = arrayOf(scenes);
+  if (!list.length) return list;
+  let changed = false;
+  const out = list.map((s, i) => {
+    if (!s || typeof s !== 'object') return s;
+    const code = s.manim && typeof s.manim.code === 'string' ? s.manim.code : '';
+    if (!code.trim()) return s;
+    if (String(s.visual_hint || '').trim()) return s;
+    const next = Object.assign({}, s);
+    if (!fillAutoHint(next, code, `scene#${i}`)) return s;
+    if (!String(next.manimHint == null ? '' : next.manimHint).trim()) next.manimHint = next.visual_hint;
+    changed = true;
+    return next;
+  });
+  return changed ? out : list;
 }
 
 function scenesLookFinal(list) {
@@ -1591,6 +1709,9 @@ async function fillScenes(inputScenes, opts = {}) {
       stickers: P.normalizeScene(src).stickers,
       tool: String(src.tool || '').trim().toLowerCase(),
       kind: 'text',
+      // 「画什么」是自动回填的（面板要据此提示）。只有沿用已有代码时才继承；
+      // 代码重新生成时由 fillAutoHint 决定，用户改过描述的场次不会带这个标记。
+      visualHintAuto: false,
       manim: null,
       video: null,
       status: 'text',
@@ -1609,6 +1730,11 @@ async function fillScenes(inputScenes, opts = {}) {
       if (given && manimHintMatches(src)) {
         base.kind = 'manim';
         base.manim = { code: given.slice(0, 8000), scene: (src.manim && src.manim.scene) || null };
+        // 代码是沿用的：上一轮如果标过"这句 hint 是自动生成的"，标记继续有效。
+        if (src.visualHintAuto) base.visualHintAuto = true;
+        // 旧配方/旧项目里"有代码、没画什么"的场次：沿用代码的同时把 hint 补上，
+        // 面板重做时才有内容可改（不补的话这张卡片永远是空的）。
+        fillAutoHint(base, given, `scene#${i}`);
         base.manimHint = String(base.visual_hint || '');
         base.status = 'manim';
         manimCount += 1;
@@ -1769,6 +1895,9 @@ async function fillScenes(inputScenes, opts = {}) {
     }
     base.kind = 'manim';
     base.manim = { code: clean.slice(0, 8000), scene: (manimObj && manimObj.scene) || null };
+    // 写稿模式拆出来的场次没有「画什么」：代码生成成功后回填一句可读摘要，
+    // 面板上这张卡片才有内容（用户也能在这句的基础上改，改了就重新生成这一段）。
+    fillAutoHint(base, clean, `scene#${i}`);
     base.manimHint = String(base.visual_hint || '');
     base.status = 'manim';
     manimCount += 1;
@@ -3342,6 +3471,8 @@ function jobRecord(job) {
   delete rec.req;
   delete rec._lastSave;
   delete rec._dirty;
+  // _libScenes 是从配方文件读出来的视图缓存，不该跟着任务落盘（否则重启后是旧快照）
+  delete rec._libScenes;
   return rec;
 }
 
@@ -3438,6 +3569,8 @@ function saveJob(job, force = false) {
  */
 function saveLibrary(job, patch = {}, initial = false) {
   try {
+    // 配方里换了分镜 → GET /v1/jobs/:id 的 hint 缓存作废，下次轮询重新读
+    if (patch && Array.isArray(patch.scenes)) job._libScenes = null;
     const file = libFilePath(job.jobId);
     const prev = initial ? null : JS.readJson(file, null);
     const item = Object.assign({}, prev || {}, {
@@ -3490,7 +3623,9 @@ function libraryView(item, full = false) {
   };
   if (full) {
     base.request = it.request === undefined ? null : it.request;
-    base.scenes = arrayOf(it.scenes);
+    // 旧配方（升级前存的）里 hint 是空的：出 API 前统一回填一次，
+    // 面板/插件读到的每场都有「画什么」，不会出现"有代码却一片空白"。
+    base.scenes = withAutoHints(arrayOf(it.scenes));
     base.projectId = it.projectId || '';
     base.rerunOf = it.rerunOf || '';
     base.jobIdForVideo = it.jobIdForVideo || '';
@@ -3513,7 +3648,10 @@ function arrayOf(value) {
  * 只补空值，不覆盖存档里已有的字段。
  */
 function withRequestHints(item) {
-  const it = item || {};
+  // 没读到这条就原样返回 null：调用方靠它走 404。以前这里兜成 {}，
+  // 于是"读不存在的配方"会回 200 + 空 item（顺手修掉，和 hint 回填无关）。
+  if (!item) return item;
+  const it = item;
   const scenes = arrayOf(it.scenes);
   if (!scenes.length) return it;
   const reqScenes = arrayOf(it.request && it.request.scenes);
@@ -3534,6 +3672,40 @@ function withRequestHints(item) {
     return Object.assign({}, s, patch);
   });
   return changed ? Object.assign({}, it, { scenes: merged }) : it;
+}
+
+/**
+ * GET /v1/jobs/:id 的 scenes 里只有引擎/状态，没有「画什么」。
+ * 任务和配方用的是同一个 id，所以去配方文件里把分镜字段并进来，再对旧数据
+ * （hint 空、但有 manim 代码）回填一遍 —— 插件/脚本直接读任务结果时也能看到画的是什么。
+ * 轮询很频繁（1~2 秒一次），所以结果缓存在 job._libScenes 上；配方写新分镜时清掉。
+ */
+function jobScenesWithHints(job) {
+  const list = Array.isArray(job && job.scenes) ? job.scenes : [];
+  if (!list.length || !job) return list;
+  let libScenes = job._libScenes;
+  if (!libScenes) {
+    let raw = [];
+    try { raw = arrayOf((readLibrary(job.jobId) || {}).scenes); } catch { }
+    libScenes = withAutoHints(raw);
+    job._libScenes = libScenes;
+  }
+  if (!libScenes.length) return list;
+  return list.map((s, i) => {
+    const src = libScenes[i];
+    if (!src) return s;
+    return Object.assign({}, s, {
+      text: String(src.text || '').slice(0, 60),
+      narration: String(src.narration || '').slice(0, 200),
+      seconds: Number(src.seconds) || 0,
+      visual_hint: String(src.visual_hint || '').slice(0, 600),
+      visualHintAuto: Boolean(src.visualHintAuto),
+      // 只回"有没有代码"：把整段代码塞进每次轮询的响应里没必要。
+      hasManim: Boolean(src.manim && typeof src.manim.code === 'string' && src.manim.code.trim()),
+      tool: String(src.tool || ''),
+      kind: String(src.kind || ''),
+    });
+  });
 }
 
 /** 任务对外的 JSON 形状（GET /v1/jobs 与 /v1/jobs/:id 共用）。 */
@@ -3565,7 +3737,7 @@ function jobView(job) {
     credits: Number(job.credits) || 0,
     warnings: Array.isArray(job.warnings) ? job.warnings : [],
     error: job.error || '',
-    scenes: Array.isArray(job.scenes) ? job.scenes : [],
+    scenes: jobScenesWithHints(job),
     title: job.title || '',
     style: job.style || '',
     voice: job.voice || '',
@@ -4136,7 +4308,9 @@ const server = http.createServer(async (req, res) => {
       const isRerun = rest.endsWith('/rerun');
       const id = decodeURIComponent(isRerun ? rest.slice(0, -'/rerun'.length) : rest);
       if (isRerun && req.method === 'POST') {
-        const item = withRequestHints(readLibrary(id));
+        // 旧配方（hint 空、有代码）读出来先补齐「画什么」再提交：
+        // 新任务的存档、面板重做时都能看到这一场画的是什么。
+        const item = withAutoHints(withRequestHints(readLibrary(id)));
         if (!item) return json(res, 404, { ok: false, error: 'NOT_FOUND' });
         // 用保存的 request + 最终 scenes 重新提交：场景都带着 manim 代码/video.prompt，
         // prepare 不会再问模型；projectId 沿用，片段缓存与旁白缓存全部命中。
@@ -4644,6 +4818,9 @@ module.exports = {
   planAiVideoQuota, isAiVideoScene, normalizeAiPrompt, wanKeyInfo, fitAiVideoClip,
   // 三种创作入口 / 人设绑定（测试脚本直接调，不必起服务）
   splitScript, fillScenes, decideTool, estimateRender, saveDraftProject,
+  // 「画什么」回填：代码摘要 / 标题摘要 / 旧数据补齐（单测直接调）
+  manimCodeSummary, titleNarrationSummary, fillAutoHint, withAutoHints, jobScenesWithHints,
+  HINT_AUTO_SUFFIX, MANIM_ELEMENT_WORDS,
   resolveBinding, fetchPersona, fetchVoiceBinding, tonePromptLines,
   progressGet, progressStart, progressUpdate, parseSpeakFailure,
   // 任务化 + 配方库：状态机、落盘、重跑

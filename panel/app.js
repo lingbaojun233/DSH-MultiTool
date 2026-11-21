@@ -1362,8 +1362,10 @@ let sceneStickerFavOnly = false;
 let sceneStickerTimer = null;
 
 let studioTitle = '';
-// 每一场：{text, narration, seconds, visual_hint, tool, kind, manim, status, dirty}
+// 每一场：{text, narration, seconds, visual_hint, visualHintAuto, tool, kind, manim, manimHint, video, status, note, dirty}
 // tool 是用户的选择（manim / text / aivideo / ''=自动），manim 是补全后拿到的代码。
+// visualHintAuto=true 表示这句「画什么」是 studio 自动回填的（写稿模式拆出来的场次没有 hint），
+// 卡片下面会提示"这句是自动生成的"；用户一改就置 false 并清掉代码。
 let studioScenes = [];
 let studioProjectId = '';      // 老流程（studio 没有 job 接口）用的项目 id
 let studioBindingInfo = null;
@@ -1639,6 +1641,47 @@ function studioField(labelText, control, className) {
   return label;
 }
 
+/**
+ * 「画什么」下面那行小字：三种情况必须分开说，别都写成一句"还没写"。
+ *  - 真空着（也没代码）：说明这一场会按标题/旁白自动决定画什么，想指定就写一句；
+ *  - 有内容、但是 studio 自动回填的（有 ✓ 有代码）：明确告诉用户"这不是你写的"，
+ *    改它会让这一场重新生成动画 —— 否则用户会以为这句是自己以前写的；
+ *  - 有内容且是自己写的：不占地方，返回空串。
+ */
+function studioVisualHintNote(scene) {
+  const hint = String((scene && scene.visual_hint) || '').trim();
+  const auto = Boolean(scene && scene.visualHintAuto) && Boolean(scene && scene.manim && scene.manim.code);
+  if (!hint) {
+    return scene && scene.tool === 'aivideo'
+      ? '还没写「画什么」：这一场会按标题/旁白自动写 AI 画面描述。'
+      : '还没写「画什么」：这一场会按标题/旁白自动决定画什么；想指定就写一句（图形/标注/动作）。';
+  }
+  return auto ? '这句是自动生成的，改它会让这一场重新生成动画' : '';
+}
+
+/**
+ * 把上面那句话写进这一行（没话就把元素删掉）。渲染时和用户改字时都走这里，
+ * 保证「空 / 自动生成」两种提示不会停在旧文案上。
+ */
+function applyStudioHintNote(row, scene) {
+  if (!row) return;
+  const text = studioVisualHintNote(scene);
+  let note = row.querySelector('.scene-visual-empty');
+  if (!text) {
+    if (note) note.remove();
+    return;
+  }
+  if (!note) {
+    note = document.createElement('p');
+    note.className = 'scene-visual-empty muted';
+    const field = row.querySelector('.scene-visual-hint');
+    const wrap = field ? field.closest('.field') : null;
+    if (wrap && wrap.parentElement) wrap.after(note);
+    else row.append(note);
+  }
+  note.textContent = text;
+}
+
 function studioInput(type, field, value, className) {
   const el = document.createElement('input');
   el.type = type;
@@ -1749,6 +1792,8 @@ function studioBlankScene() {
     narration: '',
     seconds: 5,
     visual_hint: '',
+    // 空场次不可能有"自动回填"的 hint：必须显式 false，别让上一场的标记串过来
+    visualHintAuto: false,
     tool: '',
     kind: 'text',
     manim: null,
@@ -1855,16 +1900,10 @@ function renderStudioScenes() {
       : '自然语言描述要画什么，比如：画坐标轴、曲线上两个点，连线，然后让点靠近变成切线';
     hint.value = scene.visual_hint || '';
     row.append(studioField(scene.tool === 'aivideo' ? '画什么（AI 生成画面的提示词）' : '画什么（会翻译成 manim 代码）', hint));
-    // 空的时候不能只留一个空框：旧配方 / 写稿拆出来的场次都可能没有「画什么」，
-    // 用户看到的应该是一句可操作的提示，而不是一片空白。
-    if (!String(scene.visual_hint || '').trim()) {
-      const empty = document.createElement('p');
-      empty.className = 'scene-visual-empty muted';
-      empty.textContent = scene.tool === 'aivideo'
-        ? '还没写「画什么」：这一场会按标题/旁白自动写 AI 画面描述。'
-        : '还没写「画什么」：这一场会按标题/旁白自动决定画什么；想指定就写一句（图形/标注/动作）。';
-      row.append(empty);
-    }
+    // 「画什么」下面那行小字：空着 / 自动回填的 / 自己写的，三种情况分开说。
+    // 写稿拆出来的场次、旧配方都可能没有「画什么」，不能只留一个空框；
+    // 自动回填的更要标出来 —— 用户得知道这行字不是自己写的，改它会重新生成动画。
+    applyStudioHintNote(row, scene);
 
     // 这一场的参考图（可选）：按钮 + 缩略图 + 去掉
     const imageBox = document.createElement('div');
@@ -1953,9 +1992,13 @@ function onStudioSceneEdit(event) {
       // 「画什么」或工具变了，旧代码就过时了：下次会用新的重新生成。
       scene.dirty = true;
       scene.status = field === 'tool' && control.value === 'text' ? 'text' : 'pending';
-      // 关键一行：把旧 manim 代码丢掉。不清的话提交时会原样带回 studio，
-      // studio 看到 code 就沿用 —— 用户改了描述却还是按上一次的画（实测 bug）。
-      if (field === 'visual_hint') scene.manim = null;
+      if (field === 'visual_hint') {
+        // 用户亲手改了这句：自动回填的标记作废（下面那行小字要立刻跟着变）
+        scene.visualHintAuto = false;
+        // 关键一行：把旧 manim 代码丢掉。不清的话提交时会原样带回 studio，
+        // studio 看到 code 就沿用 —— 用户改了描述却还是按上一次的画（实测 bug）。
+        scene.manim = null;
+      }
       // AI 生成场的旧英文 prompt 也不再对应用户新写的描述，清掉才会重新翻译
       if (field === 'visual_hint' && scene.tool === 'aivideo') scene.video = null;
     }
@@ -1965,6 +2008,8 @@ function onStudioSceneEdit(event) {
       if (control.value !== 'aivideo' && scene.note === STUDIO_AI_QUOTA_NOTE) scene.note = '';
       applySceneNote(row, scene);
     }
+    // 「画什么」/工具变了：那行小字（空 / 自动生成）可能也要换说法
+    if (field === 'visual_hint' || field === 'tool') applyStudioHintNote(row, scene);
   }
   // 用户动过表格 → 以后「开始做」优先用这份分镜
   studioScenesTouched = true;
@@ -2461,6 +2506,9 @@ function studioPlanFromScenes() {
       manim: useManim ? s.manim : null,
     };
     if (useManim) out.manimHint = String(s.manimHint || '');
+    // 自动回填的「画什么」标记也带回去：studio 会原样写进项目/配方，
+    // 下次载入时面板还能认出"这句是自动生成的"（改过的场 dirty，不该带）。
+    if (useManim && !s.dirty && s.visualHintAuto) out.visualHintAuto = true;
     // 没改过的场照旧带上 kind（studio 可直通，不重算引擎）；改过的场故意不带：
     // 否则 kind:'text' 会让 studio 的 scenesLookFinal 误判成"已经补全"，又跳过重新生成。
     if (!s.dirty) out.kind = useManim ? 'manim' : 'text';
@@ -2504,6 +2552,9 @@ function adoptStudioScenes(data) {
       // 只有 video.prompt 没有「画什么」时，把英文 prompt 显示在输入框里，
       // 让用户看得见真正会送去生成的那句话（改它就会重新翻译）。
       visual_hint: String((s && s.visual_hint) || (hasVideo ? videoPrompt : '')),
+      // studio 自动回填的「画什么」：卡片下面那行小字要改成"这句是自动生成的"。
+      // 没有代码的场次不算（标记不能脱离代码单独存在）。
+      visualHintAuto: Boolean(s && s.visualHintAuto) && hasManim,
       tool,
       kind: hasManim ? 'manim' : (wantsAi ? 'aivideo' : 'text'),
       // 顺手带上代码对应的「画什么」戳：studio 靠它判断这段代码有没有过期。
