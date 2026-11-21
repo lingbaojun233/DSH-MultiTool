@@ -196,7 +196,10 @@ async function personaBlock(options = {}) {
  */
 let catalogCache = { at: 0, block: null, modules: [] };
 function registryBlock(options = {}) {
-  if (options.registry === false) return null;
+  // 默认不注入。模块目录（约 66 token/轮）在插件提供了同名工具之后就重复了：
+  // 模型看得到 watch / hear / send_sticker 这些工具，不需要再读一份"有哪些模块"的散文。
+  // 需要时显式传 { registry: true } 打开（排查"模型不知道某模块存在"时用）。
+  if (options.registry !== true) return null;
   if (Date.now() - catalogCache.at < 60000) return catalogCache.block;
 
   try {
@@ -282,7 +285,7 @@ function composePrompt({ catalog, persona, user, history, task, stickers, attach
 
   if (Array.isArray(history) && history.length) {
     const lines = ['[最近对话 · 用于理解指代与言外之意]'];
-    for (const turn of history.slice(-8)) {
+    for (const turn of history.slice(-6)) {
       const who = turn.role === 'user' ? '用户' : 'DSH';
       lines.push(`${who}：${String(turn.text || '').slice(0, 500)}`);
     }
@@ -315,9 +318,15 @@ async function recordTurn(task, answer, options = {}) {
       counterpart,
     },
   ];
-  if (answer && String(answer).trim()) {
+  // 表情标记只是给界面看的指令，不该进记忆 —— 否则下次召回时会把 "[sticker:xxx]"
+  // 当成正文再喂回模型，既白付字符又可能让它以为要再发一张。
+  const cleanAnswer = String(answer || '')
+    .replace(/[ \t]*[\[【]\s*(?:sticker\s*[:：]\s*[0-9a-z][0-9a-z_-]{2,63}|收藏这张)\s*[\]】]/gi, '')
+    .trim();
+
+  if (cleanAnswer) {
     events.push({
-      content: String(answer),
+      content: cleanAnswer,
       evidence: `chat:${sessionId}#d${stamp}`,
       channel: 'chat',
       group_id: sessionId,

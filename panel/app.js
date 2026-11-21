@@ -307,16 +307,11 @@ const micBtn = document.getElementById('mic');
 let recorder = null;
 let recordChunks = [];
 
-function blobToBase64(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const s = String(reader.result || '');
-      resolve(s.slice(s.indexOf(',') + 1));
-    };
-    reader.onerror = () => reject(new Error('读不到录音'));
-    reader.readAsDataURL(blob);
-  });
+/** 录音只在浏览器里生成 webm/ogg：落盘名跟着容器走，kind 则明确告诉服务端是 audio。 */
+function recordingFileName(type) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(11, 19);
+  const ext = String(type || '').includes('ogg') ? 'ogg' : String(type || '').includes('wav') ? 'wav' : 'webm';
+  return `录音-${stamp}.${ext}`;
 }
 
 async function startRecording() {
@@ -334,25 +329,17 @@ async function startRecording() {
       stream.getTracks().forEach((t) => t.stop());
       micBtn.classList.remove('recording');
       micBtn.textContent = '…';
-      const blob = new Blob(recordChunks, { type: recorder.mimeType || 'audio/webm' });
+      const type = recorder.mimeType || 'audio/webm';
+      const blob = new Blob(recordChunks, { type });
       recorder = null;
       try {
-        const audioBase64 = await blobToBase64(blob);
-        const r = await apiJson('/api/asr', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ audioBase64, mime: blob.type || 'audio/webm' }),
-        });
-        if (r && r.ok && r.text) {
-          inputEl.value = (inputEl.value ? inputEl.value + ' ' : '') + r.text;
-          autoGrow();
-          inputEl.focus();
-          micBtn.title = `识别用时 ${r.ms || '?'}ms`;
-        } else {
-          micBtn.title = '没听清：' + ((r && r.error) || '未知');
-        }
+        // 录音不再先转文字填输入框：原声直接当一个 audio 附件挂在这条消息上，
+        // 让模型自己决定 hear / transcribe（少一次 ASR 调用，也不打断说话）。
+        const file = new File([blob], recordingFileName(type), { type: type || 'audio/webm' });
+        addAttachment(file, 'audio');
+        micBtn.title = '录音已挂上，和文字一起发';
       } catch (err) {
-        micBtn.title = '听写出错：' + (err && err.message || err);
+        micBtn.title = '录音处理失败：' + (err && err.message || err);
       } finally {
         micBtn.textContent = '🎤';
       }
@@ -646,7 +633,11 @@ async function loadHistory() {
           addMessage('assistant', '', '', { sticker: id });
         }
       } else if (m.role === 'user') {
-        addMessage('user', m.text || '', formatClock(m.ts), m.sticker ? { sticker: m.sticker } : undefined);
+        // 历史里的用户消息：附件只剩元数据（文件已经删了），但链接还拼得出来
+        addUserMessage(m.text || '', formatClock(m.ts), {
+          sticker: m.sticker ? { id: m.sticker, label: m.stickerLabel || '' } : null,
+          attachments: Array.isArray(m.attachments) ? m.attachments : [],
+        });
       } else {
         addMessage('error', m.text || '（错误）', formatClock(m.ts));
       }
@@ -675,181 +666,436 @@ async function refreshHealth() {
   }
 }
 
-// ------------------------------------------------------- 聊天里的附件（视频） --
+// ------------------------------------- 聊天里的附件（什么都能发） --
 
 const attachBtn = document.getElementById('attach');
 const attachFile = document.getElementById('attachFile');
 const attachList = document.getElementById('attachList');
-let pendingVideo = null;
+const composerHint = document.querySelector('.composer-actions .hint');
 
-function renderAttachChip() {
-  if (!attachList) return;
-  attachList.innerHTML = '';
-  if (!pendingVideo) {
-    attachList.classList.add('hidden');
+// 待发送的附件：顺序就是用户挑的顺序；发送时整体快照，再清空
+let attachments = [];      // [{ key, file, name, kind, size, kindHint }]
+let pickedSticker = null;  // { id, mood } —— 表情和文字一起发，不再单独发一轮
+let uploading = false;
+
+const KIND_ICON = { video: '🎬', audio: '🎵', image: '🖼️', text: '📄', other: '📦' };
+const MAX_ATTACHMENTS = 10; // io 那边也只收 10 个，这里先挡住
+
+// 和 server.js 的 KIND_BY_EXT 同一张表：前端只用来挑图标，
+// 真正的 kind 由服务端按扩展名再判一次（录音会显式带上 kind=audio）。
+const KIND_BY_EXT = {
+  '.mp4': 'video', '.mov': 'video', '.mkv': 'video', '.webm': 'video', '.avi': 'video',
+  '.mp3': 'audio', '.wav': 'audio', '.m4a': 'audio', '.ogg': 'audio', '.flac': 'audio', '.aac': 'audio',
+  '.png': 'image', '.jpg': 'image', '.jpeg': 'image', '.gif': 'image', '.webp': 'image', '.bmp': 'image',
+  '.txt': 'text', '.md': 'text', '.json': 'text', '.csv': 'text', '.log': 'text', '.srt': 'text',
+  '.js': 'text', '.ts': 'text', '.py': 'text', '.ps1': 'text', '.yaml': 'text', '.yml': 'text',
+};
+
+function kindOfName(name) {
+  const s = String(name || '');
+  const i = s.lastIndexOf('.');
+  const ext = i >= 0 ? s.slice(i).toLowerCase() : '';
+  return KIND_BY_EXT[ext] || 'other';
+}
+
+function formatBytes(n) {
+  const b = Number(n) || 0;
+  if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MB';
+  if (b >= 1024) return Math.round(b / 1024) + ' KB';
+  return b + ' B';
+}
+
+function fmtClock(sec) {
+  const s = Math.max(0, Math.round(sec));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+// 底栏那句提示平时说明快捷键；出错/超限时临时借用，几秒后自己换回来
+let hintTimer = null;
+function flashHint(text) {
+  if (!composerHint) return;
+  composerHint.textContent = text;
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { composerHint.textContent = 'Ctrl+Enter 发送 · Enter 换行'; }, 2600);
+}
+
+/** 挑一个文件：kind 按扩展名猜，录音这类容器与内容不一致的由调用方显式指定。 */
+function addAttachment(file, kindOverride) {
+  if (!file) return;
+  if (attachments.length >= MAX_ATTACHMENTS) {
+    flashHint(`一次最多挂 ${MAX_ATTACHMENTS} 个文件`);
     return;
   }
-  attachList.classList.remove('hidden');
+  const name = file.name || 'upload.bin';
+  attachments.push({
+    key: (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : `a${Date.now()}${Math.random().toString(36).slice(2, 6)}`,
+    file,
+    name,
+    kind: kindOverride || kindOfName(name),
+    kindHint: kindOverride || '',
+    size: Number(file.size) || 0,
+  });
+  renderAttachChips();
+}
 
-  const chip = document.createElement('div');
-  chip.className = 'attach-chip';
+/** 输入框上方那排 chip：每个附件一张，带图标/名字/大小，可单独移除；上传时下面再挂总进度。 */
+function renderAttachChips() {
+  if (!attachList) return;
+  attachList.innerHTML = '';
+  const has = attachments.length || pickedSticker || uploading;
+  attachList.classList.toggle('hidden', !has);
+  if (!has) return;
 
+  for (const a of attachments) {
+    const chip = document.createElement('div');
+    chip.className = `attach-chip ${a.kind}`;
+
+    const icon = document.createElement('span');
+    icon.className = 'attach-icon';
+    icon.textContent = KIND_ICON[a.kind] || KIND_ICON.other;
+
+    const name = document.createElement('span');
+    name.className = 'attach-name';
+    name.textContent = a.name;
+    name.title = a.name;
+
+    const size = document.createElement('span');
+    size.className = 'attach-size';
+    size.textContent = formatBytes(a.size);
+
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'attach-x';
+    remove.textContent = '×';
+    remove.title = '移除';
+    remove.onclick = () => {
+      attachments = attachments.filter((x) => x.key !== a.key);
+      renderAttachChips();
+    };
+
+    chip.append(icon, name, size, remove);
+    attachList.appendChild(chip);
+  }
+
+  if (pickedSticker) {
+    const chip = document.createElement('div');
+    chip.className = 'attach-chip sticker';
+    const icon = document.createElement('span');
+    icon.className = 'attach-icon';
+    icon.textContent = '😀';
+    const name = document.createElement('span');
+    name.className = 'attach-name';
+    name.textContent = `表情：${pickedSticker.mood || '表情'}`;
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'attach-x';
+    remove.textContent = '×';
+    remove.title = '移除';
+    remove.onclick = () => { pickedSticker = null; renderAttachChips(); };
+    chip.append(icon, name, remove);
+    attachList.appendChild(chip);
+  }
+
+  // 多文件时是"已发字节 / 总字节"，单文件时百分比也一样准，所以只留这一种进度条
+  if (uploading) {
+    const row = document.createElement('div');
+    row.className = 'attach-total';
+    const label = document.createElement('span');
+    label.className = 'attach-total-label';
+    label.id = 'attachTotalLabel';
+    label.textContent = '上传 0%';
+    const wrap = document.createElement('div');
+    wrap.className = 'attach-bar';
+    const bar = document.createElement('div');
+    bar.className = 'attach-bar-fill';
+    bar.id = 'attachTotalBar';
+    wrap.appendChild(bar);
+    row.append(label, wrap);
+    attachList.appendChild(row);
+  }
+}
+
+function setUploadProgress(frac) {
+  const bar = document.getElementById('attachTotalBar');
+  const label = document.getElementById('attachTotalLabel');
+  const pct = Math.round(Math.max(0, Math.min(1, frac)) * 100);
+  if (bar) bar.style.width = pct + '%';
+  if (label) label.textContent = `上传 ${pct}%`;
+}
+
+/** 单个文件 PUT 直传（XHR 才有上传进度）；不走 base64，也不整包读进内存。 */
+function uploadFile(item, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const hint = item.kindHint ? `&kind=${encodeURIComponent(item.kindHint)}` : '';
+    xhr.open('PUT', `/api/upload?name=${encodeURIComponent(item.name)}&size=${item.size}${hint}`);
+    const h = authHeaders({});
+    Object.keys(h).forEach((k) => xhr.setRequestHeader(k, h[k]));
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total);
+    };
+    xhr.onload = () => {
+      let data = null;
+      try { data = JSON.parse(xhr.responseText); } catch { }
+      if (!data) return reject(new Error('服务器返回不是 JSON'));
+      if (!data.ok) return reject(new Error(data.error || `HTTP ${xhr.status}`));
+      resolve(data);
+    };
+    xhr.onerror = () => reject(new Error('上传失败（网络中断或面板不可达）'));
+    xhr.ontimeout = () => reject(new Error('上传超时'));
+    xhr.send(item.file);
+  });
+}
+
+/**
+ * 串行上传，进度按总字节算：多文件时用户想看到的是"这一条消息发了多少"，
+ * 而不是每个文件各自从 0 跳到 100。
+ */
+async function uploadAll(items, onProgress) {
+  const total = items.reduce((sum, it) => sum + (it.size || 0), 0) || 1;
+  let done = 0;
+  const ids = [];
+  for (const it of items) {
+    const data = await uploadFile(it, (frac) => {
+      if (onProgress) onProgress((done + (it.size || 0) * frac) / total);
+    });
+    done += it.size || 0;
+    if (onProgress) onProgress(done / total);
+    ids.push(data.uploadId);
+  }
+  return ids;
+}
+
+/** 读音频时长；浏览器解不了就 reject，气泡那边会退回"只显示文件名"。 */
+function probeAudioDuration(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const audio = document.createElement('audio');
+    audio.preload = 'metadata';
+    audio.onloadedmetadata = () => {
+      const sec = audio.duration;
+      URL.revokeObjectURL(url);
+      resolve(Number.isFinite(sec) ? sec : 0);
+    };
+    audio.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('读不到时长'));
+    };
+    audio.src = url;
+  });
+}
+
+/**
+ * 气泡里的一个附件。刚发出去的有本地 File（能做缩略图/时长），
+ * 从历史回放的只有名字；两者用同一个节点，结构不会因为刷新而变样。
+ */
+function userFileCard(info) {
+  const kind = info.kind || 'other';
+  const card = document.createElement('a');
+  card.className = `bubble-file ${kind}`;
+  card.title = info.name || '';
+  // 有 uploadId 才给链接：预览路由凭 UUID，能看原图/原文件；文件被清掉就是 404
+  if (info.uploadId) {
+    card.href = `/api/upload/${encodeURIComponent(info.uploadId)}`;
+    card.target = '_blank';
+    card.rel = 'noopener';
+  }
+
+  // 图片：本地 File 直接出缩略图。发送后服务端会删文件，所以缩略图必须靠本地 blob，
+  // 不能指望 /api/upload/:id —— 那正是"点开看原图"用的，不是缩略图用的。
+  if (kind === 'image' && info.file) {
+    const img = document.createElement('img');
+    img.className = 'bubble-thumb';
+    img.alt = info.name || '图片';
+    img.loading = 'lazy';
+    img.src = URL.createObjectURL(info.file);
+    card.appendChild(img);
+    return card;
+  }
+  if (kind === 'image' && info.uploadId) {
+    const img = document.createElement('img');
+    img.className = 'bubble-thumb';
+    img.alt = info.name || '图片';
+    img.loading = 'lazy';
+    img.src = `/api/upload/${encodeURIComponent(info.uploadId)}`;
+    card.appendChild(img);
+    return card;
+  }
+
+  const icon = document.createElement('span');
+  icon.className = 'bubble-file-icon';
+  icon.textContent = KIND_ICON[kind] || KIND_ICON.other;
+
+  const body = document.createElement('span');
+  body.className = 'bubble-file-meta';
   const name = document.createElement('span');
-  name.className = 'attach-name';
-  name.textContent = `🎬 ${pendingVideo.name} · ${(pendingVideo.size / 1048576).toFixed(1)} MB`;
-  chip.appendChild(name);
+  name.className = 'bubble-file-name';
+  name.textContent = info.name || '文件';
+  const sub = document.createElement('span');
+  sub.className = 'bubble-file-sub';
+  sub.textContent = formatBytes(info.size);
+  body.append(name, sub);
+  card.append(icon, body);
 
-  const barWrap = document.createElement('div');
-  barWrap.className = 'attach-bar';
-  const bar = document.createElement('div');
-  bar.className = 'attach-bar-fill';
-  barWrap.appendChild(bar);
-  chip.appendChild(barWrap);
-
-  const remove = document.createElement('button');
-  remove.type = 'button';
-  remove.className = 'attach-x';
-  remove.textContent = '×';
-  remove.title = '移除';
-  remove.onclick = () => { pendingVideo = null; renderAttachChip(); };
-  chip.appendChild(remove);
-
-  attachList.appendChild(chip);
-}
-
-function updateAttachProgress(frac) {
-  const bar = attachList && attachList.querySelector('.attach-bar-fill');
-  if (bar) bar.style.width = Math.max(0, Math.min(1, frac)) * 100 + '%';
-}
-
-/** 把附件小条塞进这条用户消息的气泡里（刷新历史后就没有了，历史只存文字）。 */
-function attachChipTo(wrap, label) {
-  const bubble = wrap.querySelector('.bubble');
-  if (!bubble) return;
-  const chip = document.createElement('div');
-  chip.className = 'bubble-attach';
-  chip.textContent = '🎬 ' + label;
-  bubble.insertBefore(chip, bubble.firstChild);
-}
-
-/** 回复下面挂一份"模型看到的/听到的"，默认收起。 */
-function attachVideoDetails(wrap, analysis) {
-  if (!analysis || !wrap) return;
-  const box = document.createElement('details');
-  box.className = 'msg-details';
-  const sum = document.createElement('summary');
-  sum.textContent = '它看到了什么';
-  box.appendChild(sum);
-
-  const body = document.createElement('div');
-  body.className = 'muted';
-  const lines = [];
-  if (analysis.synopsis) lines.push('画面：' + analysis.synopsis);
-  if (analysis.audio && analysis.audio.ok) {
-    if (analysis.audio.transcript) lines.push('听到的话：' + analysis.audio.transcript);
-    if (analysis.audio.summary) lines.push('声音：' + analysis.audio.summary);
+  // 音频有时长就补上；拿不到就只显示文件名，够用了
+  if (kind === 'audio' && info.file) {
+    probeAudioDuration(info.file).then((sec) => {
+      if (sec > 0) sub.textContent = `${fmtClock(sec)} · ${formatBytes(info.size)}`;
+    }).catch(() => { });
   }
-  if (Array.isArray(analysis.timeline) && analysis.timeline.length) {
-    lines.push('时间线：' + analysis.timeline.map((t) => `${t.t} ${t.what}`).join('；'));
-  }
-  body.textContent = lines.join('\n');
-  box.appendChild(body);
-  wrap.appendChild(box);
+  return card;
 }
 
-async function sendWithVideo(text) {
-  const file = pendingVideo;
-  busy = true;
-  sendBtn.disabled = true;
-  inputEl.value = '';
-  autoGrow();
+/**
+ * 一条用户消息 = 一个气泡组。
+ * 文字、表情、附件都塞进同一个 .bubble —— 拆成多条气泡的话，
+ * 回看时就分不清哪些东西是"一起发出去"的了。
+ */
+function addUserMessage(text, meta, opts = {}) {
+  const placeholder = logEl.querySelector('.empty');
+  if (placeholder) placeholder.remove();
 
-  const userWrap = addMessage('user', text || '（发了段视频）', formatClock(Date.now()));
-  attachChipTo(userWrap, file.name);
-  const pending = addPending();
-  const started = performance.now();
+  const wrap = document.createElement('div');
+  wrap.className = 'msg user';
 
-  try {
-    setStatus('busy', '上传视频 0%…');
-    const up = await uploadVideoFile(file, (frac) => {
-      updateAttachProgress(frac);
-      setStatus('busy', `上传视频 ${Math.round(frac * 100)}%…`);
-    });
-    setStatus('busy', '抽帧、听声音、让它看…');
-    updateAttachProgress(1);
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
 
-    const data = await apiJson('/api/video/analyze-file', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ uploadId: up.uploadId, text, frames: 6 }),
-    });
-    pending.remove();
+  if (opts.sticker && opts.sticker.id) {
+    const img = document.createElement('img');
+    img.className = 'bubble-sticker';
+    img.alt = opts.sticker.label ? `表情：${opts.sticker.label}` : '表情';
+    img.title = img.alt;
+    img.loading = 'lazy';
+    img.src = `/api/stickers/gif?id=${encodeURIComponent(opts.sticker.id)}`;
+    bubble.appendChild(img);
+    bubble.classList.add('has-sticker');
+  }
 
-    if (data && data.ok) {
-      const ms = Math.round(performance.now() - started);
-      const replyWrap = await addReplySeries(data.reply || '（空答案）',
-        `${(ms / 1000).toFixed(1)} 秒${data.tokens ? ' · ' + data.tokens.total + ' token' : ''} · ${formatClock(Date.now())}`);
-      attachVideoDetails(replyWrap, data.analysis);
-    } else {
-      addMessage('error', (data && (data.error || data.code)) || '看视频失败');
+  if (text) {
+    const textEl = document.createElement('div');
+    textEl.className = 'bubble-text';
+    textEl.textContent = text;
+    bubble.appendChild(textEl);
+  }
+
+  const files = Array.isArray(opts.files) ? opts.files : [];
+  const saved = Array.isArray(opts.attachments) ? opts.attachments : [];
+  if (files.length || saved.length) {
+    const list = document.createElement('div');
+    list.className = 'bubble-files';
+    for (const it of files) {
+      list.appendChild(userFileCard({ name: it.name, kind: it.kind, size: it.size, file: it.file }));
     }
-  } catch (err) {
-    pending.remove();
-    addMessage('error', String(err && err.message ? err.message : err));
-  } finally {
-    pendingVideo = null;
-    renderAttachChip();
-    busy = false;
-    sendBtn.disabled = !currentUser;
-    setStatus('', '');
-    refreshHealth();
-    if (currentUser) inputEl.focus();
+    for (const it of saved) {
+      list.appendChild(userFileCard({ name: it.name, kind: it.kind, size: it.bytes, uploadId: it.uploadId }));
+    }
+    bubble.appendChild(list);
+  }
+
+  wrap.appendChild(bubble);
+
+  if (meta) {
+    const metaEl = document.createElement('div');
+    metaEl.className = 'meta';
+    metaEl.textContent = meta;
+    wrap.appendChild(metaEl);
+  }
+
+  logEl.appendChild(wrap);
+  logEl.scrollTop = logEl.scrollHeight;
+  return wrap;
+}
+
+/**
+ * 发完之后服务端才给出 uploadId：把气泡里那几张卡片补上"点开看原件"的链接。
+ * 顺序和上传顺序一致（服务端按 uploadIds 原序返回）。
+ */
+function wireSentAttachmentLinks(wrap, links) {
+  if (!wrap || !Array.isArray(links) || !links.length) return;
+  const cards = wrap.querySelectorAll('.bubble-files .bubble-file');
+  for (let i = 0; i < cards.length && i < links.length; i++) {
+    const link = links[i];
+    if (!link || !link.link) continue;
+    cards[i].href = link.link;
+    cards[i].target = '_blank';
+    cards[i].rel = 'noopener';
+    cards[i].title = link.name || '';
   }
 }
 
 if (attachBtn) {
   attachBtn.addEventListener('click', () => attachFile.click());
   attachFile.addEventListener('change', () => {
-    const f = attachFile.files && attachFile.files[0];
-    if (f) { pendingVideo = f; renderAttachChip(); }
+    const files = Array.from(attachFile.files || []);
+    // 先清 value：连着选同一个文件两次也要能触发 change
     attachFile.value = '';
+    for (const f of files) addAttachment(f);
   });
 }
 
+/**
+ * 发送：一条消息只调一次 /api/message。
+ * 先把附件传完拿到 uploadIds，再把「文字 + uploadIds + stickerId」合成一个请求；
+ * 表情不再是"另一条消息"，所以发"文字 + 表情"只会回一次。
+ */
 async function send() {
+  if (busy) return;
   const text = inputEl.value.trim();
-  if ((!text && !pendingVideo) || busy) return;
+  const files = attachments.slice();
+  const sticker = pickedSticker;
+  if (!text && !files.length && !sticker) return;
   if (!currentUser) {
     showAuth('login', '请先登录');
     return;
   }
-  if (pendingVideo) return sendWithVideo(text);
 
   busy = true;
   sendBtn.disabled = true;
-  setStatus('busy', '处理中…');
+  // 内容已经拿在手上了：输入框清空，选择也清空，界面上不留第二份
   inputEl.value = '';
   autoGrow();
+  attachments = [];
+  pickedSticker = null;
+  uploading = files.length > 0;
+  renderAttachChips();
 
   // 把最近几轮带上去，模型才能读出指代与言外之意
   const history = recentTurns.slice(-6);
-  addMessage('user', text, formatClock(Date.now()));
-  recentTurns.push({ role: 'user', text });
+  const userWrap = addUserMessage(text, formatClock(Date.now()), { files, sticker });
   const pending = addPending();
   const started = performance.now();
+  let delivered = false;
 
   try {
-    const res = await apiFetch('/api/input', {
+    let uploadIds = [];
+    if (files.length) {
+      setStatus('busy', '上传 0%…');
+      uploadIds = await uploadAll(files, (frac) => {
+        setUploadProgress(frac);
+        setStatus('busy', `上传 ${Math.round(frac * 100)}%…`);
+      });
+    }
+    uploading = false;
+    renderAttachChips();
+    setStatus('busy', files.length || sticker ? '让它看看…' : '处理中…');
+
+    const res = await apiFetch('/api/message', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      // 带上表情目录，模型才可能输出 [sticker:<id>]；目录没加载就不传
-      body: JSON.stringify({ text, sessionId: getSessionId(), history, stickers: stickerCatalog() }),
+      // 不再带 stickers 目录：模型有 send_sticker 工具，80 条目录纯属白烧 token
+      body: JSON.stringify({
+        text,
+        uploadIds,
+        stickerId: sticker ? sticker.id : '',
+        stickerMood: sticker ? sticker.mood : '',
+        sessionId: getSessionId(),
+        history,
+      }),
     });
 
     if (res.status === 401) {
       pending.remove();
-      // 这轮没送到核心，别留在上下文里
-      if (recentTurns.length && recentTurns[recentTurns.length - 1].text === text) recentTurns.pop();
       handleUnauthorized('会话过期，请重新登录');
       return;
     }
@@ -858,25 +1104,36 @@ async function send() {
     pending.remove();
 
     if (data.ok) {
+      delivered = true;
       const ms = typeof data.ms === 'number' ? data.ms : Math.round(performance.now() - started);
+      recentTurns.push({ role: 'user', text });
       recentTurns.push({ role: 'assistant', text: data.answer || '' });
       if (recentTurns.length > 12) recentTurns.splice(0, recentTurns.length - 12);
-      await addReplySeries(data.answer || '（空答案）', `${(ms / 1000).toFixed(1)} 秒${usageNote(data.usage)} · ${formatClock(Date.now())}`);
+      // 服务端把这次用到的附件 id 带回来了：给气泡里的卡片补上可点的原件链接
+      wireSentAttachmentLinks(userWrap, data.attachments);
+      await addReplySeries(data.answer || '（空答案）',
+        `${(ms / 1000).toFixed(1)} 秒${usageNote(data.usage)} · ${formatClock(Date.now())}`);
       // 插件在这一轮里"做了点什么"：发张表情、念一段。模型自己碰不到界面，靠这里落地。
       applyActions(data.actions);
     } else {
-      const detail = data.exitCode != null ? `exit=${data.exitCode}` : '';
-      addMessage('error', data.error || data.code || '请求失败', detail);
+      addMessage('error', data.error || data.code || '请求失败', '');
     }
   } catch (err) {
     pending.remove();
     addMessage('error', String(err && err.message ? err.message : err));
   } finally {
+    uploading = false;
     busy = false;
     sendBtn.disabled = !currentUser;
+    // 没送到就不要偷偷把附件丢掉：还回去，改一下再发，不用重新挑文件
+    if (!delivered && (files.length || sticker) && !attachments.length && !pickedSticker) {
+      attachments = files;
+      pickedSticker = sticker;
+    }
+    renderAttachChips();
+    setStatus('', '');
     refreshHealth();
     if (currentUser) inputEl.focus();
-  loadAdminPanel();
   }
 }
 

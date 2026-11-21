@@ -49,9 +49,6 @@
         <div id="stickerPanel" class="sticker-panel hidden">
           <div class="sticker-head">
             <input id="stickerSearch" placeholder="找个表情：不想上班 / 开心 / 睡觉" />
-            <label class="sticker-look" title="抽一帧交给视觉模型看，准确但慢一点（每次多一次识图）">
-              <input id="stickerLook" type="checkbox" /> 看图
-            </label>
             <button id="stickerClose" class="iconbtn" type="button" title="收起">✕</button>
           </div>
           <div class="sticker-tabs" role="tablist" aria-label="表情分类">
@@ -62,12 +59,12 @@
           <p id="stickerHint" class="muted"></p>
         </div>
         <div id="attachList" class="attach-list hidden"></div>
-        <textarea id="input" rows="3" placeholder="输入内容… 也可以先点 📎 挂一段视频" spellcheck="false"></textarea>
+        <textarea id="input" rows="3" placeholder="输入内容… 也可以挂图片 / 视频 / 音频 / 文档（可多选）" spellcheck="false"></textarea>
         <div class="composer-actions">
-          <button id="attach" class="iconbtn" type="button" title="挂一个视频（发送时会抽帧并听声音）">📎</button>
+          <button id="attach" class="iconbtn" type="button" title="添加文件：图片 / 视频 / 音频 / 文档，可多选">📎</button>
           <button id="mic" class="iconbtn mic" type="button" title="按住说话：点一下开始录，再点一下结束">🎤</button>
-          <button id="stickerBtn" class="iconbtn" type="button" title="表情包">😀</button>
-          <input id="attachFile" type="file" accept="video/*" hidden />
+          <button id="stickerBtn" class="iconbtn" type="button" title="挑一张表情，和文字一起发">😀</button>
+          <input id="attachFile" type="file" multiple hidden />
           <span class="hint">Ctrl+Enter 发送 · Enter 换行</span>
           <button id="send" class="primary">发送</button>
         </div>
@@ -88,56 +85,15 @@
       </div>
     </section>
 
-    <!-- 视频：本地拖入（浏览器抽帧）或贴链接 -->
+    <!-- 视频页只剩"做视频"：想看视频内容，改成在聊天里直接发文件 -->
     <section id="view-video" class="view" role="tabpanel">
       <div class="pane">
-        <section class="card">
-          <h2>让它看视频</h2>
-          <div id="videoDrop" class="drop">
-            <p>把视频拖到这里，或 <button id="videoPick" class="linkbtn" type="button">选一个文件</button></p>
-            <p class="muted" id="videoDropHint">本地视频只在本机抽帧，原文件不会上传</p>
-            <input id="videoFile" type="file" accept="video/*" hidden />
-          </div>
-
-          <label class="checkline">
-            <input type="checkbox" id="videoAudio" checked />
-            <span>连声音一起听（上传原片：能听出响动、配乐、静音）</span>
-          </label>
-          <div class="progress hidden" id="videoProgress"><div class="bar" id="videoBar"></div></div>
-
-          <label class="field">
-            <span>想让我注意什么（可不填）</span>
-            <input id="videoText" placeholder="比如：他为什么输了 / 这段值不值得看" />
-          </label>
-
-          <div class="row">
-            <label class="field small">
-              <span>帧数</span>
-              <select id="videoFrames">
-                <option value="6">6</option>
-                <option value="8" selected>8</option>
-                <option value="12">12</option>
-                <option value="16">16</option>
-              </select>
-            </label>
-            <button id="videoGo" class="primary" type="button" disabled>看这个视频</button>
-          </div>
-
-          <div class="divider"><span>或者贴链接</span></div>
-          <div class="row">
-            <input id="videoUrl" placeholder="https:// 视频页面地址" />
-            <button id="videoUrlGo" class="primary" type="button">看链接</button>
-          </div>
-          <p class="muted" id="videoUrlHint">链接由服务器下载后抽帧，需要几十秒</p>
-        </section>
-
-        <section class="card hidden" id="videoFramesCard">
-          <h2>抽到的帧</h2>
-          <div id="videoFramesStrip" class="frames"></div>
-        </section>
+        <p class="view-note muted">
+          做视频：先让核心写好分镜，再交给 ffmpeg 渲染。想看视频内容？直接在聊天里发视频文件就行。
+        </p>
 
         <section class="card" id="studioCard">
-          <h2>让它做一段视频</h2>
+          <h2>做视频</h2>
           <label class="field">
             <span>想要什么样的</span>
             <input id="studioPrompt" placeholder="比如：做一段 12 秒的短片，讲讲下雨天不想出门" />
@@ -180,18 +136,6 @@
             <button id="studioRender" class="primary" type="button">重新渲染</button>
           </div>
           <p class="muted" id="sceneHint">改完点「重新渲染」——不过 ffmpeg 是整段重渲，改一句也要重来一次。</p>
-        </section>
-
-        <section class="card hidden" id="videoResultCard">
-          <h2>大肥鱼说</h2>
-          <div id="videoReply" class="reply"></div>
-          <details id="videoDetails">
-            <summary>画面描述（模型看到的内容）</summary>
-            <div id="videoSynopsis" class="muted"></div>
-            <ul id="videoTimeline" class="timeline"></ul>
-            <div id="videoAudio" class="audioNote"></div>
-            <div id="videoOnScreen" class="muted"></div>
-          </details>
         </section>
       </div>
     </section>

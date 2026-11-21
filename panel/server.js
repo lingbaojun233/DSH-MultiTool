@@ -40,7 +40,7 @@ const STICKER_BASE = process.env.DSH_STICKER_URL || 'http://127.0.0.1:8773';
 const UPLOAD_DIR = process.env.DSH_UPLOAD_DIR || path.join(__dirname, '..', 'data', 'uploads');
 const UPLOAD_TTL_MS = 30 * 60 * 1000;
 const UPLOAD_MAX_BYTES = Number(process.env.DSH_UPLOAD_MAX_BYTES || 2 * 1024 * 1024 * 1024);
-const uploads = new Map(); // id -> { file, name, bytes, at }
+const uploads = new Map(); // id -> { file, name, bytes, kind, at }
 const ROOT = __dirname;
 const MAX_BODY = 1024 * 1024;
 
@@ -60,6 +60,48 @@ const MIME = {
   '.ico': 'image/x-icon',
   '.json': 'application/json; charset=utf-8',
 };
+
+/**
+ * 附件的 kind 只按扩展名判断：够用，也不用读文件头 ——
+ * 2GB 的片子为了看前几个字节先开一次流，不值得。
+ */
+const KIND_BY_EXT = {
+  '.mp4': 'video', '.mov': 'video', '.mkv': 'video', '.webm': 'video', '.avi': 'video',
+  '.mp3': 'audio', '.wav': 'audio', '.m4a': 'audio', '.ogg': 'audio', '.flac': 'audio', '.aac': 'audio',
+  '.png': 'image', '.jpg': 'image', '.jpeg': 'image', '.gif': 'image', '.webp': 'image', '.bmp': 'image',
+  '.txt': 'text', '.md': 'text', '.json': 'text', '.csv': 'text', '.log': 'text', '.srt': 'text',
+  '.js': 'text', '.ts': 'text', '.py': 'text', '.ps1': 'text', '.yaml': 'text', '.yml': 'text',
+};
+
+// 预览路由要用它回 content-type：浏览器认得出类型才肯内联显示
+const UPLOAD_MIME = {
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+  '.webp': 'image/webp', '.bmp': 'image/bmp',
+  '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.mkv': 'video/x-matroska',
+  '.webm': 'video/webm', '.avi': 'video/x-msvideo',
+  '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.m4a': 'audio/mp4', '.ogg': 'audio/ogg',
+  '.flac': 'audio/flac', '.aac': 'audio/aac',
+};
+
+const KIND_LIST = ['video', 'audio', 'image', 'text', 'other'];
+
+function kindOfName(name) {
+  return KIND_BY_EXT[path.extname(String(name || '')).toLowerCase()] || 'other';
+}
+
+/**
+ * 上传名只留文件名：去掉目录与 `..`，既防穿越，也避免 Windows 非法字符写盘失败。
+ * 浏览器有时会把整个本地路径塞进 name；落盘名还会再加一层 UUID 前缀。
+ */
+function safeUploadName(raw) {
+  const base = String(raw || '').replace(/\\/g, '/').split('/').pop() || '';
+  const cleaned = base
+    .replace(/\.\.+/g, '.')                    // 任何一段 `..` 都不能留
+    .replace(/[\u0000-\u001f<>:"|?*]/g, '')    // Windows 不允许的字符：写盘会直接失败
+    .trim();
+  if (!cleaned || cleaned === '.' || cleaned === '..') return 'upload.bin';
+  return cleaned.slice(0, 120) || 'upload.bin';
+}
 
 function log(message) {
   process.stdout.write(`[panel] ${new Date().toISOString()} ${message}\n`);
@@ -247,7 +289,10 @@ function protectedPath(pathname) {
     pathname === '/api/tts' || pathname === '/api/asr' ||
     pathname === '/api/history' || pathname === '/api/studio/create' ||
     pathname === '/api/studio/plan' || pathname === '/api/studio/render' ||
-    pathname === '/api/stickers/send' || pathname === '/api/stickers/favorite';
+    pathname === '/api/stickers/send' || pathname === '/api/stickers/favorite' ||
+    pathname === '/api/message' || pathname === '/api/upload';
+  // 注意：GET /api/upload/:id（预览）故意不在这里 —— <img>/<video>/新窗口都带不了
+  // Bearer 头，它靠不可猜的 UUID 当凭据，和 /api/studio/video 同一个理由。
 }
 
 /** 服务间直连 POST（视频模块 / io）：不走 req 透传，因为要拿回结果再二次加工。 */
@@ -392,12 +437,22 @@ function sweepUploads() {
 /**
  * 浏览器把原片直接 PUT 上来，边收边写盘：不经过 base64（省 33% 体积），
  * 也不在内存里攒（2GB 的片子也不会把面板撑爆）。
+ *
+ * kindHint 是给录音这类"容器扩展名与内容不一致"的文件留的逃生口：
+ * MediaRecorder 只能出 webm，但那段录音是 audio，不能让模型去 watch。
  */
-function saveUpload(req, res, name, declaredSize) {
+function saveUpload(req, res, name, declaredSize, kindHint) {
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
   sweepUploads();
   const id = crypto.randomUUID();
-  const safe = path.basename(String(name || 'upload.bin')).slice(0, 120) || 'upload.bin';
+  const safe = safeUploadName(name);
+  const hinted = KIND_LIST.includes(String(kindHint || '')) ? String(kindHint) : '';
+  const kind = hinted || kindOfName(safe);
+  // 声明的大小先挡一道：2GB 的请求没必要收完了才拒绝
+  const declared = Number(declaredSize);
+  if (Number.isFinite(declared) && declared > UPLOAD_MAX_BYTES) {
+    return sendJson(res, 413, { ok: false, error: 'TOO_LARGE' });
+  }
   const file = path.join(UPLOAD_DIR, id + path.extname(safe));
   const ws = fs.createWriteStream(file);
   let bytes = 0;
@@ -424,11 +479,193 @@ function saveUpload(req, res, name, declaredSize) {
   ws.on('finish', () => {
     if (aborted) return;
     if (bytes === 0) { fail(400, 'EMPTY_BODY'); return; }
-    uploads.set(id, { file, name: safe, bytes, at: Date.now() });
-    log(`upload ok id=${id} name=${safe} bytes=${bytes}`);
-    sendJson(res, 200, { ok: true, uploadId: id, name: safe, bytes });
+    uploads.set(id, { file, name: safe, bytes, kind, at: Date.now() });
+    log(`upload ok id=${id} name=${safe} bytes=${bytes} kind=${kind}`);
+    sendJson(res, 200, { ok: true, uploadId: id, name: safe, bytes, kind });
   });
   req.pipe(ws);
+}
+
+/**
+ * uploadIds → 上传记录。不认识的 id 直接跳过（过期、服务重启、
+ * 或者历史上已经发过的那条消息都会这样），不让整条消息因此失败。
+ */
+function pickUploads(ids) {
+  const out = [];
+  for (const raw of Array.isArray(ids) ? ids.slice(0, 10) : []) {
+    const id = String(raw || '');
+    const up = uploads.get(id);
+    if (up) out.push(Object.assign({ id }, up));
+  }
+  return out;
+}
+
+/**
+ * 图片的"一句话描述"。
+ * 为什么由面板来做：模型看不到像素，附件说明里只有这一句 description，
+ * 而视觉能力在视频模块手里（面板不持有视觉 key）。
+ * 失败一律不阻断 —— 少一句描述，总比整条消息发不出去强。
+ */
+async function describeImage(up) {
+  // 大图 base64 会把内存顶满；超过 8MB 就放弃描述，只报文件名
+  if (up.bytes > 8 * 1024 * 1024) return '';
+  try {
+    const ext = path.extname(up.name).toLowerCase();
+    const mime = UPLOAD_MIME[ext] || 'image/png';
+    const buf = await fs.promises.readFile(up.file);
+    const r = await postJson(VIDEO_BASE, '/v1/look', {
+      image: `data:${mime};base64,${buf.toString('base64')}`,
+      prompt: '用一句中文说清这张图里有什么、有没有字。不超过 40 字，不要客套。',
+    }, {}, 90000);
+    const desc = r.data && r.data.ok ? String(r.data.description || '').replace(/\s+/g, ' ').trim() : '';
+    return desc.slice(0, 200);
+  } catch (err) {
+    log(`image describe failed: ${err.message}`);
+    return '';
+  }
+}
+
+/**
+ * 表情 id → 名字。
+ * 前端选中表情时本来就知道 mood，会顺手带过来（stickerMood），省一次目录请求；
+ * 没带才问一次表情模块 —— 找不到就退回"表情"，绝不因为一张图卡住整条消息。
+ */
+async function stickerMood(id, hint) {
+  const named = String(hint || '').trim();
+  if (named) return named.slice(0, 40);
+  try {
+    const r = await fetch(`${STICKER_BASE}/v1/list?limit=200`, { signal: AbortSignal.timeout(8000) });
+    const data = await r.json().catch(() => null);
+    const items = data && Array.isArray(data.items) ? data.items : [];
+    const hit = items.find((it) => it && String(it.id) === id);
+    if (hit) return String(hit.mood || hit.name || '表情').slice(0, 40);
+  } catch (err) {
+    log(`sticker mood lookup failed: ${err.message}`);
+  }
+  return '表情';
+}
+
+/** 这一轮用完的上传文件立刻删掉：附件已经交给模型了，留着只会塞满磁盘。 */
+function dropUploads(list) {
+  for (const up of list) {
+    try { fs.unlinkSync(up.file); } catch { }
+    uploads.delete(up.id);
+  }
+}
+
+/**
+ * 一条消息 = 一次 io 调用。
+ *
+ * 为什么要在面板里合成：文字、图片、音频、文档、表情在界面上是"一条"，
+ * 到了模型那边也必须是"一次"。否则「文字 + 表情」会回两遍，上下文也被拆散。
+ * 这里把附件折成 io 的 attachments 字段（它自己决定用 watch / hear / 看描述），
+ * 表情折成正文前面的一行提示 —— 模型才知道你"发了一张图"而不是在说文字。
+ */
+async function handleMessage(req, res) {
+  const user = await currentUser(req);
+  if (!user) return sendJson(res, 401, { ok: false, code: 'E_UNAUTHORIZED', error: '未登录或会话已过期' });
+
+  const raw = await readBody(req);
+  let body = {};
+  try { body = JSON.parse(raw.toString('utf8')) || {}; } catch { }
+  const text = String(body.text || '').trim();
+  const files = pickUploads(body.uploadIds);
+  const stickerId = /^[0-9a-f]{6,40}$/i.test(String(body.stickerId || '')) ? String(body.stickerId) : '';
+
+  if (!text && !files.length && !stickerId) {
+    return sendJson(res, 400, { ok: false, error: 'EMPTY_MESSAGE' });
+  }
+
+  const started = Date.now();
+  let sticker = null;
+  const attachments = [];
+  try {
+    // 1) 图片先让人看一眼：附件块里给模型一句人话，它才编得出"我看到了什么"
+    for (const up of files) {
+      const description = up.kind === 'image' ? await describeImage(up) : '';
+      attachments.push({
+        kind: up.kind,
+        name: up.name,
+        path: up.file,
+        description: description || undefined,
+      });
+    }
+
+    // 2) 表情是这条消息的一部分：在正文前面拼一行，不再单独发一轮
+    const lines = [];
+    if (stickerId) {
+      const mood = await stickerMood(stickerId, body.stickerMood);
+      sticker = { id: stickerId, label: mood };
+      lines.push(`[我发了一个表情：${mood}]`);
+    }
+    if (text) lines.push(text);
+    if (!lines.length) lines.push(files.length ? '（我给你发了几个文件，你看一下）' : '（我发了一个表情）');
+
+    // 3) 历史先记：万一 io 挂了，至少知道这句话说过；附件信息也只在这里留一份
+    appendHistory(user.id, {
+      role: 'user',
+      text,
+      attachments: attachments.map((a, i) => ({
+        uploadId: files[i].id, name: a.name, kind: a.kind, bytes: files[i].bytes,
+      })),
+      sticker: stickerId || undefined,
+      ts: Date.now(),
+    });
+
+    // 4) 只有这一次 io：不带 stickers 目录（模型手上已经有 send_sticker 工具了）
+    const io = await postJson(IO_BASE, '/v1/input', {
+      text: lines.join('\n'),
+      sessionId: String(body.sessionId || 'panel'),
+      history: Array.isArray(body.history) ? body.history.slice(-8) : undefined,
+      attachments: attachments.length ? attachments : undefined,
+    }, { authorization: req.headers.authorization || '' }, 600000);
+
+    const answer = (io.data && io.data.answer) || '';
+    const ok = Boolean(io.data && io.data.ok);
+    if (io.status === 401) {
+      // 用户态问题：不写 assistant，也别把"未登录"当成一句话存进历史
+      return sendJson(res, 401, { ok: false, code: 'E_UNAUTHORIZED', error: '会话已过期，请重新登录' });
+    }
+    if (ok && answer) {
+      appendHistory(user.id, {
+        role: 'assistant',
+        text: answer,
+        ms: io.data && io.data.ms,
+        usage: (io.data && io.data.usage) || null,
+        ts: Date.now(),
+      });
+    } else if (!ok) {
+      const reason = (io.data && (io.data.error || io.data.code)) || `io HTTP ${io.status}`;
+      appendHistory(user.id, { role: 'error', text: String(reason), ts: Date.now() });
+    }
+
+    const publicAtts = attachments.map((a, i) => ({
+      uploadId: files[i].id,
+      name: a.name,
+      kind: a.kind,
+      bytes: files[i].bytes,
+      link: `/api/upload/${files[i].id}`,
+    }));
+
+    log(`message user=${user.id} files=${files.length} sticker=${stickerId || '-'} io=${io.status} ok=${ok} ms=${Date.now() - started}`);
+
+    return sendJson(res, 200, {
+      ok,
+      answer,
+      ms: io.data && io.data.ms != null ? io.data.ms : Date.now() - started,
+      usage: (io.data && io.data.usage) || null,
+      actions: (io.data && Array.isArray(io.data.actions)) ? io.data.actions : [],
+      attachments: publicAtts,
+      sticker,
+      error: ok ? undefined : ((io.data && (io.data.error || io.data.code)) || `io HTTP ${io.status}`),
+    });
+  } catch (err) {
+    log(`message failed: ${err.message}`);
+    return sendJson(res, 500, { ok: false, error: err.message });
+  } finally {
+    // 5) 不论成败都清掉这一轮的临时文件
+    dropUploads(files);
+  }
 }
 
 /**
@@ -553,6 +790,61 @@ const handler = async (req, res) => {
       });
     }
 
+    // 通用附件上传：任何类型都能挂。流式写盘沿用旧视频上传那一套，不整包进内存。
+    if (req.method === 'PUT' && url.pathname === '/api/upload') {
+      return saveUpload(req, res, url.searchParams.get('name'), url.searchParams.get('size'),
+        url.searchParams.get('kind'));
+    }
+
+    // 预览：图片/视频内联给浏览器看，文本回前 200 行，其它 415。
+    // 这里不校验 Bearer（<img>/<video>/新窗口都带不了头），凭据就是不可猜的 UUID ——
+    // 和 /api/studio/video 同一个理由；protectedPath 里也刻意没拦这个前缀。
+    if (req.method === 'GET' && url.pathname.startsWith('/api/upload/')) {
+      let id = '';
+      try { id = decodeURIComponent(url.pathname.slice('/api/upload/'.length)); } catch { }
+      const up = uploads.get(id);
+      if (!up) {
+        return sendJson(res, 404, { ok: false, error: 'UPLOAD_NOT_FOUND（可能已过期，或这条消息已经发过了）' });
+      }
+      let size = 0;
+      try { size = fs.statSync(up.file).size; } catch { return sendJson(res, 404, { ok: false, error: 'UPLOAD_GONE' }); }
+      const ext = path.extname(up.name).toLowerCase();
+      // 录音是 webm 容器但只有音频：别让 <audio> 收到 video/webm
+      const type = up.kind === 'audio' && ext === '.webm' ? 'audio/webm' : (UPLOAD_MIME[ext] || '');
+
+      if (up.kind === 'image' || up.kind === 'video') {
+        if (!type) return sendJson(res, 415, { ok: false, error: 'UNSUPPORTED' });
+        res.writeHead(200, {
+          'content-type': type,
+          'content-length': size,
+          'accept-ranges': 'none',
+          'cache-control': 'no-store',
+        });
+        return fs.createReadStream(up.file).pipe(res);
+      }
+
+      // 文本预览只读前 256KB 再取 200 行：预览不是下载，别为了一份日志把内存吃满
+      if (up.kind === 'text') {
+        const fd = fs.openSync(up.file, 'r');
+        try {
+          const buf = Buffer.alloc(Math.min(size, 256 * 1024));
+          const n = fs.readSync(fd, buf, 0, buf.length, 0);
+          const body = buf.subarray(0, n).toString('utf8').split(/\r?\n/).slice(0, 200).join('\n');
+          res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+          return res.end(body);
+        } finally {
+          fs.closeSync(fd);
+        }
+      }
+
+      return sendJson(res, 415, { ok: false, error: 'UNSUPPORTED（这种文件不能预览）' });
+    }
+
+    // 一条消息：文字 + 附件 + 表情，只调一次 io（细节见 handleMessage）
+    if (req.method === 'POST' && url.pathname === '/api/message') {
+      return handleMessage(req, res);
+    }
+
     // 视频：先让 video 模块看懂画面，再把描述交给 io，由大肥鱼用自己的口气回应
     if (req.method === 'POST' && (url.pathname === '/api/video/analyze' || url.pathname === '/api/video/url')) {
       const rawVideo = await readBody(req);
@@ -570,9 +862,10 @@ const handler = async (req, res) => {
       return completeVideo(req, res, v, String(body.text || '').trim());
     }
 
-    // 原片上传：XHR 直接 PUT 字节流，边收边写盘
+    // 原片上传（兼容旧路径）：和 /api/upload 同一套流式实现，只是调用方是老页面/老脚本
     if (req.method === 'PUT' && url.pathname === '/api/video/upload') {
-      return saveUpload(req, res, url.searchParams.get('name'), url.searchParams.get('size'));
+      return saveUpload(req, res, url.searchParams.get('name'), url.searchParams.get('size'),
+        url.searchParams.get('kind'));
     }
 
     // 上传完成后分析：服务器自己抽帧 + 听音轨（浏览器那条路只有帧，听不到声音）
