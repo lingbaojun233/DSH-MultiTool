@@ -1,12 +1,47 @@
 {
   "port": 8770,
-  "provider": "piper",
-  "voice": "yaoyao",
+  "provider": "breezeblue",
+  "voice": "",
   "rate": -1,
   "maxChars": 300,
+  "strict": true,
+  "strictAllowExplicitLocal": true,
   "gateway": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
   "qwenModel": "qwen-audio-3.0-tts-plus",
   "requestTimeoutMs": 60000,
   "piperExe": "C:\\Apps\\DSH-MultiTool\\tools\\piper\\piper.exe",
-  "piperDir": "C:\\Apps\\DSH-MultiTool\\tools\\piper"
+  "piperDir": "C:\\Apps\\DSH-MultiTool\\tools\\piper",
+  "breezeblue": {
+    "base": "https://api.breeze.blue",
+    "keyPath": "C:\\Apps\\DSH-MultiTool\\secrets\\breezeblue.key",
+    "voiceId": "voc_cc9mhfrqw4z2",
+    "model": "",
+    "outputFormat": "wav",
+    "timeoutMs": 120000,
+    "ffmpegExe": "C:\\Apps\\DSH-MultiTool\\tools\\ffmpeg\\bin\\ffmpeg.exe",
+    "sampleRate": 22050,
+    "creditsPerChar": 0.185,
+    "maxConcurrency": 1,
+    "queueMax": 64,
+    "queueTimeoutMs": 180000,
+    "retry": {
+      "maxAttempts": 4,
+      "backoffMs": [1000, 2000, 4000, 8000],
+      "retryStatus": [408, 429, 500, 502, 503, 504],
+      "retryOnNetwork": true
+    },
+    "balanceTtlMs": 30000,
+    "balanceAfterMaxAgeMs": 5000,
+    "balanceTimeoutMs": 15000
+  },
+  "personaVoice": {
+    "memoryUrl": "http://127.0.0.1:8767",
+    "language": "zh",
+    "useModel": false,
+    "ioUrl": "http://127.0.0.1:8765",
+    "internalTokenPath": "C:\\Apps\\DSH-MultiTool\\secrets\\internal-token.txt",
+    "modelUserId": 0,
+    "memoryTimeoutMs": 15000,
+    "modelTimeoutMs": 90000
+  }
 }

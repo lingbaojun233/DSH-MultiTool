@@ -66,6 +66,8 @@ function sceneKey(scene, cfg) {
     text: String(scene.text || ''),
     html: String(scene.html || ''),
     python: String(scene.python || ''),
+    // manim 脚本也进缓存键：改了代码必须重渲，不能复用旧动画
+    manim: scene.manim || null,
     draw: scene.draw || null,
     steps: Array.isArray(scene.steps) ? scene.steps : null,
     seconds: Number(scene.seconds) || 0,
@@ -76,6 +78,12 @@ function sceneKey(scene, cfg) {
     motion: scene.motion || null,
     // 表情叠加也影响画面，必须进缓存键 —— 否则改了表情却复用旧片段
     stickers: Array.isArray(scene.stickers) ? scene.stickers : null,
+    // 风格也进缓存键：manim 脚本会被注入风格色/背景，文字卡背景也来自风格。
+    // 少了这一项，"同一场景换个风格重渲"会直接复用旧配色的片段，风格永远不生效。
+    style: cfg.styleSig || cfg.styleId || null,
+    // 文字卡的入场/出场淡化同样决定画面：改这个值必须重渲文字卡，否则新旧混一集。
+    // v2 = 淡到风格底色 + 跨 xfade 中点（v1 是淡到黑，缓存必须区分开）
+    edge: String(scene.kind || 'text') === 'text' ? `v2|${Number(cfg.textEdgeFade) || 0}|${cfg.styleId || ''}` : null,
     w: cfg.width, h: cfg.height, fps: cfg.fps,
   };
   return sha1(JSON.stringify(payload));
@@ -98,6 +106,11 @@ function createProject(root, input = {}) {
     fade: input.fade == null ? 0.4 : Number(input.fade),
     voice: String(input.voice || ''),
     bgm: String(input.bgm || ''),
+    // 项目级风格 id（styles/<id>.json）。空串表示"渲染时按人设决定"，
+    // 只有真要用某个风格钉死时才写具体 id —— 见 server.js 的 resolveStyleFor()。
+    style: String(input.style || ''),
+    // 项目级文字卡淡化覆盖（秒）。null = 用全局配置 textEdgeFade。
+    textEdgeFade: input.textEdgeFade == null ? null : Number(input.textEdgeFade),
     scenes: [],
     cache: {},       // sceneKey -> { clip, at }
     audioCache: {},  // audioKey -> { wav, ms, at }
@@ -176,7 +189,18 @@ function normalizeScene(raw) {
   const hex = (v, fallback) => (/^#[0-9a-f]{6}$/i.test(String(v || '')) ? String(v) : fallback);
   const bg = raw.bg || {};
   const seconds = Math.min(12, Math.max(1, Number(raw.seconds) || 3));
-  const kind = ['text', 'rich', 'plot'].includes(raw.kind) ? raw.kind : 'text';
+  let kind = ['text', 'rich', 'plot', 'manim'].includes(raw.kind) ? raw.kind : 'text';
+  // manim 场景：模型写一段 Manim 脚本，渲染时整段交给 manim（不再走静帧 + zoompan）。
+  // 脚本没有/不是字符串就把 kind 退回 text —— 否则每次渲染都会白跑一次注定失败的 manim。
+  const manimSrc = raw.manim && typeof raw.manim === 'object' ? raw.manim : null;
+  const manimCode = manimSrc && typeof manimSrc.code === 'string' ? manimSrc.code.trim() : '';
+  const manimScene = manimSrc && /^[\p{L}_][\p{L}\p{N}_]{0,63}$/u.test(String(manimSrc.scene || ''))
+    ? String(manimSrc.scene) : null;
+  const manim = manimCode ? { code: manimCode.slice(0, 8000), scene: manimScene } : null;
+  // kind 只是"偏好"。有脚本就是 manim 场 —— 以前这里只在 kind==='manim' 时才认，
+  // 结果"规划成 text/rich 但确实给了 manim 脚本"的场次会白白丢掉动画。
+  if (manim) kind = 'manim';
+  if (kind === 'manim' && !manim) kind = 'text';
   // 表情叠加：坐标用 0~1 相对值，渲染器自己换算成像素
   const stickers = (Array.isArray(raw.stickers) ? raw.stickers : [])
     .filter((s) => s && /^[0-9a-f]{6,40}$/i.test(String(s.id || '')))
@@ -202,6 +226,7 @@ function normalizeScene(raw) {
     textColor: raw.textColor || null,
     // rich 场景用绘图指令（GDI+），html 是早期留给无头浏览器的路，保留但不再主推
     python: raw.python ? String(raw.python).slice(0, 4000) : null,
+    manim,
     draw: raw.draw && Array.isArray(raw.draw.shapes) ? {
       title: String(raw.draw.title || raw.text || '').slice(0, 60),
       bg1: raw.draw.bg1 || '#101a33',

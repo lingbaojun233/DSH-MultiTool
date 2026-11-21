@@ -264,7 +264,81 @@ async function sceneStill({ ffmpeg, work, index, scene, w, h, font, imageDir = n
   return imageStill({ ffmpeg, work, index, scene: s, w, h, font, image: imagePath });
 }
 
-/** 原慢推路径：没图的场次照旧走这里 */
+/**
+ * 静帧运镜模式。这直接决定画面会不会"呼吸"。
+ *
+ *   'none'        不加任何运动：一张静帧铺满整场，逐帧内容完全一致（像素差 0）
+ *   'supersample' 先放大到 2 倍再 zoompan，最后缩回 1080p：靠重采样抹掉亚像素取整
+ *   'zoompan'     老行为（1.0→1.12 直接 zoompan）：抖动明显，只留作对照/回退
+ *
+ * 默认 'none'：实测 2 倍法能把抖动压到很小但压不到 0，而"静帧就该纹丝不动"
+ * 这件事上 0 比"小"重要得多 —— 观众看到的是整幅画面在发颤，不是幅度大小。
+ * 想要运镜的场次应该交给 manim（真动画），而不是让一张图假动。
+ */
+const STILL_MODES = new Set(['none', 'supersample', 'zoompan']);
+let stillMode = 'none';
+
+/** 改静帧模式（server.js 读 config.json 后调一次）；不认识的值当 'none' */
+function setStillMotion(mode) {
+  const v = String(mode == null ? '' : mode).trim().toLowerCase();
+  stillMode = STILL_MODES.has(v) ? v : 'none';
+  return stillMode;
+}
+
+function getStillMotion() {
+  return stillMode;
+}
+
+/**
+ * 零运动片段：静帧 → 定长视频。
+ *
+ * 这里刻意**什么都不做**（除了缩放和编码）。zoompan 的抖动来自它每帧都要
+ * 按浮点 zoom 算裁切窗口，再把 x/y 取整到像素；同一个源图在 1080p 下逐帧的
+ * 取整结果会在两个像素之间跳，解码出来就是整幅画在轻微抖动。
+ * 不加 zoom 就没有裁切窗口，也就没有取整，帧帧完全一致。
+ */
+async function staticClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, edgeFade = 0, edgeLead = 0, edgeColor = null }) {
+  const out = path.join(work, `clip-${index}.mp4`);
+  const frames = Math.max(1, Math.round(seconds * fps));
+  // 静帧可能来自 2 倍超采样画布（imageStill）或原始分辨率（gradientStill），统一缩到项目规格
+  let vf = `scale=${w}:${h}:flags=lanczos,setsar=1,format=yuv420p`;
+  // 文字卡的入场/出场淡化。为什么必须在这里做：文字是"烤"进静帧的，
+  // 两张文字卡在 xfade 的 0.4 秒重叠期里会同时全亮 —— 两个标题就叠在一起了。
+  //
+  // 只加"头尾各 0.15 秒"其实不够：xfade 的权重在窗口里从 1→0 / 0→1，
+  // 但只要两张卡都还是不透明，中点就一定是 50/50 的重影。要让标题真的不叠，
+  // 得让 A 的标题在窗口**中点之前**淡完、B 的标题在中点之后才淡出来：
+  //   fade-in  延后 edgeLead/2（0.2 秒）开始，时长 edgeFade（0.15）
+  //   fade-out 提前 edgeLead/2 结束，时长 edgeFade
+  // 于是窗口里 A 在 [start, mid] 淡出、B 在 [mid, end] 淡入，交集为空。
+  // edgeLead=0（单场、没有转场）时自然退化成"片头片尾各 0.15 秒"。
+  //
+  // 淡到**风格底色**而不是黑色：淡到黑会在浅色风格（白板）上变成一下黑屏闪烁，
+  // 淡到底色则只是背景抹平一下，标题照样消失。edgeColor 由调用方按风格传进来。
+  const d = Math.min(Math.max(0, Number(edgeFade) || 0), Math.max(0, seconds / 2 - 0.01));
+  if (d > 0.01) {
+    const lead = Math.max(0, Number(edgeLead) || 0);
+    const half = lead / 2;
+    const inStart = Math.max(0, Math.min(half, seconds - 2 * d - 0.05));
+    const outStart = Math.min(Math.max(inStart + d + 0.05, seconds - half - d), Math.max(0, seconds - d));
+    const color = /^#[0-9a-f]{6}$/i.test(String(edgeColor || '')) ? `:color=0x${String(edgeColor).slice(1)}` : '';
+    vf += `,fade=t=in:st=${inStart.toFixed(3)}:d=${d.toFixed(3)}${color},fade=t=out:st=${outStart.toFixed(3)}:d=${d.toFixed(3)}${color}`;
+  }
+  const args = [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-loop', '1', '-i', stillPng,
+    '-vf', vf,
+    '-t', String(seconds),
+    '-r', String(fps),
+    '-frames:v', String(frames),
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+    out,
+  ];
+  const r = await run(ffmpeg, args, 300000);
+  return { ok: r.code === 0 && fs.existsSync(out), file: out, error: r.stderr };
+}
+
+/** 原慢推路径（老行为，只作对照）：没图的场次也照这个推 */
 async function legacyClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps }) {
   const out = path.join(work, `clip-${index}.mp4`);
   const frames = Math.max(1, Math.round(seconds * fps));
@@ -288,13 +362,35 @@ async function legacyClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps })
 }
 
 /**
+ * 运镜表达式：推近 / 拉远 / 左右平移。
+ * 返回 { z, x, y } 三个 ffmpeg 表达式片段，两倍法与原速法共用同一套算法。
+ */
+function motionExprs(motion, frames, maxZoom) {
+  const last = Math.max(1, frames - 1);
+  const zoomRange = +(maxZoom - 1).toFixed(4);
+  const y = '(ih-ih/zoom)/2';
+  switch (normalizeMotion(motion)) {
+    case 'zoom-out':
+      return { z: `${maxZoom}-${zoomRange}*on/${last}`, x: '(iw-iw/zoom)/2', y };
+    case 'pan-left':
+      // 镜头向左看：先看画面右侧，再一路移到左侧
+      return { z: String(maxZoom), x: `(iw-iw/zoom)*(1-on/${last})`, y };
+    case 'pan-right':
+      return { z: String(maxZoom), x: `(iw-iw/zoom)*(on/${last})`, y };
+    case 'zoom-in':
+    default:
+      return { z: `1+${zoomRange}*on/${last}`, x: '(iw-iw/zoom)/2', y };
+  }
+}
+
+/**
  * 图片底 + 运镜。
  *
  * zoompan 的几个参数是踩过的坑，这里说明白：
  *   d=N       一张输入图扩成 N 帧（静帧是单帧 png，所以不再用 -loop 1，
  *             否则输入无限循环、'on' 也会一直涨，取不到"本场进度"）
- *   s=WxH     输出尺寸固定 1920x1080，不跟 zoom 变
- *   fps       必须显式给 30，否则 zoompan 按 25 的时间基算，输出会莫名丢帧/加速
+ *   s=WxH     输出尺寸固定，不跟 zoom 变
+ *   fps       必须显式给，否则 zoompan 按 25 的时间基算，输出会莫名丢帧/加速
  *   on        输出帧号，0..N-1；用 on/(N-1) 得到本场 0→1 的进度，推拉平移都靠它
  * x/y 用 (iw-iw/zoom) 这类表达式：zoompan 的坐标是"裁切窗口左上角"，
  * 除以 2 就是居中；平移时让它从 0 线性走到 (iw-iw/zoom)。
@@ -302,43 +398,14 @@ async function legacyClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps })
 async function imageClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, motion }) {
   const out = path.join(work, `clip-${index}.mp4`);
   const frames = Math.max(1, Math.round(seconds * fps));
-  const last = Math.max(1, frames - 1);
-  const m = normalizeMotion(motion);
   const maxZoom = 1.12;
-  // 1.12-1 = 0.1200000000000001，浮点尾巴会原样进命令行，取整一下看着干净
-  const zoomRange = +(maxZoom - 1).toFixed(4);
-
-  let z;
-  let x;
-  const y = '(ih-ih/zoom)/2';
-  switch (m) {
-    case 'zoom-out':
-      z = `${maxZoom}-${zoomRange}*on/${last}`;
-      x = '(iw-iw/zoom)/2';
-      break;
-    case 'pan-left':
-      // 镜头向左看：先看画面右侧，再一路移到左侧
-      z = String(maxZoom);
-      x = `(iw-iw/zoom)*(1-on/${last})`;
-      break;
-    case 'pan-right':
-      z = String(maxZoom);
-      x = `(iw-iw/zoom)*(on/${last})`;
-      break;
-    case 'zoom-in':
-    default:
-      z = `1+${zoomRange}*on/${last}`;
-      x = '(iw-iw/zoom)/2';
-      break;
-  }
-
+  const e = motionExprs(motion, frames, maxZoom);
   // clip 夹在 1~1.12：万一 seconds*fps 让最后一帧的 on 略微越界，也不会越推越糊
-  const zExpr = `clip(${z},1,${maxZoom})`;
   const vf = [
-    `zoompan=z='${zExpr}'`,
+    `zoompan=z='clip(${e.z},1,${maxZoom})'`,
     `d=${frames}:s=${w}x${h}:fps=${fps}`,
-    `x='${x}'`,
-    `y='${y}'`,
+    `x='${e.x}'`,
+    `y='${e.y}'`,
   ].join(':');
 
   const r = await run(ffmpeg, [
@@ -354,21 +421,75 @@ async function imageClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, mo
 }
 
 /**
+ * 2 倍超采样运镜：放大 → zoompan → 缩回。
+ *
+ * 原理：zoompan 的裁切窗口算出来是小数，取整发生在它内部。在 3840x2160 上
+ * 取整，误差相对输出只有半个 1080p 像素；再缩回 1920x1080 时每个输出像素由
+ * 4 个输入像素平均得到，那半个像素的跳变被重采样抹平，看起来就不抖了。
+ * 代价是一次 4K 编码，比原速法慢约 1 倍。
+ */
+async function supersampleClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, motion }) {
+  const out = path.join(work, `clip-${index}.mp4`);
+  const frames = Math.max(1, Math.round(seconds * fps));
+  const W = w * SUPERSAMPLE;
+  const H = h * SUPERSAMPLE;
+  const maxZoom = 1.12;
+  const e = motionExprs(motion, frames, maxZoom);
+  // 注意：zoompan 自己的参数之间必须是 ':'，只有"链上的下一个滤镜"才用 ','。
+  // 两者混用 ffmpeg 会把 d=90 当成一个新滤镜名，报 "No option name near '90:...'"。
+  const zoompan = [
+    `zoompan=z='clip(${e.z},1,${maxZoom})'`,
+    `d=${frames}:s=${W}x${H}:fps=${fps}`,
+    `x='${e.x}'`,
+    `y='${e.y}'`,
+  ].join(':');
+  const vf = [
+    `scale=${W}:${H}:flags=lanczos`,
+    zoompan,
+    `scale=${w}:${h}:flags=lanczos`,
+    'setsar=1',
+    'format=yuv420p',
+  ].join(',');
+  const r = await run(ffmpeg, [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-i', stillPng,
+    '-vf', vf,
+    '-frames:v', String(frames),
+    '-r', String(fps),
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+    out,
+  ], 300000);
+  return { ok: r.code === 0 && fs.existsSync(out), file: out, error: r.stderr };
+}
+
+/**
  * 静帧 → 视频片段。
  *
- * 有底图的场次走运镜（scene.motion，默认 zoom-in），没图的场次仍然走原来的慢推。
- * 判断依据是 sceneStill 写在 work 里的 still-<index>.meta.json；
- * 也可以显式传 motion 覆盖（比如自己造了张图当静帧，不走 sceneStill）。
+ * 按 stillMode 分派：
+ *   none         → staticClip（默认；抖动为 0，画面完全静止）
+ *   supersample  → supersampleClip（保留轻微运镜，抖动被 2 倍重采样压掉）
+ *   zoompan      → 老行为，有底图走 imageClip、没底图走 legacyClip
+ * 老调用方签名不变：motion 仍可显式覆盖 meta 里记的运镜。
+ * edgeFade：文字卡的入场/出场淡化秒数（只在 static 分支生效，见 staticClip）。
+ * edgeLead：转场重叠时长（xfade 的 fade）；淡化会跨过它的中点，避免两个标题重影。
+ * edgeColor：淡化到哪种颜色（默认黑；文字卡传风格底色，浅色风格才不会闪黑）。
  */
-async function sceneClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, motion = null }) {
+async function sceneClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, motion = null, edgeFade = 0, edgeLead = 0, edgeColor = null }) {
+  if (stillMode === 'none') {
+    return staticClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, edgeFade, edgeLead, edgeColor });
+  }
+
   const meta = readStillMeta(work, index);
-  if (!meta || !meta.hasImage) {
+  const hasImage = !!(meta && meta.hasImage);
+  const m = motion || (meta && meta.motion) || DEFAULT_MOTION;
+
+  if (stillMode === 'supersample') {
+    return supersampleClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, motion: m });
+  }
+  if (!hasImage) {
     return legacyClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps });
   }
-  return imageClip({
-    ffmpeg, work, index, stillPng, seconds, w, h, fps,
-    motion: motion || meta.motion,
-  });
+  return imageClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, motion: m });
 }
 
 /** 多个片段 xfade 串联。ffmpeg 的 xfade 只能两两接，所以要链式叠。 */
@@ -433,7 +554,10 @@ async function mixAudio({ ffmpeg, videoIn, narrations, bgm, totalSeconds, out })
 
   // apad 是必须的：旁白念完得早时，音轨会比画面短，
   // 不加 apad 的话配合 -shortest 会把成片直接剪到最后一句念完的位置（画面后半段消失）。
-  filters.push(`${mixLabels.join('')}amix=inputs=${mixLabels.length}:duration=longest:dropout_transition=0,alimiter=limit=0.95,apad[aout]`);
+  // normalize=0 是关键：amix 默认会把结果除以输入轨数，而我们有「每场一条轨」
+  // —— 8 场的片子人声会被压掉约 18dB，听起来就是"说话不清楚"。
+  // 同一时刻实际只有一条旁白在响，所以不做归一化才对；峰值交给 alimiter 兜。
+  filters.push(`${mixLabels.join('')}amix=inputs=${mixLabels.length}:duration=longest:dropout_transition=0:normalize=0,alimiter=limit=0.95,apad[aout]`);
   const args = ['-hide_banner', '-loglevel', 'error', '-y', ...inputs,
     '-filter_complex', filters.join(';'),
     '-map', '0:v', '-map', '[aout]',
@@ -445,4 +569,7 @@ async function mixAudio({ ffmpeg, videoIn, narrations, bgm, totalSeconds, out })
   return { ok: r.code === 0 && fs.existsSync(out), file: out, error: r.stderr };
 }
 
-module.exports = { run, sceneStill, sceneClip, concatClips, mixAudio, resolveImage, normalizeMotion, MOTIONS };
+module.exports = {
+  run, sceneStill, sceneClip, concatClips, mixAudio, resolveImage, normalizeMotion, MOTIONS,
+  setStillMotion, getStillMotion,
+};

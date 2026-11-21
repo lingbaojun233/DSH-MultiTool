@@ -8,7 +8,12 @@
     "minSceneSeconds":  2,
     "maxTotalSeconds":  900,
     "ffmpeg":  "C:\\Apps\\DSH-MultiTool\\tools\\ffmpeg\\bin\\ffmpeg.exe",
+    "python":  "C:\\Apps\\DSH-MultiTool\\tools\\python311\\python.exe",
     "font":  "C:\\Windows\\Fonts\\msyh.ttc",
+    "stillMotion":  "none",
+    "manimQuality":  "-qm",
+    "manimTimeoutBaseMs":  45000,
+    "manimTimeoutPerSecondMs":  6000,
     "ioUrl":  "http://127.0.0.1:8765",
     "speakUrl":  "http://127.0.0.1:8770",
     "outDir":  "C:\\Apps\\DSH-MultiTool\\data\\studio",
@@ -18,5 +23,9 @@
     "renderTimeoutMs":  600000,
     "edgePath":  "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
     "stickerDir":  "C:\\Apps\\DSH-MultiTool\\data\\stickers\\send",
-    "stickerUrl":  "http://127.0.0.1:8773"
+    "stickerUrl":  "http://127.0.0.1:8773",
+    "personaUrl":  "http://127.0.0.1:8767",
+    "personaTimeoutMs":  6000,
+    "defaultStyle":  "whiteboard",
+    "textEdgeFade":  0.15
 }

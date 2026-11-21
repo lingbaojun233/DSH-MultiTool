@@ -1,155 +1,182 @@
 # studio — 视频创作模块
 
-DSH 想做一个视频时用它。**模型不生成任何像素**：它只写"分镜 JSON"，画面全部由 ffmpeg 渲染。
+DSH 想做一个视频时用它。**模型不生成任何像素**：它只写"分镜 JSON + manim 脚本"，
+画面由 Manim 渲染，文字卡由 ffmpeg 渲染。
 
-## 为什么这么拆
+## 现在的画面只有两条路
 
-| 做法 | 问题 |
+| 场次类型 | 谁出像素 | 用在哪 |
+| --- | --- | --- |
+| `manim` | Manim（数学动画） | **默认，≥80% 场次** |
+| `text` | ffmpeg（渐变底 + 一行大字） | 开场 / 转场 / 结论，一集 1~2 场 |
+
+`plot`（matplotlib）、`draw`（GDI+ 图元）、`html`（无头浏览器）的**渲染分支还在**，
+是给旧项目兜底的兼容路径，但**规划提示词不再选择它们** —— 用户要求"视频只使用 manim"。
+
+## 一集是怎么出来的
+
+```text
+分镜骨架（manim/text）           POST /v1/plan 或 /v1/create
+  ↓ 逐场生成 manim 脚本（一次只问一场）
+Manim 渲染（-qm，1080p30） →
+  ↓ 规格统一（缩放/补帧/截断）+ 风格注入（配色/背景/线宽/字体）
+单场 mp4
+  ↓ xfade 0.4 秒串联 + 旁白（speak）+ BGM
+成片
+```
+
+**旁白先拿后渲**：所有场次的旁白必须先全部合成成功，否则整片失败返回
+`VOICE_UNAVAILABLE`（HTTP 503）。以前这里失败会默默跳过，产出"一半真一半假"的片子。
+
+## 场景契约（分镜 JSON）
+
+```json
+{
+  "title": "标题",
+  "style": "oscilloscope-math",
+  "scenes": [
+    {"kind": "manim", "text": "这一场标题", "narration": "旁白", "seconds": 8,
+     "manim": {"scene": "DerivativeFormula", "code": "from manim import *\nclass DerivativeFormula(Scene):\n    def construct(self):\n        ..."}},
+    {"kind": "text", "text": "一句短话", "narration": "旁白", "seconds": 3}
+  ]
+}
+```
+
+- `style` 可省，省了按人设决定（见下）。项目里写死就按写死的渲。
+- `manim.code` 的硬约束（提示词里也这么要求）：
+  - 只写 `from manim import *` + 一个 `class X(Scene):` + `def construct(self):`
+  - import 只允许 `manim` / `numpy`；禁止文件/网络/subprocess/open/eval/exec/`__import__`/`Scene.embed`
+  - ≤60 行；`MathTex` 可用（MiKTeX 已装）；中文 `Text(..., font="Microsoft YaHei")`
+  - **坐标轴不要 `include_numbers=True`**（刻度数字是 DecimalNumber，逐帧排 TeX，慢且易失败）
+  - 不要自己设背景色：渲染器按风格注入 `self.camera.background_color`
+- `kind` 只是偏好。**真正的引擎按"手里有什么素材"决定**：
+  `manim 脚本 > matplotlib 代码 > draw 图元 > html > 文字卡`，前一个失败自动退到下一个。
+  所以"有 draw 却被 manim 分支吞掉"这种事不会发生了（`sceneEngines()`）。
+
+## 风格预设（studio/styles/*.json）
+
+风格把「整集一套配色/线宽/字体/节奏」变成一份 JSON，渲染时**机械地**套上去：
+
+```json
+{"id":"oscilloscope-math","name":"示波器数学","bg":"#010402","fg":"#8dffb0",
+ "accent":"#4dff88","muted":"#3f7a58","accent2":"#ffb547","line_width":3,
+ "glow":true,"font":"Microsoft YaHei","motion":"slow","camera":"follow"}
+```
+
+| id | 名称 | 底色 | 主色 | 字色 | 线宽 |
+| --- | --- | --- | --- | --- | --- |
+| `oscilloscope-math` | 示波器数学 | `#010402` | `#4dff88` | `#8dffb0` | 3 |
+| `blueprint` | 工程蓝图 | `#18336b` | `#e7f0f9` | `#e7f0f9` | 2 |
+| `whiteboard` | 白板讲解 | `#f7f5ef` | `#2a5cb3` | `#23262c` | 4 |
+
+来源是 [lemomo-ai/lemo-opuscar](https://github.com/lemomo-ai/lemo-opuscar) 对应风格的 `STYLE.md`，
+只提炼"我们的渲染器真能执行"的部分（颜色/线宽/字体/节奏/机位），散文部分压成 `notes` 进提示词。
+
+注入是确定性的（`styles.js` 的 `applyToManimCode`）：
+1. `BLUE/GREEN/TEAL…` → 主色；`YELLOW/GOLD/ORANGE/RED…` → 强调色；`WHITE` → 字色；`GREY…` → 次要色
+2. 插一行 `self.camera.background_color = "<bg>"`
+3. 显式写的 `stroke_width` / `font` 覆盖成风格值
+4. 文字卡用风格底色做渐变、风格字色做文字
+
+风格进画面缓存键（`sceneKey` 里的 `style`）：换风格一定重渲，不会复用旧配色的片段。
+
+### 默认风格由人设决定
+
+`GET /v1/style` 的算法：
+
+```text
+项目/请求显式指定 → 人设（GET 127.0.0.1:8767/v1/persona 的 block 关键词投票）
+                  → 人设缓存（按 version 失效）→ 默认 whiteboard
+```
+
+关键词映射（命中次数投票，同分按顺序）：
+
+| 风格 | 关键词（节选） |
 | --- | --- |
-| 让模型直接出视频 | 控制不了细节，同一个提示两次结果完全不同，改一个字要重画全片 |
-| 模型写分镜 + 程序渲染 | 分镜是可读的 JSON，改一句重跑；同样输入永远同样输出 |
+| `oscilloscope-math` | 数学 公式 方程 函数 微积分 导数 积分 几何 向量 证明 定理 物理 概率 math formula |
+| `blueprint` | 理性 严谨 逻辑 工程 结构 系统 原理 机制 参数 拆解 技术 精确 推导 架构 |
+| `whiteboard` | 温柔 叙事 故事 陪伴 情感 聊天 轻松 童话 日常 治愈 软 可爱 黏人 暖 |
 
-所以分工是硬的：**DSH 负责说话（分镜、旁白文本），ffmpeg 负责画画。**
-
-## 三步渲染
-
-```text
-分镜 JSON
-  ↓ 每场：gradients（两色渐变）+ drawtext（微软雅黑）
-一张 1920x1080 静帧
-  ↓ zoompan 慢推
-一段 3 秒的片段
-  ↓ xfade 串联 + 旁白（speak 模块）+ BGM
-        mp4
-```
-
-## 项目模式：长片与增量修改
-
-一次性接口（`/v1/create`）每次都是整片重渲 —— 改一个字也要重画全部画面。
-长科普视频（几十场）这么干，时间全花在重复劳动上。所以有了项目模式：
-
-```text
-POST /v1/project          {title, scenes?, voice?}     建项目，分镜存盘
-POST /v1/project/patch    {id, patches:[…]}            只发改动
-POST /v1/project/render   {id, scope}                  出片
-GET  /v1/project?id=                                   看当前分镜与缓存索引
-```
-
-### 两种渲染语义
-
-| scope | 含义 | 用在什么时候 |
-| --- | --- | --- |
-| `auto` | **内容优先**：旁白长度决定每场时长，只有画面参数变了的场才重画 | 改了文字/配色后 |
-| `audio` | **画面优先**：所有片段复用，只重合成旁白并重新混音 | 只改台词/换音色 |
-| `all` | 全部重画 | 换了分辨率/字体，或需要绝对一致 |
-
-关键设计：**画面缓存键不含旁白**。所以改一句台词时，`willRebuild` 会是空的 ——
-画面一个字节都不用重画，`scope:'audio'` 秒级出片。
-
-### 三层缓存
-
-```text
-旁白  按 (文本, 音色) 缓存  → 改一句只重合成那一句
-片段  按 (文字, 时长, 配色, 图片, 运镜, 分辨率) 缓存
-拼接  按 (片段列表, 时长, fps) 缓存  → 只换声音时连拼接都不用重跑
-```
-
-### 实测（服务器，2 场 4.74 秒）
-
-| 操作 | 耗时 | 重画场数 |
-| --- | --- | --- |
-| 首次 `auto` | 6593ms | 2 |
-| 改旁白后 `audio` | **1112ms** | 0 |
-| 无改动重渲 | 798ms（3 场测试） | 0 |
-| 改一场文字后 `auto` | 1257ms（3 场测试） | 1 |
-
-`scope:'audio'` 时如果还有场次没渲过，会返回 409 `CLIPS_MISSING` 而不是偷偷改成全量 ——
-悄悄改变语义是最难查的 bug。
-
-### 上限
-
-`maxScenes` 80、`maxTotalSeconds` 900（15 分钟）。真正的瓶颈是渲染时间，不是这些数字。
+缓存写在 `data/studio/persona-style.json`（`{version, styleId, reason}`），
+版本没变就不再算；人设服务挂了就沿用缓存（`source:"cache", stale:true`）。
 
 ## 接口
 
 ```text
-GET  /v1/health                 → {ok, width, height, fps, ffmpeg, font}
-POST /v1/plan   {prompt,seconds}→ {ok, plan}          只写分镜，不渲染
-POST /v1/render {plan,voice,bgm}→ {ok, file, jobId}   只渲染
-POST /v1/create {prompt,seconds,voice,bgm} → 一步到底
+GET  /v1/health                        → {ok,width,height,fps,ffmpeg,font,manim,styles,...}
+GET  /v1/styles                        → 风格列表
+GET  /v1/styles/:id                    → 单个风格（404 STYLE_NOT_FOUND）
+GET  /v1/style                         → 当前生效风格 + reason + source + personaVersion
+POST /v1/plan    {prompt,seconds,style}→ {ok, plan, manimRatio, style}
+POST /v1/render  {plan,voice,bgm,style}→ {ok, file, jobId, style}
+POST /v1/create  {prompt,seconds,voice,bgm,style} → 一步到底（内部走两段式规划）
+POST /v1/project {title,scenes,style}  → 建项目
+POST /v1/project/patch   {id,patches}  → 只发改动
+POST /v1/project/render  {id,scope,style} → 出片（style 会写回项目）
 ```
 
-分镜格式：
+`/v1/create` 现在和 `/v1/plan` 走同一套两段式提示词（以前是另一套 rich/draw 提示词，
+两条路迟早会走偏，所以删了）。
 
-```json
-{"title":"...","scenes":[
-  {"text":"画面上的字","narration":"旁白","seconds":3,
-   "bg":{"c0":"#0b1a3a","c1":"#ff7a3d"}}
-]}
-```
-
-`normalizePlan()` 会把模型给的坏值收进合法范围（场数、时长、颜色格式、总时长封顶），
-渲染阶段就不会因为一句脏数据整片失败。
-
-## 画面：渐变或图片，两种都能运镜
-
-分镜每场可以带 `image` 和 `motion`：
-
-```json
-{"text":"...","narration":"...","seconds":3,
- "bg":{"c0":"#0b1a3a","c1":"#ff7a3d"},
- "image":"sunset.jpg","motion":"zoom-in"}
-```
-
-- `image`：绝对路径，或 `data\studio\images\` 下的文件名（**相对名限制在这个目录内**，防 `..\..\` 读任意文件）
-- `motion`：`zoom-in`（默认）/ `zoom-out` / `pan-left` / `pan-right`
-- 有图：cover 裁切 + 运镜 + 文字压暗带（保证白字在任何图上都读得清）
-- 无图：走原来的渐变 + 居中文字，**代码路径完全没变**（无回归，有 argv 逐项比对和 PSNR=inf 为证）
-
-**已知取舍**：文字是"烤"进静帧的，所以运镜时文字跟着画面动。想文字完全不动，
-得把文字层挪到运镜之后叠加——那是另一套结构，暂未做。
-
-## 旁白决定时长
-
-不再是"先定时长再塞旁白"，而是：
+## 三层缓存
 
 ```text
-每场：先合成旁白 → 量 wav 时长 → seconds = max(原计划, 旁白+0.6)
-     旁白超过 5.4 秒时，6 秒单场上限让位（宁可不截话）
-总时长超上限：只压"下限以上"的部分，任何一场不短于 旁白+0.3
+旁白  按 (文本, 音色) 缓存           → 改一句只重合成那一句
+片段  按 (引擎, 素材, 时长, 风格, 文字卡淡化, 分辨率) 缓存
+拼接  按 (片段列表, 时长, fps) 缓存  → 只换声音时连拼接都不用重跑
 ```
 
-返回里每场带 `actualSeconds` 和 `narrationMs`，顶层带 `overBudget`，面板能显示"为什么这场变长了"。
+`scope`：`auto`（内容优先，旁白决定时长）/ `audio`（画面优先，只重做声音）/ `all`（全重画）。
 
-实测：计划 [3,2,3] 秒 + 旁白 [1.2, 5.0, 0.8] 秒 → 实际 [3, 5.6, 3]，没有截断。
+## 三个踩过的坑（都修了）
 
-## 三个必须知道的坑
+1. **rich 场景丢坐标轴**：以前按 `s.kind` 分派引擎，`kind:'manim'` 但脚本没生成出来的场次
+   会被 `normalizeScene` 改回 `text`，于是 manim 分支不跑、rich 分支（要求 `kind==='rich'`）也不跑，
+   场景里的 `draw.shapes` 被彻底吞掉，最后出了一张没有坐标轴的文字卡。
+   现在按素材排序（`sceneEngines`），有 draw 就一定排在链条里。
+2. **0.4 秒交叉淡化时标题叠加**：xfade 是重叠转场，两张文字卡在 0.4 秒窗口里同时全亮。
+   只给"头尾各 0.15 秒"其实治不了：窗口里两张卡都还是不透明，中点必然是 50/50 重影。
+   所以淡化按 **xfade 中点**摆（`lib/render.js` 的 `staticClip({edgeFade, edgeLead, edgeColor})`）：
+   - 入场：延后 `edgeLead/2`（0.2 秒）开始，时长 `textEdgeFade`（0.15 秒）
+   - 出场：提前 `edgeLead/2` 结束，同样 0.15 秒
+   - 淡到**风格底色**而不是黑（白板这类浅色风格淡到黑会变成一下黑屏闪烁）
+   于是 A 的标题在窗口前半段就淡完、B 的在后半段才出来，重叠为零。
+   项目可以用 `textEdgeFade: 0` 关掉（进画面缓存键，改了一定重渲）。
+3. **偶发回退 huayan 导致音色不一致**：studio 侧改成"渲染前先确认所有旁白都拿到了"，
+   任一失败就整片失败返回 `VOICE_UNAVAILABLE`（503），不产出半真半假的片子。
+   speak 侧的 strict 模式负责"拿不到就别回退"。
 
-**1. 静帧上不能用时间相关的表达式。** `drawtext` 的 `alpha='min(1,t/0.6)'` 看着很合理，
-但静帧只渲染第 0 帧，`t=0` 时 alpha 正好是 0 —— 字会整个消失，画面只剩渐变。
+## 抖动
 
-**2. xfade 是重叠转场，成片会变短。** 4 场 × 3 秒，减 3 次 0.4 秒转场 = **10.8 秒**，
-不是 12 秒。旁白的插入点也要按这个偏移算。
+静帧走 `staticClip`：**不做 zoompan**，一帧铺满整场，逐帧像素完全一致（实测帧差 0.0000）。
+想要运动就交给 manim（真动画），而不是让一张图假动。
 
-**3. `-shortest` 会把成片剪成"最后一句旁白念完"。** 音轨比画面短时（旁白早结束），
-`-shortest` 直接截断画面：10 秒视频 + 2 秒旁白 → 输出只有 2 秒。
-修法是音轨加 `apad`、去掉 `-shortest`，时长统一交给 `-t`。
-
-## BGM
-
-把 mp3 放进 `C:\Apps\DSH-MultiTool\data\studio\bgm\`，请求里 `bgm` 传文件名即可。
-会自动循环、压到 12% 音量，和旁白混音。
-
-## 实测
+## 实测（2026-11-21，服务器 1920×1080@30，无并发干扰）
 
 | 项目 | 结果 |
 | --- | --- |
-| 12 秒 / 4 场 / 4 条旁白 | 21.8s（其中渲染 14s） |
-| 6 秒 / 2 场 | 6.1s |
-| 输出 | 1920×1080 / h264 / AAC / 约 800KB~1.2MB |
+| **60 秒 / 8 场全 manim + 8 条旁白** | **192.4s**（旁白串行 8 句 ≈30s、manim 8 场 143.3s、拼接混音 ≈20s）；成片 61.2s / 1.27MB |
+| 单场 manim | 11.6s ~ 31.6s（简单公式 11.6~16.9s；NumberPlane+Circle+Rotate 31.6s；含 MathTex 首帧 16.9s） |
+| 3 场全 manim（含 MathTex 公式） | 66.2s；成片 23.2s / 491KB |
+| 同场景换风格重渲（manim 1 场 6s） | 22.5s / 12.1s；底色均值 (1.1,4.0,1.4) → (243,242,236) |
+| 3 张文字卡（8.2s） | 7.3~8.2s |
+| GDI 图元场（draw） | 11.5s / 2 场 |
+| 静帧抖动（文字卡片段相邻帧） | **mean_abs_diff 0.000000，max_diff 0，>2 的像素 0** |
+| 输出 | 1920×1080 / h264 / AAC；60 秒约 1.3MB（静态文字卡约 0.17MB/8s） |
+| 文字卡片段复用 | `scope:'audio'` 秒级出片 |
+
+标题重叠（边缘图相关性，"两个标题同时可见的最大值"）：
+
+| 文字卡淡化 | 交界窗口里两标题同时可见 | 中点（2.80s）A / B |
+| --- | --- | --- |
+| 开（0.15s，跨中点） | **0.656**（只是背景板，无字形） | 0.000 / 0.000 |
+| 关（0.00s） | 0.899（真·叠字） | 0.899 / 0.906 |
 
 ## 限制
 
-- **画面只有渐变 + 文字 + 慢推**，没有图片/素材。要做真正的运动镜头得接图片层。
-- **没有转场以外的时间线能力**（无遮罩、无画中画、无逐帧动画）。
-- 旁白用的是 TTS，念多长没法和场景时长精确对齐 —— 太长会压到下一场。
+- manim 每场是**一次真实渲染**：实测 11.6~31.6 秒/场（MiKTeX 首次约 25 秒，之后走缓存）。
+  一集 60 秒（8 场）串行要 3 分钟出头，这是 manim 的固有成本。
+- 旁白必须**串行**合成（BreezeBlue Starter 并发上限 1），8 句约 30 秒；单句超时 150 秒。
+- manim 场景的动画长度由脚本里 `run_time` 之和决定，渲染后统一补帧/截断到本场秒数。
+- 没有转场以外的时间线能力（无遮罩、无画中画、无逐帧关键帧控制）。
+- 表情叠加在成片前一次做完；`html` 需要无头浏览器，服务器上不可用（仅开发机）。

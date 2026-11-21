@@ -1,0 +1,19 @@
+{
+  "id": "oscilloscope-math",
+  "name": "示波器数学",
+  "source": "lemo-opuscar/styles/oscilloscope-math/STYLE.md",
+  "bg": "#010402",
+  "fg": "#8dffb0",
+  "accent": "#4dff88",
+  "muted": "#3f7a58",
+  "accent2": "#ffb547",
+  "line_width": 3,
+  "glow": true,
+  "font": "Microsoft YaHei",
+  "math_font": "",
+  "motion": "slow",
+  "camera": "follow",
+  "bg_mix": 0.18,
+  "grid": true,
+  "notes": "数学是真的：曲线/读数/公式同源。磷光屏黑底 + 电子束绿，白热点 #e6ffec 只给最新画出的点，琥珀 #ffb547 只给测量游标，第二个色不能拿来装饰。"
+}
