@@ -43,7 +43,6 @@ const MAX_BODY = 1024 * 1024;
 
 // 默认写在模块目录之外，push 整目录替换也不会丢掉；DSH_PANEL_DATA 只给自测用
 const DATA_DIR = process.env.DSH_PANEL_DATA || path.join(ROOT, '..', 'data');
-const HISTORY_FILE = path.join(DATA_DIR, 'panel-history.jsonl');
 const HISTORY_MAX_LINES = 1000;
 const HISTORY_TRIM_TO = 800;
 
@@ -81,10 +80,48 @@ function ensureDataDir() {
   }
 }
 
-function readHistory(limit) {
+// 历史按用户分文件：多人共用面板时，谁也别看到谁的对话。
+const HISTORY_DIR = path.join(DATA_DIR, 'panel-history');
+
+function historyFile(userId) {
+  return path.join(HISTORY_DIR, `${Number(userId) || 0}.jsonl`);
+}
+
+/**
+ * 从 Bearer token 解析出当前用户（问 separator 要）。
+ * 60 秒缓存：面板一轮对话会连着发好几个请求，不该每次都去问一次。
+ */
+const userCache = new Map(); // tokenHash -> { user, at }
+const USER_TTL_MS = 60 * 1000;
+
+async function currentUser(req) {
+  const token = bearer(req);
+  if (!token) return null;
+  const key = crypto.createHash('sha256').update(token).digest('hex');
+  const hit = userCache.get(key);
+  if (hit && Date.now() - hit.at < USER_TTL_MS) return hit.user;
+
   try {
-    if (!fs.existsSync(HISTORY_FILE)) return [];
-    const lines = fs.readFileSync(HISTORY_FILE, 'utf8').split('\n').filter(Boolean);
+    const res = await fetch(`${SEPARATOR_BASE}/v1/auth/me`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) { userCache.delete(key); return null; }
+    const data = await res.json().catch(() => null);
+    const user = data && data.user ? data.user : null;
+    if (user) userCache.set(key, { user, at: Date.now() });
+    return user;
+  } catch (err) {
+    log(`auth/me failed: ${err.message}`);
+    return null;
+  }
+}
+
+function readHistory(userId, limit) {
+  try {
+    const file = historyFile(userId);
+    if (!fs.existsSync(file)) return [];
+    const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
     const slice = limit > 0 ? lines.slice(-limit) : lines;
     const messages = [];
     for (const line of slice) {
@@ -102,34 +139,52 @@ function readHistory(limit) {
   }
 }
 
-function appendHistory(entry) {
+function appendHistory(userId, entry) {
   try {
-    ensureDataDir();
-    fs.appendFileSync(HISTORY_FILE, `${JSON.stringify(entry)}\n`, 'utf8');
-    trimHistory();
+    const file = historyFile(userId);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file, `${JSON.stringify(entry)}\n`, 'utf8');
+    trimHistory(userId);
   } catch (err) {
     log(`history write failed: ${err.message}`);
   }
 }
 
-function trimHistory() {
+function trimHistory(userId) {
   try {
-    const size = fs.statSync(HISTORY_FILE).size;
+    const file = historyFile(userId);
+    const size = fs.statSync(file).size;
     if (size < 2 * 1024 * 1024) return;
-    const lines = fs.readFileSync(HISTORY_FILE, 'utf8').split('\n').filter(Boolean);
+    const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
     if (lines.length <= HISTORY_MAX_LINES) return;
-    fs.writeFileSync(HISTORY_FILE, `${lines.slice(-HISTORY_TRIM_TO).join('\n')}\n`, 'utf8');
-    log(`history trimmed to ${HISTORY_TRIM_TO} entries`);
+    fs.writeFileSync(file, `${lines.slice(-HISTORY_TRIM_TO).join('\n')}\n`, 'utf8');
+    log(`history trimmed to ${HISTORY_TRIM_TO} entries (user ${userId})`);
   } catch (err) {
     log(`history trim failed: ${err.message}`);
   }
 }
 
-function clearHistory() {
+function clearHistory(userId) {
   try {
-    if (fs.existsSync(HISTORY_FILE)) fs.writeFileSync(HISTORY_FILE, '', 'utf8');
+    const file = historyFile(userId);
+    if (fs.existsSync(file)) fs.writeFileSync(file, '', 'utf8');
   } catch (err) {
     log(`history clear failed: ${err.message}`);
+  }
+}
+
+/** 老版本只有一份全局历史。第一次启动时改名归档，避免谁的账号里突然冒出别人的对话。 */
+function archiveLegacyHistory() {
+  try {
+    const legacy = path.join(DATA_DIR, 'panel-history.jsonl');
+    if (!fs.existsSync(legacy)) return;
+    fs.mkdirSync(HISTORY_DIR, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const dest = path.join(HISTORY_DIR, `legacy-${stamp}.jsonl`);
+    fs.renameSync(legacy, dest);
+    log(`legacy global history archived -> ${path.basename(dest)}`);
+  } catch (err) {
+    log(`legacy archive failed: ${err.message}`);
   }
 }
 
@@ -184,7 +239,8 @@ function bearer(req) {
 function protectedPath(pathname) {
   return pathname === '/api/input' || pathname === '/api/persona' ||
     pathname.startsWith('/api/memory/') || pathname.startsWith('/api/video') ||
-    pathname === '/api/tts' || pathname === '/api/asr';
+    pathname === '/api/tts' || pathname === '/api/asr' ||
+    pathname === '/api/history';
 }
 
 /** 服务间直连 POST（视频模块 / io）：不走 req 透传，因为要拿回结果再二次加工。 */
@@ -298,12 +354,15 @@ async function completeVideo(req, res, v, label) {
       error: (v.data && v.data.error) || `video module HTTP ${v.status}`,
     });
   }
+  const user = await currentUser(req);
   const io = await postJson(IO_BASE, '/v1/input',
     { text: buildVideoTask(v.data, label), sessionId: 'panel-video' },
     { authorization: req.headers.authorization || '' }, 600000);
   const reply = (io.data && io.data.answer) || '';
-  appendHistory({ role: 'user', text: label ? `[视频] ${label}` : '[视频]', ts: Date.now() });
-  if (reply) appendHistory({ role: 'assistant', text: reply, ts: Date.now(), usage: (io.data && io.data.usage) || null });
+  if (user) {
+    appendHistory(user.id, { role: 'user', text: label ? `[视频] ${label}` : '[视频]', ts: Date.now() });
+    if (reply) appendHistory(user.id, { role: 'assistant', text: reply, ts: Date.now(), usage: (io.data && io.data.usage) || null });
+  }
   return sendJson(res, 200, {
     ok: true,
     analysis: v.data,
@@ -404,17 +463,24 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && url.pathname === '/api/history') {
+      const user = await currentUser(req);
+      if (!user) return sendJson(res, 401, { ok: false, error: '未登录或会话已过期' });
       const limit = Number(url.searchParams.get('limit') || 200);
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-      return res.end(JSON.stringify({ ok: true, messages: readHistory(limit) }));
+      return res.end(JSON.stringify({ ok: true, messages: readHistory(user.id, limit) }));
     }
 
     if (req.method === 'DELETE' && url.pathname === '/api/history') {
-      clearHistory();
+      const user = await currentUser(req);
+      if (!user) return sendJson(res, 401, { ok: false, error: '未登录或会话已过期' });
+      clearHistory(user.id);
+      log(`history cleared for user ${user.id}`);
       return sendJson(res, 200, { ok: true, cleared: true });
     }
 
     if (req.method === 'POST' && url.pathname === '/api/input') {
+      const user = await currentUser(req);
+      if (!user) return sendJson(res, 401, { ok: false, code: 'E_UNAUTHORIZED', error: '未登录或会话已过期' });
       const raw = await readBody(req);
       let text = '';
       try {
@@ -422,7 +488,7 @@ const server = http.createServer(async (req, res) => {
       } catch {
         /* upstream will reject it */
       }
-      if (text) appendHistory({ role: 'user', text, ts: Date.now() });
+      if (text) appendHistory(user.id, { role: 'user', text, ts: Date.now() });
 
       return proxy(req, res, '/v1/input', raw, (status, payload) => {
         let data = {};
@@ -434,10 +500,10 @@ const server = http.createServer(async (req, res) => {
         // 401 是用户态问题，不写进对话历史，避免每次掉线都留一条错误
         if (status === 401) return;
         if (data && data.ok) {
-          appendHistory({ role: 'assistant', text: data.answer || '', ms: data.ms, usage: data.usage || null, ts: Date.now() });
+          appendHistory(user.id, { role: 'assistant', text: data.answer || '', ms: data.ms, usage: data.usage || null, ts: Date.now() });
         } else {
           const reason = (data && (data.error || data.code)) || `HTTP ${status}`;
-          appendHistory({ role: 'error', text: String(reason), ts: Date.now() });
+          appendHistory(user.id, { role: 'error', text: String(reason), ts: Date.now() });
         }
       });
     }
@@ -539,7 +605,8 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   ensureDataDir();
-  log(`listening on http://${HOST}:${PORT}  io=${IO_BASE}  separator=${SEPARATOR_BASE}  history=${HISTORY_FILE}`);
+  archiveLegacyHistory();
+  log(`listening on http://${HOST}:${PORT}  io=${IO_BASE}  separator=${SEPARATOR_BASE}  history=${HISTORY_DIR}`);
 });
 
 function shutdown(signal) {
