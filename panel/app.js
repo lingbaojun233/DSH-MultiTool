@@ -1738,6 +1738,66 @@ function studioStickerPlacement(scene, ordinal) {
   };
 }
 
+/**
+ * 一场空白分镜：追加（「加一场」）和中间插入共用一份。
+ * dirty=true：这场还没生成过动画，提交时不会带 kind / manim 代码，
+ * studio 看到"没有成品"就会重新生成，不会被当成"没改"复用旧缓存。
+ */
+function studioBlankScene() {
+  return {
+    text: '',
+    narration: '',
+    seconds: 5,
+    visual_hint: '',
+    tool: '',
+    kind: 'text',
+    manim: null,
+    status: 'pending',
+    note: '',
+    image: '',
+    stickers: [],
+    dirty: true,
+  };
+}
+
+/** 相邻卡片之间的插入条：平时是一条细线，移上去才露出「+ 在这里插入一场」。 */
+function studioInsertBar(at) {
+  const wrap = document.createElement('div');
+  wrap.className = 'scene-insert';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'scene-insert-btn';
+  btn.dataset.insertAt = String(at);
+  btn.title = at >= studioScenes.length
+    ? '在最后追加一场空白分镜'
+    : `在第 ${Number(at) + 1} 场前面插入一场空白分镜`;
+  const label = document.createElement('span');
+  label.textContent = '+ 在这里插入一场';
+  btn.append(label);
+  wrap.append(btn);
+  return wrap;
+}
+
+/**
+ * 把焦点放到第 index 场的「标题」，并把它滚到看得见的位置。
+ * 插入/追加之后都走这里：别让人自己往下找新加的那一场。
+ */
+function focusStudioScene(index) {
+  if (!studioEls.sceneList) return;
+  const row = studioEls.sceneList.querySelector(`.scene[data-index="${index}"]`);
+  if (!row) return;
+  const title = row.querySelector('.scene-text');
+  if (title) {
+    // preventScroll：滚动交给下面的 scrollIntoView，别两边同时抢
+    try { title.focus({ preventScroll: true }); } catch (err) { title.focus(); }
+  }
+  if (row.scrollIntoView) {
+    try { row.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (err) { row.scrollIntoView(); }
+  }
+  row.classList.add('scene-fresh');
+  setTimeout(() => row.classList.remove('scene-fresh'), 1600);
+}
+
 /** 整块重建。只在增删场次 / 换新分镜时调用，输入过程中绝不重排 DOM。 */
 function renderStudioScenes() {
   if (!studioEls.sceneList) return;
@@ -1751,6 +1811,8 @@ function renderStudioScenes() {
   }
 
   studioScenes.forEach((scene, index) => {
+    // 每张卡片前面一条插入条：第 N 条 = 插到第 N 场之前（最后一条 = 追加到末尾）
+    studioEls.sceneList.append(studioInsertBar(index));
     const row = document.createElement('div');
     row.className = 'scene';
     row.dataset.index = String(index);
@@ -1826,6 +1888,7 @@ function renderStudioScenes() {
     }
     studioEls.sceneList.append(row);
   });
+  studioEls.sceneList.append(studioInsertBar(studioScenes.length));
 }
 
 /** 分镜框那一行的标题：标题 + 场数 + 总时长。编辑时只动这行字。 */
@@ -2326,28 +2389,42 @@ function studioDeleteScene(event) {
   updateStudioHint();
 }
 
-function studioAddScene() {
-  studioScenes.push({
-    text: '',
-    narration: '',
-    seconds: 5,
-    visual_hint: '',
-    tool: '',
-    kind: 'text',
-    manim: null,
-    status: 'pending',
-    note: '',
-    image: '',
-    stickers: [],
-    dirty: true,
-  });
+/**
+ * 在第 at 场前面插入一场空白分镜（at = 数组长度就是追加到末尾）。
+ * 直接改数组再整块重建：所有「第 N 场」「约 X 秒」「共 N 场」都按新顺序重算。
+ */
+function studioInsertScene(at) {
+  const total = studioScenes.length;
+  let pos = Math.floor(Number(at));
+  if (!Number.isFinite(pos)) pos = total;
+  pos = Math.max(0, Math.min(total, pos));
+  studioScenes.splice(pos, 0, studioBlankScene());
   studioScenesTouched = true;
   markStudioRedoChanged();
   renderStudioScenes();
   updateStudioMeta();
   updateStudioHint();
-  const texts = studioEls.sceneList ? studioEls.sceneList.querySelectorAll('.scene-text') : [];
-  if (texts.length) texts[texts.length - 1].focus();
+  focusStudioScene(pos);
+  setStudioSceneHint(`已在第 ${pos + 1} 场插入一场空白分镜，改完点「开始做」。`);
+}
+
+/** 插入条上的点击：data-insert-at 就是这个位置在数组里的下标。 */
+function onStudioSceneInsert(event) {
+  const btn = event.target.closest('[data-insert-at]');
+  if (!btn) return;
+  const at = Number(btn.dataset.insertAt);
+  if (!Number.isFinite(at)) return;
+  studioInsertScene(at);
+}
+
+function studioAddScene() {
+  studioScenes.push(studioBlankScene());
+  studioScenesTouched = true;
+  markStudioRedoChanged();
+  renderStudioScenes();
+  updateStudioMeta();
+  updateStudioHint();
+  focusStudioScene(studioScenes.length - 1);
 }
 
 /** 分镜 → 交给 studio 的场景数组。tool=text 时把旧代码丢掉，别让文字卡带着动画。 */
@@ -3652,6 +3729,7 @@ if (studioEls.sceneList) {
   studioEls.sceneList.addEventListener('click', onStudioSceneImageClick);
   studioEls.sceneList.addEventListener('click', onStudioSceneStickerClick);
   studioEls.sceneList.addEventListener('click', studioDeleteScene);
+  studioEls.sceneList.addEventListener('click', onStudioSceneInsert);
 }
 // 参考图：首屏那个小按钮和分镜行共用同一个 file input
 if (studioEls.refBtn) studioEls.refBtn.addEventListener('click', () => pickStudioImage('ref'));
