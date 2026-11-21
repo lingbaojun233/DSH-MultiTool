@@ -528,13 +528,155 @@ async function refreshHealth() {
   }
 }
 
+// ------------------------------------------------------- 聊天里的附件（视频） --
+
+const attachBtn = document.getElementById('attach');
+const attachFile = document.getElementById('attachFile');
+const attachList = document.getElementById('attachList');
+let pendingVideo = null;
+
+function renderAttachChip() {
+  if (!attachList) return;
+  attachList.innerHTML = '';
+  if (!pendingVideo) {
+    attachList.classList.add('hidden');
+    return;
+  }
+  attachList.classList.remove('hidden');
+
+  const chip = document.createElement('div');
+  chip.className = 'attach-chip';
+
+  const name = document.createElement('span');
+  name.className = 'attach-name';
+  name.textContent = `🎬 ${pendingVideo.name} · ${(pendingVideo.size / 1048576).toFixed(1)} MB`;
+  chip.appendChild(name);
+
+  const barWrap = document.createElement('div');
+  barWrap.className = 'attach-bar';
+  const bar = document.createElement('div');
+  bar.className = 'attach-bar-fill';
+  barWrap.appendChild(bar);
+  chip.appendChild(barWrap);
+
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'attach-x';
+  remove.textContent = '×';
+  remove.title = '移除';
+  remove.onclick = () => { pendingVideo = null; renderAttachChip(); };
+  chip.appendChild(remove);
+
+  attachList.appendChild(chip);
+}
+
+function updateAttachProgress(frac) {
+  const bar = attachList && attachList.querySelector('.attach-bar-fill');
+  if (bar) bar.style.width = Math.max(0, Math.min(1, frac)) * 100 + '%';
+}
+
+/** 把附件小条塞进这条用户消息的气泡里（刷新历史后就没有了，历史只存文字）。 */
+function attachChipTo(wrap, label) {
+  const bubble = wrap.querySelector('.bubble');
+  if (!bubble) return;
+  const chip = document.createElement('div');
+  chip.className = 'bubble-attach';
+  chip.textContent = '🎬 ' + label;
+  bubble.insertBefore(chip, bubble.firstChild);
+}
+
+/** 回复下面挂一份"模型看到的/听到的"，默认收起。 */
+function attachVideoDetails(wrap, analysis) {
+  if (!analysis || !wrap) return;
+  const box = document.createElement('details');
+  box.className = 'msg-details';
+  const sum = document.createElement('summary');
+  sum.textContent = '它看到了什么';
+  box.appendChild(sum);
+
+  const body = document.createElement('div');
+  body.className = 'muted';
+  const lines = [];
+  if (analysis.synopsis) lines.push('画面：' + analysis.synopsis);
+  if (analysis.audio && analysis.audio.ok) {
+    if (analysis.audio.transcript) lines.push('听到的话：' + analysis.audio.transcript);
+    if (analysis.audio.summary) lines.push('声音：' + analysis.audio.summary);
+  }
+  if (Array.isArray(analysis.timeline) && analysis.timeline.length) {
+    lines.push('时间线：' + analysis.timeline.map((t) => `${t.t} ${t.what}`).join('；'));
+  }
+  body.textContent = lines.join('\n');
+  box.appendChild(body);
+  wrap.appendChild(box);
+}
+
+async function sendWithVideo(text) {
+  const file = pendingVideo;
+  busy = true;
+  sendBtn.disabled = true;
+  inputEl.value = '';
+  autoGrow();
+
+  const userWrap = addMessage('user', text || '（发了段视频）', formatClock(Date.now()));
+  attachChipTo(userWrap, file.name);
+  const pending = addPending();
+  const started = performance.now();
+
+  try {
+    setStatus('busy', '上传视频 0%…');
+    const up = await uploadVideoFile(file, (frac) => {
+      updateAttachProgress(frac);
+      setStatus('busy', `上传视频 ${Math.round(frac * 100)}%…`);
+    });
+    setStatus('busy', '抽帧、听声音、让它看…');
+    updateAttachProgress(1);
+
+    const data = await apiJson('/api/video/analyze-file', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ uploadId: up.uploadId, text, frames: 8 }),
+    });
+    pending.remove();
+
+    if (data && data.ok) {
+      const ms = Math.round(performance.now() - started);
+      const replyWrap = addMessage('assistant', data.reply || '（空答案）',
+        `${(ms / 1000).toFixed(1)} 秒${data.tokens ? ' · ' + data.tokens.total + ' token' : ''} · ${formatClock(Date.now())}`);
+      attachVideoDetails(replyWrap, data.analysis);
+    } else {
+      addMessage('error', (data && (data.error || data.code)) || '看视频失败');
+    }
+  } catch (err) {
+    pending.remove();
+    addMessage('error', String(err && err.message ? err.message : err));
+  } finally {
+    pendingVideo = null;
+    renderAttachChip();
+    busy = false;
+    sendBtn.disabled = !currentUser;
+    setStatus('', '');
+    refreshHealth();
+    if (currentUser) inputEl.focus();
+  }
+}
+
+if (attachBtn) {
+  attachBtn.addEventListener('click', () => attachFile.click());
+  attachFile.addEventListener('change', () => {
+    const f = attachFile.files && attachFile.files[0];
+    if (f) { pendingVideo = f; renderAttachChip(); }
+    attachFile.value = '';
+  });
+}
+
 async function send() {
   const text = inputEl.value.trim();
-  if (!text || busy) return;
+  if ((!text && !pendingVideo) || busy) return;
   if (!currentUser) {
     showAuth('login', '请先登录');
     return;
   }
+  if (pendingVideo) return sendWithVideo(text);
 
   busy = true;
   sendBtn.disabled = true;

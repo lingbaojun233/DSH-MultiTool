@@ -411,7 +411,7 @@ async function energyProfile(wavFile, windowSec, deadline) {
 }
 
 /** 把能量曲线翻译成"听到了什么"。所有推断性结论都带"像"，不装成事实。 */
-function describeAudio(profile, transcript, truncated) {
+function describeAudio(profile, transcript, truncated, confidence) {
   const segs = profile.segments || [];
   if (!segs.length) return { events: [], summary: '没听到任何声音（整段静音）', speechSeconds: 0 };
 
@@ -459,7 +459,10 @@ function describeAudio(profile, transcript, truncated) {
   if (quiet === segs.length) parts.push('整段基本静音');
   else if (quiet > segs.length * 0.6) parts.push('大部分时间是安静/静音');
 
-  if (transcript && transcript.length >= 4) {
+  if (transcript && typeof confidence === 'number' && confidence < 0.5) {
+    // 背景嘈杂时 SAPI 会把噪声听成"句子"，这时说"听得到人说话"就是撒谎
+    parts.push('有类似人声的声音，但识别置信度只有 ' + confidence.toFixed(2) + '，内容不可靠');
+  } else if (transcript && transcript.length >= 4) {
     parts.push('听得到人说话');
   } else if (transcript) {
     // 只有"阿""嗯"这类语气词，不能算"有人在说话"
@@ -581,7 +584,7 @@ const server = http.createServer(async (req, res) => {
           asr = await transcribe(buf, 'audio/wav');
         } catch { }
 
-        const desc = describeAudio(prof, (asr.text || '').trim(), truncated);
+        const desc = describeAudio(prof, (asr.text || '').trim(), truncated, asr.confidence);
         const result = {
           ok: true,
           ms: Date.now() - t0,
