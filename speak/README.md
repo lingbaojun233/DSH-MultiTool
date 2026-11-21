@@ -25,6 +25,30 @@ api-key 换成 query / header / 表单 → 仍是 404 或 url error
 
 `config.json` 里 `provider` 改成 `"qwen"` 会明确报 `QWEN_AUDIO_NOT_ROUTED` 而不是假装成功 —— 等拿到可用音频路由再填。
 
+## 五个音色，按名字点单
+
+`POST /v1/speak {text, voice}` 里的 `voice` 决定用哪个引擎，调用方不用关心底层：
+
+| voice | 引擎 | 特点 |
+| --- | --- | --- |
+| `huayan` | Piper (CPU, onnx) | **默认**，22050Hz，音质最好，约 1.2s/句，峰值 160MB |
+| `huayan-fast` | Piper x_low | 约 0.94s/句、92MB，但声调有损 |
+| `yaoyao` | WinRT OneCore | 0.88s/句，年轻女声，系统自带 |
+| `huihui` | WinRT OneCore | 老式播音腔（就是最初那个） |
+| `kangkang` | WinRT OneCore | 男声 |
+
+`config.json` 的 `voice` 是默认值，重启生效。
+
+Piper 装在 `C:\Apps\DSH-MultiTool\tools\piper\`（包含 `espeak-ng-data\` 与 VC 运行时 dll，
+都是 app-local 部署，没装系统级 redist）。
+
+### 为什么不用 xiao_ya / keqing 这些"角色音色"
+
+它们是 **pinyin 音素表**模型（`"phoneme_type":"pinyin"`，音素是多字符的 `zh`/`ai`/`ang`），
+而 Piper 1.2.0 只接受单码点音素，直接报 `"ai" is not a single codepoint`，wav 0 字节。
+要换人声得上 sherpa-onnx 的 pinyin 模型 —— 注意那个 `sherpa-onnx-non-streaming-tts-x64.exe`
+是 GUI 子系统，当 CLI 用会静默挂起，得找官方 CLI 版。
+
 ## 接口
 
 ```text

@@ -24,14 +24,40 @@ function readJson(file, fallback) {
 
 const CFG = Object.assign({
   port: 8770,
-  provider: 'winrt',         // winrt（OneCore 音色，推荐）| sapi（老引擎）| qwen（未接通）
-  voice: 'Yaoyao',           // OneCore: Yaoyao / Huihui / Kangkang
+  provider: 'piper',         // piper（huayan，音质最好）| winrt（Yaoyao/Huihui/Kangkang）| sapi | qwen
+  voice: 'huayan',
   rate: -1,
   maxChars: 300,
   gateway: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
   qwenModel: 'qwen-audio-3.0-tts-plus',
   requestTimeoutMs: 60000,
+  piperExe: 'C:\\Apps\\DSH-MultiTool\\tools\\piper\\piper.exe',
+  piperDir: 'C:\\Apps\\DSH-MultiTool\\tools\\piper',
 }, readJson(path.join(DIR, 'config.json'), {}));
+
+/**
+ * 音色表：名字 → 用哪个引擎、哪个模型。
+ * 让面板/调用方按名字点单，不用关心底下是 piper 还是 WinRT。
+ */
+function voiceTable() {
+  const p = CFG.piperDir;
+  return {
+    huayan: { engine: 'piper', model: `${p}\\models\\huayan\\zh_CN-huayan-medium.onnx`, config: `${p}\\models\\huayan\\zh_CN-huayan-medium.onnx.json` },
+    'huayan-fast': { engine: 'piper', model: `${p}\\models\\x_low\\zh_CN-huayan-x_low.onnx`, config: `${p}\\models\\x_low\\zh_CN-huayan-x_low.onnx.json` },
+    yaoyao: { engine: 'winrt', match: 'Yaoyao' },
+    huihui: { engine: 'winrt', match: 'Huihui' },
+    kangkang: { engine: 'winrt', match: 'Kangkang' },
+  };
+}
+
+function resolveVoice(name) {
+  const table = voiceTable();
+  const key = String(name || CFG.voice || 'huayan').toLowerCase();
+  if (table[key]) return { name: key, ...table[key] };
+  // 认不出来就退回默认，别让调用直接失败
+  const fallback = table[String(CFG.voice || 'huayan').toLowerCase()] || table.huayan;
+  return { name: CFG.voice || 'huayan', ...fallback };
+}
 
 const OUT_DIR = path.join(DIR, 'out');
 
@@ -152,9 +178,57 @@ async function synthesizeQwen() {
   };
 }
 
+/** Piper（离线、CPU、huayan 音色）。文本走 stdin，必须 UTF-8 无 BOM + \n。 */
+async function synthesizePiper(text, voice) {
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+  const stamp = `${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
+  const wavFile = path.join(OUT_DIR, `p-${stamp}.wav`);
+  const args = [
+    '--model', voice.model,
+    '--config', voice.config,
+    '--output_file', wavFile,
+    '--length_scale', '1.0',
+    '--noise_scale', '0.667',
+    '--noise_w', '0.8',
+    '--sentence_silence', '0.2',
+  ];
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(CFG.piperExe, args, { windowsHide: true });
+    } catch (err) {
+      resolve({ ok: false, error: 'PIPER_SPAWN: ' + (err && err.message || err) });
+      return;
+    }
+    let err = '';
+    const timer = setTimeout(() => { try { child.kill(); } catch { } }, CFG.requestTimeoutMs);
+    child.stderr.on('data', (d) => { err += d.toString('utf8'); });
+    child.on('error', (e) => { clearTimeout(timer); resolve({ ok: false, error: 'PIPER_ERROR: ' + (e && e.message || e) }); });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      const exists = fs.existsSync(wavFile);
+      if (code !== 0 || !exists || fs.statSync(wavFile).size < 1000) {
+        resolve({ ok: false, error: `PIPER_FAILED(code=${code}): ${err.slice(0, 300)}` });
+        return;
+      }
+      resolve({ ok: true, file: wavFile, provider: 'piper', info: { voice: voice.name || 'huayan' } });
+    });
+    try {
+      // 只送一行；末尾的换行是 piper 判定"这一句结束"的依据
+      child.stdin.write(text + '\n', 'utf8');
+      child.stdin.end();
+    } catch (e) {
+      clearTimeout(timer);
+      resolve({ ok: false, error: 'PIPER_STDIN: ' + (e && e.message || e) });
+    }
+  });
+}
+
 async function synthesize(text, voice, rate) {
+  const picked = resolveVoice(voice);
+  if (picked.engine === 'piper') return synthesizePiper(text, picked);
+  if (picked.engine === 'winrt') return synthesizeWinRt(text, picked.match);
   if (CFG.provider === 'qwen') return synthesizeQwen(text, voice, rate);
-  if (CFG.provider === 'winrt') return synthesizeWinRt(text, voice);
   return synthesizeWindows(text, voice, rate);
 }
 
@@ -167,6 +241,8 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         provider: CFG.provider,
         voice: CFG.voice || 'auto',
+        voices: Object.keys(voiceTable()),
+        piper: fs.existsSync(CFG.piperExe),
         rate: CFG.rate,
         scripts: {
           winrt: fs.existsSync(path.join(DIR, 'tts-winrt.ps1')),
