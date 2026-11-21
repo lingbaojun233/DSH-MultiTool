@@ -289,6 +289,9 @@ function protectedPath(pathname) {
     pathname === '/api/tts' || pathname === '/api/asr' ||
     pathname === '/api/history' || pathname === '/api/studio/create' ||
     pathname === '/api/studio/plan' || pathname === '/api/studio/render' ||
+    pathname === '/api/studio/script' || pathname === '/api/studio/scenes' ||
+    pathname === '/api/studio/project' || pathname === '/api/studio/project/render' ||
+    pathname === '/api/studio/binding' ||
     pathname === '/api/stickers/send' || pathname === '/api/stickers/favorite' ||
     pathname === '/api/message' || pathname === '/api/upload';
   // 注意：GET /api/upload/:id（预览）故意不在这里 —— <img>/<video>/新窗口都带不了
@@ -1065,6 +1068,7 @@ const handler = async (req, res) => {
       const r = await postJson(STUDIO_BASE, '/v1/create', {
         prompt,
         seconds: Number(body.seconds) || 12,
+        style: body.style || '',
         voice: body.voice || '',
         bgm: body.bgm || '',
       }, { authorization: req.headers.authorization || '' }, 1200000);
@@ -1083,11 +1087,108 @@ const handler = async (req, res) => {
       const r = await postJson(STUDIO_BASE, '/v1/plan', {
         prompt,
         seconds: Number(body.seconds) || 12,
-      }, { authorization: req.headers.authorization || '' }, 180000);
+        style: body.style || '',
+        voice: body.voice || '',
+      }, { authorization: req.headers.authorization || '' }, 300000);
       if (!r.data) return sendJson(res, 502, { ok: false, error: `studio HTTP ${r.status}` });
       const scenes = (r.data.plan && Array.isArray(r.data.plan.scenes)) ? r.data.plan.scenes.length : 0;
       log(`studio plan ok=${r.data.ok} scenes=${scenes} ms=${r.data.ms || 0}`);
       return sendJson(res, r.status || 200, r.data);
+    }
+
+    // 写稿模式：一段稿子 → 4~10 场分镜（只拆，不渲染）
+    if (req.method === 'POST' && url.pathname === '/api/studio/script') {
+      const raw = await readBody(req, 1024 * 1024);
+      let body = {};
+      try { body = JSON.parse(raw.toString('utf8')) || {}; } catch { }
+      const script = String(body.script || '').trim();
+      if (!script) return sendJson(res, 400, { ok: false, error: '先把稿子贴进来' });
+      const r = await postJson(STUDIO_BASE, '/v1/storyboard/from-script', {
+        script,
+        seconds: Number(body.seconds) || 60,
+        style: body.style || '',
+        voice: body.voice || '',
+        projectId: body.projectId || '',
+      }, { authorization: req.headers.authorization || '' }, 300000);
+      if (!r.data) return sendJson(res, 502, { ok: false, error: `studio HTTP ${r.status}` });
+      log(`studio script ok=${r.data.ok} scenes=${(r.data.scenes || []).length} ms=${r.data.ms || 0}`);
+      return sendJson(res, r.status || 200, r.data);
+    }
+
+    // 分镜模式：用户填的每场 → 补引擎与 manim 代码（visual_hint 在这里翻译成代码）
+    if (req.method === 'POST' && url.pathname === '/api/studio/scenes') {
+      const raw = await readBody(req, 1024 * 1024);
+      let body = {};
+      try { body = JSON.parse(raw.toString('utf8')) || {}; } catch { }
+      const scenes = Array.isArray(body.scenes) ? body.scenes : [];
+      if (!scenes.length) return sendJson(res, 400, { ok: false, error: '分镜是空的' });
+      const r = await postJson(STUDIO_BASE, '/v1/storyboard/from-scenes', {
+        title: body.title || '',
+        projectId: body.projectId || '',
+        scenes,
+        style: body.style || '',
+        voice: body.voice || '',
+      }, { authorization: req.headers.authorization || '' }, 900000);
+      if (!r.data) return sendJson(res, 502, { ok: false, error: `studio HTTP ${r.status}` });
+      log(`studio scenes ok=${r.data.ok} manim=${(r.data.stats && r.data.stats.manim) || 0}/${scenes.length}`);
+      return sendJson(res, r.status || 200, r.data);
+    }
+
+    // 建/改草稿项目（分镜补全后要一个稳定的 id 才能取进度、取成片）
+    if (req.method === 'POST' && url.pathname === '/api/studio/project') {
+      const raw = await readBody(req, 1024 * 1024);
+      let body = {};
+      try { body = JSON.parse(raw.toString('utf8')) || {}; } catch { }
+      const scenes = Array.isArray(body.scenes) ? body.scenes : [];
+      if (!scenes.length) return sendJson(res, 400, { ok: false, error: '分镜是空的' });
+      const r = await postJson(STUDIO_BASE, '/v1/project', {
+        id: body.id || '',
+        title: body.title || '未命名',
+        scenes,
+        style: body.style || '',
+        voice: body.voice || '',
+      }, { authorization: req.headers.authorization || '' }, 60000);
+      if (!r.data) return sendJson(res, 502, { ok: false, error: `studio HTTP ${r.status}` });
+      return sendJson(res, r.status || 200, r.data);
+    }
+
+    // 渲染项目：长请求（1~3 分钟），进度另走 /api/studio/progress 轮询
+    if (req.method === 'POST' && url.pathname === '/api/studio/project/render') {
+      const raw = await readBody(req, 1024 * 1024);
+      let body = {};
+      try { body = JSON.parse(raw.toString('utf8')) || {}; } catch { }
+      const id = String(body.id || '').trim();
+      if (!id) return sendJson(res, 400, { ok: false, error: '缺项目 id' });
+      const r = await postJson(STUDIO_BASE, '/v1/project/render', {
+        id,
+        scope: body.scope || 'auto',
+        style: body.style || '',
+        voice: body.voice || '',
+        bgm: body.bgm || '',
+      }, { authorization: req.headers.authorization || '' }, 1200000);
+      if (!r.data) return sendJson(res, 502, { ok: false, error: `studio HTTP ${r.status}` });
+      log(`studio project render ok=${r.data.ok} job=${r.data.renderId || '-'} ms=${r.data.ms || 0}`);
+      return sendJson(res, r.status || 200, r.data);
+    }
+
+    // 渲染进度（浏览器每 1.5 秒问一次）
+    if (req.method === 'GET' && url.pathname === '/api/studio/progress') {
+      return proxy(req, res, '/v1/project/progress' + url.search, null, null, STUDIO_BASE);
+    }
+
+    // 人设绑定：当前音色 / 风格 / 语气，以及一句话解释
+    if (req.method === 'GET' && url.pathname === '/api/studio/binding') {
+      return proxy(req, res, '/v1/persona-binding' + url.search, null, null, STUDIO_BASE);
+    }
+
+    // 风格预设（"跟人设"以外的显式选择）
+    if (req.method === 'GET' && url.pathname === '/api/studio/styles') {
+      return proxy(req, res, '/v1/styles', null, null, STUDIO_BASE);
+    }
+
+    // 音色下拉：中文音色池（BreezeBlue），当前音色由人设决定
+    if (req.method === 'GET' && url.pathname === '/api/studio/voices') {
+      return proxy(req, res, '/v1/voices?zh=1', null, null, SPEAK_BASE);
     }
 
     // 用面板改过的分镜重渲：分镜本身只有几 KB，1MB 上限绰绰有余。

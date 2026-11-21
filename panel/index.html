@@ -85,58 +85,113 @@
       </div>
     </section>
 
-    <!-- 视频页只剩"做视频"：想看视频内容，改成在聊天里直接发文件 -->
+    <!-- 视频页：三种创作方式（写稿 / 分镜 / 全自动）共用一条操作栏 -->
     <section id="view-video" class="view" role="tabpanel">
       <div class="pane">
         <p class="view-note muted">
-          做视频：先让核心写好分镜，再交给 ffmpeg 渲染。想看视频内容？直接在聊天里发视频文件就行。
+          做视频：人设决定音色、风格和说话的口气。三种做法都先出分镜，确认后再渲染。
         </p>
 
-        <section class="card" id="studioCard">
-          <h2>做视频</h2>
+        <p class="studio-binding" id="studioBinding">正在读人设绑定…</p>
+
+        <div class="studio-tabs" role="tablist" aria-label="创作方式">
+          <button class="studio-tab active" data-mode="script" role="tab" aria-selected="true">写稿</button>
+          <button class="studio-tab" data-mode="scenes" role="tab" aria-selected="false">分镜</button>
+          <button class="studio-tab" data-mode="auto" role="tab" aria-selected="false">全自动</button>
+        </div>
+
+        <!-- 一、写稿：一段稿子 → 4~10 场分镜 -->
+        <section class="card studio-pane" id="paneScript">
+          <h2>写稿</h2>
           <label class="field">
-            <span>想要什么样的</span>
-            <input id="studioPrompt" placeholder="比如：做一段 12 秒的短片，讲讲下雨天不想出门" />
+            <span>稿子（尽量用原话，不改写成书面语）</span>
+            <textarea id="studioScript" class="studio-textarea" rows="8"
+              placeholder="导数是变化率。先看一条曲线，上面取两个点，连成一条割线……"></textarea>
           </label>
           <div class="row">
             <label class="field small">
-              <span>秒数</span>
-              <select id="studioSeconds">
-                <option value="8">8</option>
-                <option value="12" selected>12</option>
-                <option value="20">20</option>
-                <option value="30">30</option>
+              <span>时长</span>
+              <select id="scriptSeconds">
+                <option value="30">30 秒</option>
+                <option value="60" selected>60 秒</option>
+                <option value="90">90 秒</option>
+                <option value="120">120 秒</option>
+                <option value="180">180 秒</option>
               </select>
             </label>
             <label class="field small">
-              <span>音色</span>
-              <select id="studioVoice">
-                <option value="yaoyao" selected>yaoyao</option>
-                <option value="huayan">huayan</option>
-                <option value="huihui">huihui</option>
-                <option value="kangkang">kangkang</option>
-              </select>
+              <span>风格</span>
+              <select id="scriptStyle" class="studio-style"></select>
             </label>
-            <button id="studioGo" class="primary" type="button">开始创作</button>
-            <button id="studioPlanOnly" class="ghost" type="button" title="只写分镜、先不渲染，写完可以在下面改">只写分镜</button>
+            <label class="field small">
+              <span>音色</span>
+              <select id="scriptVoice" class="studio-voice"></select>
+            </label>
+            <button id="studioScriptGo" class="primary" type="button">生成分镜</button>
           </div>
-          <p class="muted" id="studioHint">先由它写分镜，再交给 ffmpeg 渲染 —— 模型不画像素，改一句分镜就能精确重渲。</p>
-          <div id="studioPlan" class="plan"></div>
-          <pre id="studioRaw" class="raw hidden"></pre>
-          <video id="studioVideo" class="studio-video hidden" controls preload="metadata"></video>
+          <p class="muted" id="studioScriptHint">拆成 4~10 场，每场的旁白尽量用你的原话。</p>
         </section>
 
-        <!-- 分镜编辑区：默认隐藏，拿到分镜（只写分镜 / 一键出片）后才铺开 -->
-        <section class="card hidden" id="studioEditCard">
+        <!-- 二、分镜：用户自己填每一场，三层都能留空 -->
+        <section class="card studio-pane hidden" id="paneScenes">
           <h2>分镜 <span class="muted" id="studioEditMeta">还没有分镜</span></h2>
           <div id="sceneList" class="scene-list"></div>
           <div class="scene-foot">
             <button id="sceneAdd" class="ghost" type="button">加一场</button>
-            <span class="muted scene-note">总时长 = 各场之和 − 0.4 × (场数 − 1)</span>
-            <button id="studioRender" class="primary" type="button">重新渲染</button>
+            <button id="studioFill" class="ghost" type="button"
+              title="把每场的「画什么」翻译成 manim 代码，先不渲染">补全动画</button>
+            <span class="muted" id="sceneHint">每行都能改；「画什么」写清楚，动画才对得上。</span>
           </div>
-          <p class="muted" id="sceneHint">改完点「重新渲染」——不过 ffmpeg 是整段重渲，改一句也要重来一次。</p>
         </section>
+
+        <!-- 三、全自动：只给主题 -->
+        <section class="card studio-pane hidden" id="paneAuto">
+          <h2>全自动</h2>
+          <label class="field">
+            <span>想要什么样的</span>
+            <input id="studioPrompt" placeholder="比如：做一段 60 秒的短片，讲讲导数是什么" />
+          </label>
+          <div class="row">
+            <label class="field small">
+              <span>时长</span>
+              <select id="autoSeconds">
+                <option value="30">30 秒</option>
+                <option value="60" selected>60 秒</option>
+                <option value="90">90 秒</option>
+                <option value="120">120 秒</option>
+              </select>
+            </label>
+            <label class="field small">
+              <span>风格</span>
+              <select id="autoStyle" class="studio-style"></select>
+            </label>
+            <label class="field small">
+              <span>音色</span>
+              <select id="autoVoice" class="studio-voice"></select>
+            </label>
+          </div>
+          <p class="muted" id="studioHint">给个主题，它自己写分镜并渲染。</p>
+        </section>
+
+        <!-- 结果与进度：三种方式共用 -->
+        <section class="card studio-result" id="studioResultCard">
+          <div id="studioProgress" class="studio-progress hidden">
+            <div class="studio-progress-bar"><i id="studioProgressFill"></i></div>
+            <span id="studioProgressText">渲染中…</span>
+          </div>
+          <div id="studioPlan" class="plan"></div>
+          <pre id="studioRaw" class="raw hidden"></pre>
+          <video id="studioVideo" class="studio-video hidden" controls preload="metadata"></video>
+          <p class="muted" id="studioResultHint"></p>
+          <a id="studioDownload" class="studio-download hidden" download>下载成片</a>
+        </section>
+
+        <!-- 三种模式共用底部一条操作栏 -->
+        <div class="studio-actionbar">
+          <button id="studioPreview" class="ghost" type="button">预览分镜</button>
+          <button id="studioRender" class="primary" type="button">渲染</button>
+          <span class="muted" id="studioEstimate">预计：0 场 / 0 秒</span>
+        </div>
       </div>
     </section>
 

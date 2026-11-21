@@ -18,6 +18,8 @@ const R = require('./lib/render.js');
 const P = require('./lib/project.js');
 // 风格预设：配色/线宽/字体/节奏。渲染时机械地套到 manim 代码与文字卡上。
 const S = require('./lib/styles.js');
+// 人设 → 语气。旁白要像"她"在讲，而不是播音腔；见 lib/persona-binding.js。
+const PB = require('./lib/persona-binding.js');
 const STYLE_DIR = path.join(__dirname, 'styles');
 
 // 讲解画面（HTML/SVG → 无头浏览器截图）与表情叠加是后加的能力。
@@ -159,6 +161,156 @@ function readBody(req, limit = 4 * 1024 * 1024) {
   });
 }
 
+async function getJson(url, timeoutMs = 10000) {
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(Math.max(1000, Number(timeoutMs) || 10000)) });
+    const text = await res.text();
+    try { return { status: res.status, data: JSON.parse(text) }; } catch { return { status: res.status, data: null }; }
+  } catch (err) {
+    return { status: 0, data: null, error: String(err && err.message || err) };
+  }
+}
+
+// ------------------------------------------------------------ 渲染进度 ----
+/**
+ * 进度表：projectId -> 这一集渲染到哪一步。
+ *
+ * 为什么存在内存里：渲染是一个长 HTTP 请求（1~3 分钟），面板没法从响应里
+ * 逐步拿到进度；但 Node 是单线程的，渲染等 ffmpeg 的 await 间隙完全可以
+ * 服务 GET /v1/project/progress。所以进度只是"旁路信息"，丢了不影响出片，
+ * 也不写盘（重启后旧进度本来就没意义）。
+ */
+const PROGRESS = new Map();
+const PROGRESS_MAX = 24;
+
+function progressStart(projectId, total) {
+  const id = String(projectId || '');
+  if (!id) return;
+  const now = Date.now();
+  PROGRESS.set(id, {
+    id, status: 'running', phase: 'voice', total: Number(total) || 0, done: 0,
+    current: -1, engine: '', label: '正在取旁白', error: '', detail: '',
+    startedAt: now, updatedAt: now,
+  });
+  // 只留最近 24 个项目，别让这个 Map 跟着服务一起长
+  if (PROGRESS.size > PROGRESS_MAX) {
+    const oldest = [...PROGRESS.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt)[0];
+    if (oldest) PROGRESS.delete(oldest[0]);
+  }
+}
+
+function progressUpdate(projectId, patch) {
+  const id = String(projectId || '');
+  if (!id) return;
+  const cur = PROGRESS.get(id) || { id, startedAt: Date.now(), total: 0, done: 0, current: -1 };
+  PROGRESS.set(id, Object.assign(cur, patch || {}, { updatedAt: Date.now() }));
+}
+
+function progressGet(projectId) {
+  const rec = PROGRESS.get(String(projectId || ''));
+  if (!rec) return null;
+  return Object.assign({}, rec, {
+    elapsedMs: Date.now() - (rec.startedAt || Date.now()),
+  });
+}
+
+// -------------------------------------------------------- 人设 / 绑定 ----
+/**
+ * 读人设。失败返回 { ok:false }，**不抛** —— 人设服务挂了只是让旁白少点个性，
+ * 不该让整条视频创作链断掉。
+ */
+async function fetchPersona() {
+  const r = await getJson(`${CFG.personaUrl}/v1/persona`, CFG.personaTimeoutMs);
+  const d = r.data;
+  if (!d || (d.ok === false)) return { ok: false, error: (d && d.error) || r.error || 'PERSONA_UNAVAILABLE' };
+  const block = String(d.block || (d.persona && d.persona.block) || d.constitution || '');
+  if (!block.trim()) return { ok: false, error: 'PERSONA_EMPTY' };
+  const traits = d.traits && typeof d.traits === 'object' ? d.traits : {};
+  const version = Number.isFinite(Number(d.version)) ? Number(d.version) : 0;
+  // 正文第一行一般是"你是 XXX，……"，拿它当人设名给面板显示
+  const nameMatch = block.match(/^(?:你是|我叫|我是)\s*([^\n，。,.！!？?]{1,20})/);
+  return {
+    ok: true, block, traits, version,
+    name: nameMatch ? nameMatch[1].trim() : '',
+  };
+}
+
+/**
+ * 当前音色绑定。音色是 speak 按人设挑的（GET /v1/voice 会给 reason），
+ * 这里只负责读出来 —— 两处各算一遍一定会算出不同的答案。
+ */
+async function fetchVoiceBinding() {
+  const r = await getJson(`${CFG.speakUrl}/v1/voice`, 12000);
+  const d = r.data;
+  if (!d || d.ok === false) {
+    return { ok: false, id: '', name: '', reason: (d && d.error) || r.error || 'VOICE_UNAVAILABLE', source: 'unavailable' };
+  }
+  return {
+    ok: true,
+    id: String(d.voiceId || ''),
+    name: String(d.name || ''),
+    reason: String(d.reason || ''),
+    source: String(d.source || ''),
+    cached: Boolean(d.cached),
+    version: Number(d.version) || 0,
+  };
+}
+
+/**
+ * 一次拿齐"这集为什么是这个音色/风格/语气"。
+ * 面板把它显示成一行：大肥鱼（迷糊版）· 白板讲解 · 温柔口语。
+ */
+async function resolveBinding(opts = {}) {
+  const [persona, voice, styleInfo] = await Promise.all([
+    fetchPersona(),
+    fetchVoiceBinding(),
+    resolveStyleFor({ styleId: opts.styleId || '' }),
+  ]);
+  const tone = PB.describeTone(persona.ok ? persona.block : '', persona.ok ? persona.traits : null);
+  const voiceName = voice.ok && voice.name ? voice.name : '人设音色';
+  const styleName = styleInfo.style ? styleInfo.style.name : '默认风格';
+  return {
+    persona: {
+      name: persona.ok ? persona.name : '',
+      version: persona.ok ? persona.version : 0,
+      available: Boolean(persona.ok),
+      error: persona.ok ? '' : persona.error,
+    },
+    voice: {
+      id: voice.id || '', name: voiceName, reason: voice.reason || '',
+      source: voice.source || '', cached: Boolean(voice.cached),
+      available: Boolean(voice.ok), error: voice.ok ? '' : voice.reason,
+    },
+    style: {
+      id: styleInfo.id, name: styleName, reason: styleInfo.reason || '',
+      source: styleInfo.source || '', available: true,
+    },
+    tone: {
+      label: tone.label,
+      tags: tone.tags,
+      selfRefs: tone.selfRefs,
+      particles: tone.particles,
+      address: tone.address,
+      empty: Boolean(tone.empty),
+    },
+    summary: `${voiceName} · ${styleName} · ${tone.label}`,
+    personaBlock: persona.ok ? persona.block : '',
+    personaTraits: persona.ok ? persona.traits : {},
+    styleObject: styleInfo.style,
+    styleInfo,
+  };
+}
+
+/**
+ * 生成旁白时附带的语气块。人设读不到就返回空数组：没有依据时宁可不多写，
+ * 也不要编一个"温柔"出来 —— 那会变成每次都不一样的人设。
+ */
+function tonePromptLines(binding, opts = {}) {
+  if (!binding || !binding.tone || binding.tone.empty) return [];
+  return PB.narrationTonePrompt(binding.tone, opts);
+}
+
+
 async function postJson(url, obj, headers = {}, timeoutMs = 60000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -257,6 +409,7 @@ async function askJson(promptText, opts = {}) {
 function buildSkeletonPrompt(prompt, total, opts = {}) {
   const style = opts.style || null;
   const stickerIds = Array.isArray(opts.stickerIds) ? opts.stickerIds.slice(0, 10) : [];
+  const toneLines = Array.isArray(opts.toneLines) ? opts.toneLines : [];
   const lines = [
     '只输出 JSON，第一个字符必须是 {，不要解释。',
     `给这个主题写分镜：${prompt}`,
@@ -275,6 +428,7 @@ function buildSkeletonPrompt(prompt, total, opts = {}) {
     '- 不要出现 markdown、不要解释你的做法。',
   ];
   if (style) lines.push('', `视觉风格：${style.name}（配色与节奏由后续每场的脚本落实，骨架阶段不用管）`);
+  if (toneLines.length) lines.push('', ...toneLines);
   if (stickerIds.length) {
     lines.push(
       '',
@@ -289,6 +443,45 @@ function buildSkeletonPrompt(prompt, total, opts = {}) {
 }
 
 /**
+ * 写稿 → 分镜：拆场提示词。
+ *
+ * 和"给个主题写分镜"最大的区别：这一轮的旁白**必须来自稿子原话**。
+ * 模型天生爱润色，所以约束写成"可以删字、可以截断，但不要换说法"，
+ * 并明确"不要改写成书面语"。
+ */
+function buildScriptSplitPrompt(script, total, opts = {}) {
+  const style = opts.style || null;
+  const toneLines = Array.isArray(opts.toneLines) ? opts.toneLines : [];
+  const minScenes = Math.max(4, Math.min(10, Math.round(total / 15)));
+  const maxScenes = Math.min(10, Math.max(minScenes + 2, Math.round(total / 8)));
+  const lines = [
+    '只输出 JSON，第一个字符必须是 {，不要解释。',
+    `把下面这份稿子拆成分镜。总时长约 ${total} 秒，拆 ${minScenes}~${maxScenes} 场，每场 3~10 秒。`,
+    '{"title":"标题","scenes":[{"text":"这一场的标题（≤14字）","narration":"这一场念的旁白（稿子原话截取，≤40字）","seconds":8,"visual_hint":"这一场画面画什么（一句话，具体到图形/公式/动作）","tool":"manim"}]}',
+    '',
+    '## 原话优先（最重要）',
+    '- narration 必须是稿子里**出现过的话**：可以删字、可以截断、可以调顺序，但不要换说法、不要润色、不要改写成书面语。',
+    '- text 是从这句原话里抽出来的短标题，≤14 字，不要另起一句。',
+    '- 稿子里如果本来就是书面语，旁白照抄；不要为了"口语"把它改写掉。',
+    '',
+    '## 拆场',
+    '- 一场只讲一个意思：转折、举例、公式、结论各成一场。',
+    '- visual_hint 要写成"别人照着就能画"的一句话：画什么图形、标什么量、做什么动作。',
+    '- tool 只能是 manim 或 text；**至少 80% 的场次用 manim**，text 只给开场/转场/一句结论。',
+    '- 讲到公式、坐标轴、曲线、变化过程、对比大小的场次必须 manim。',
+    '- 场数不超过 10；加起来接近 ' + total + ' 秒。',
+    '- 不要 markdown、不要解释、不要在 JSON 前后加字。',
+    '',
+    '## 稿子',
+    String(script || '').slice(0, 6000),
+  ];
+  if (style) lines.push('', `视觉风格：${style.name}（配色与节奏由后续每场的脚本落实）`);
+  if (toneLines.length) lines.push('', ...toneLines);
+  return lines.join('\n');
+}
+
+
+/**
  * 单场 manim 脚本的提示词。
  *
  * 这些"硬约束"是踩出来的，不是猜的：
@@ -300,12 +493,23 @@ function buildSkeletonPrompt(prompt, total, opts = {}) {
  *   - 代码要能被 checkCode 放行：文件/网络/import 越权一律拒收。
  */
 function buildVisualPrompt(scene, kind, style) {
+  const hint = String(scene.visual_hint || '').trim();
   const head = [
     '只输出 JSON，第一个字符必须是 {，不要解释。',
     `要画这一场：标题「${scene.text}」，旁白「${scene.narration}」`,
     `这一场要演 ${Number(scene.seconds) || 4} 秒。`,
     '',
   ];
+  if (hint) {
+    head.push(
+      '## 用户指定的画面（最高优先级，必须照着画）',
+      hint.slice(0, 600),
+      '',
+      '上面这段是用户自己写的"画什么"。把它翻译成 manim 动画：图形、元素、动作、先后顺序都要对上；',
+      '不要换成另一个画法，也不要只画个标题糊过去。旁白只用来对齐节奏，不是画面内容。',
+      '',
+    );
+  }
   const body = [
     '{"manim":{"scene":"TangentAnim","code":"from manim import *\\nclass TangentAnim(Scene):\\n    def construct(self):\\n        ..."}}',
     '',
@@ -324,6 +528,7 @@ function buildVisualPrompt(scene, kind, style) {
     '## 三个必须避开的坑',
     '- **坐标轴不要 include_numbers=True**（刻度数字是 DecimalNumber，内部走 TeX，慢且容易失败）；要数字就用 Text 在轴旁手标',
     '- 不要用 DecimalNumber / Integer；公式只有 MathTex 一种正确写法',
+    '- **MathTex 的参数不要再包 $**：写 MathTex(r"\\frac{dy}{dx}")，不要写 MathTex(r"$\\frac{dy}{dx}$") —— 包了 LaTeX 直接编译失败，整场会降级成文字卡',
     '- 不要设背景色、不要 import 颜色表：背景和配色由渲染器按风格统一注入',
     '',
     '## 排序',
@@ -337,10 +542,25 @@ function buildVisualPrompt(scene, kind, style) {
 }
 
 
+/**
+ * 去掉 MathTex/Tex 参数外面多包的一层 $...$。
+ *
+ * 为什么需要：MathTex 本身就在数学模式里，再包 $ 会让 LaTeX 直接编译失败。
+ * 实测模型写 MathTex(r"$\frac{dy}{dx}$")，整场 manim 报 MANIM_FAILED 降级成文字卡 ——
+ * 提示词里能叮嘱，但它十次里总有一两次手滑，所以这里做确定性清洗。
+ * 只处理 "MathTex('...')" / "Tex('...')" 整串参数，不碰其它字符串。
+ */
+function stripMathDelims(code) {
+  return String(code == null ? '' : code).replace(
+    /\b(MathTex|Tex)\(\s*(r?)(["'])\s*\$+([\s\S]*?)\$+\s*\3\s*\)/g,
+    (m, fn, raw, quote, inner) => `${fn}(${raw}${quote}${inner}${quote})`,
+  );
+}
+
 async function planTwoStage(prompt, opts = {}) {
   const total = Number(opts.seconds) || 12;
   const style = opts.style || null;
-  const skel = await askJson(buildSkeletonPrompt(prompt, total, { style, stickerIds: opts.stickerIds }), opts);
+  const skel = await askJson(buildSkeletonPrompt(prompt, total, { style, stickerIds: opts.stickerIds, toneLines: opts.toneLines }), opts);
   if (!skel.ok) return skel;
   const scenes = Array.isArray(skel.json.scenes) ? skel.json.scenes.slice(0, CFG.maxScenes) : [];
   if (!scenes.length) return { ok: false, error: 'NO_SCENES' };
@@ -355,10 +575,12 @@ async function planTwoStage(prompt, opts = {}) {
     if (!r.ok) { log(`场「${s.text}」视觉生成失败，降级文字卡`); textCards += 1; continue; }
     const code = r.json && r.json.manim && typeof r.json.manim.code === 'string' ? r.json.manim.code : '';
     if (!code.trim()) { log(`场「${s.text}」没给 manim.code，降级文字卡`); textCards += 1; continue; }
+    // 先清洗常见的 Markdown/LaTeX 写法问题，再过安全闸门（否则白等一次 manim）
+    const clean = stripMathDelims(code);
     // 安全过滤与 LaTeX 闸门在规划阶段就做一次：命中当场降级，
     // 不必等到渲染时才发现这段代码不能用（那要白等一次 manim）。
-    const unsafe = Manim ? Manim.checkCode(code) : 'manim 模块不可用';
-    const noLat = Manim ? Manim.checkNoLatex(code) : null;
+    const unsafe = Manim ? Manim.checkCode(clean) : 'manim 模块不可用';
+    const noLat = Manim ? Manim.checkNoLatex(clean) : null;
     if (unsafe) {
       log(`场「${s.text}」manim 代码被拒（${unsafe}），降级`);
       textCards += 1;
@@ -366,7 +588,7 @@ async function planTwoStage(prompt, opts = {}) {
       log(`场「${s.text}」manim 代码含 LaTeX 组件（${noLat}），降级`);
       textCards += 1;
     } else {
-      s.manim = { code: code.slice(0, 8000), scene: r.json.manim.scene || null };
+      s.manim = { code: clean.slice(0, 8000), scene: r.json.manim.scene || null };
       s.kind = 'manim';
       visuals += 1;
     }
@@ -375,6 +597,235 @@ async function planTwoStage(prompt, opts = {}) {
   log(`两段式规划：${scenes.length} 场，manim ${visuals} 场（${ratio}%），文字卡 ${textCards} 场`);
   return { ok: true, json: { title: skel.json.title || '', scenes }, visuals, manimRatio: ratio };
 }
+
+// ------------------------------------------------ 三种创作入口（两个新口） --
+
+const MANIM_HINT_WORDS = [
+  '公式', '方程', '函数', '曲线', '坐标', '轴', '导数', '微分', '积分', '斜率', '切线',
+  '极限', '向量', '矩阵', '概率', '几何', '面积', '体积', '增长', '下降', '变化', '对比',
+  '运动', '轨迹', '动画', '画一', '画出', '坐标轴', 'graph', 'plot', 'math', 'formula',
+];
+
+/**
+ * 这一场该用哪个引擎？tool 显式给了就听用户的；空着才由这里判断。
+ * 判断标准故意写得"宁可多画"：讲到公式/图形/变化过程就用 manim ——
+ * 用户要的是动画，一张静止的文字卡看起来像 PPT。
+ */
+function decideTool(scene) {
+  const raw = String((scene && scene.tool) || '').trim().toLowerCase();
+  if (raw === 'manim' || raw === 'text') {
+    return { tool: raw, reason: `用户指定：${raw}` };
+  }
+  const hint = String((scene && scene.visual_hint) || '').trim();
+  if (hint) return { tool: 'manim', reason: '用户写了「画什么」，按画面描述生成 manim' };
+  const text = `${(scene && scene.text) || ''} ${(scene && scene.narration) || ''}`.toLowerCase();
+  const hit = MANIM_HINT_WORDS.find((w) => text.includes(w));
+  if (hit) return { tool: 'manim', reason: `内容里有「${hit}」，适合用 manim 画` };
+  if (!String((scene && scene.narration) || '').trim() && !String((scene && scene.text) || '').trim()) {
+    return { tool: 'text', reason: '这一场是空的，只能出文字卡' };
+  }
+  return { tool: 'text', reason: '没有公式/图形线索，按文字卡处理（想画就填「画什么」）' };
+}
+
+function clampSceneSeconds(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 8;
+  return Math.min(10, Math.max(3, Math.round(n * 10) / 10));
+}
+
+/**
+ * 写稿模式：稿子 → 分镜。
+ * 只拆场、只抽原话，**不生成 manim 代码**（那一步由 /v1/storyboard/from-scenes 做），
+ * 因为用户下一步大概率要改标题和秒数，先花几十秒写代码是浪费。
+ */
+async function splitScript(script, opts = {}) {
+  const total = Math.min(CFG.maxTotalSeconds, Math.max(10, Number(opts.seconds) || 60));
+  const style = opts.style || null;
+  const prompt = buildScriptSplitPrompt(script, total, { style, toneLines: opts.toneLines });
+  const r = await askJson(prompt, { ...opts, sessionId: 'studio-script' });
+  if (!r.ok) return r;
+
+  const rawScenes = Array.isArray(r.json.scenes) ? r.json.scenes.slice(0, 10) : [];
+  if (!rawScenes.length) return { ok: false, error: 'NO_SCENES' };
+
+  const scenes = rawScenes.map((s, i) => {
+    const tool = String(s.tool || '').trim().toLowerCase() === 'text' ? 'text' : 'manim';
+    return {
+      index: i,
+      text: String(s.text || '').slice(0, 20),
+      narration: String(s.narration || '').slice(0, 80),
+      seconds: clampSceneSeconds(s.seconds),
+      visual_hint: String(s.visual_hint || '').slice(0, 300),
+      tool,
+    };
+  });
+  // 场数不足 4 时补一句提示，不强行拆 —— 稿子本来就短的时候硬拆会变成一句一场。
+  const warnings = [];
+  if (scenes.length < 4) warnings.push(`只拆出 ${scenes.length} 场（要求 4~10 场），稿子可能太短；可以手加几场。`);
+  const manimCount = scenes.filter((s) => s.tool === 'manim').length;
+  if (scenes.length && manimCount / scenes.length < 0.8) warnings.push('manim 占比不足 80%，会让成片更像 PPT。');
+  log(`写稿拆场：${scenes.length} 场，manim ${manimCount} 场，${total} 秒`);
+  return {
+    ok: true,
+    title: String(r.json.title || script.slice(0, 12) || '未命名').slice(0, 60),
+    scenes,
+    warnings,
+  };
+}
+
+/**
+ * 分镜模式：把用户填的每一场补成能渲染的场景。
+ *
+ * 关键一步是 visual_hint → manim code：用户写"画坐标轴、曲线上两个点，连线，
+ * 然后让点靠近变成切线"，这里把它当成**最高优先级的画面要求**喂给写脚本的模型，
+ * 再把返回的代码过一遍安全/LaTeX 闸门。代码不合格就降级文字卡并把原因带回前端，
+ * 不能假装成功。
+ */
+async function fillScenes(inputScenes, opts = {}) {
+  const style = opts.style || null;
+  const scenes = [];
+  const warnings = [];
+  let manimCount = 0;
+  let textCount = 0;
+  let fallbackCount = 0;
+
+  for (let i = 0; i < inputScenes.length; i++) {
+    const src = inputScenes[i] || {};
+    const base = {
+      index: i,
+      text: String(src.text || '').slice(0, 60),
+      narration: String(src.narration || '').slice(0, 200),
+      seconds: clampSceneSeconds(src.seconds),
+      visual_hint: String(src.visual_hint || '').slice(0, 600),
+      tool: String(src.tool || '').trim().toLowerCase(),
+      kind: 'text',
+      manim: null,
+      status: 'text',
+      note: '',
+    };
+    const decided = decideTool(src);
+    base.tool = decided.tool;
+    base.tool_reason = decided.reason;
+    if (decided.tool === 'text') {
+      textCount += 1;
+      base.status = 'text';
+      scenes.push(base);
+      continue;
+    }
+
+    const prompt = buildVisualPrompt(base, 'manim', style);
+    const r = await askJson(prompt, { ...opts, sessionId: 'studio-scene' });
+    if (!r.ok) {
+      base.status = 'fallback';
+      base.note = `动画生成失败（${r.error}），这一场会出文字卡`;
+      warnings.push(`第 ${i + 1} 场：${base.note}`);
+      fallbackCount += 1;
+      textCount += 1;
+      scenes.push(base);
+      continue;
+    }
+    const manimObj = r.json && r.json.manim && typeof r.json.manim === 'object' ? r.json.manim : null;
+    const code = manimObj && typeof manimObj.code === 'string' ? manimObj.code.trim() : '';
+    if (!code) {
+      base.status = 'fallback';
+      base.note = '模型没给出 manim.code，这一场会出文字卡';
+      warnings.push(`第 ${i + 1} 场：${base.note}`);
+      fallbackCount += 1;
+      textCount += 1;
+      scenes.push(base);
+      continue;
+    }
+    // 和两段式规划同一套闸门：规划阶段就拦住，别等渲染白等一次 manim。
+    // 先清洗 MathTex 外面多包的 $（模型常见手滑），再做安全检查。
+    const clean = stripMathDelims(code);
+    const unsafe = Manim ? Manim.checkCode(clean) : 'manim 模块不可用';
+    const noLat = Manim ? Manim.checkNoLatex(clean) : null;
+    if (unsafe || noLat) {
+      base.status = 'fallback';
+      base.note = `代码被拒（${unsafe || noLat}），这一场会出文字卡`;
+      warnings.push(`第 ${i + 1} 场：${base.note}`);
+      fallbackCount += 1;
+      textCount += 1;
+      scenes.push(base);
+      continue;
+    }
+    base.kind = 'manim';
+    base.manim = { code: clean.slice(0, 8000), scene: (manimObj && manimObj.scene) || null };
+    base.status = 'manim';
+    manimCount += 1;
+    scenes.push(base);
+  }
+
+  const ratio = scenes.length ? Math.round((manimCount / scenes.length) * 100) : 0;
+  log(`分镜补全：${scenes.length} 场，manim ${manimCount} 场（${ratio}%），文字卡 ${textCount} 场，降级 ${fallbackCount} 场`);
+  return {
+    ok: true,
+    scenes,
+    stats: { total: scenes.length, manim: manimCount, text: textCount, fallback: fallbackCount, manimRatio: ratio },
+    warnings,
+  };
+}
+
+/**
+ * 渲染前给个量级：面板底部那行"预计：8 场 / 60 秒 / 约 3 分钟 / 约 27 credits"。
+ * 系数来自实测：8 场 60 秒全 manim ≈ 192 秒，其中旁白 8 句串行约 30 秒；
+ * credits 按 speak 的 0.185/字（BreezeBlue 结算口径）估。
+ */
+function estimateRender(scenes) {
+  const list = Array.isArray(scenes) ? scenes : [];
+  let manim = 0;
+  let text = 0;
+  let chars = 0;
+  let sum = 0;
+  for (const s of list) {
+    // 还没补代码的分镜（写稿刚拆完）也要按 tool 预估：否则会报"0 场 manim"，
+    // 用户看到的渲染时间会小得离谱。
+    const isManim = Boolean(s && (s.kind === 'manim' || (s.manim && s.manim.code) || s.tool === 'manim'));
+    if (isManim) manim += 1; else text += 1;
+    chars += String((s && s.narration) || '').length;
+    sum += Number((s && s.seconds) || 0);
+  }
+  const videoSeconds = Math.max(0, sum - CFG.fade * Math.max(0, list.length - 1));
+  const renderSeconds = Math.round(manim * 20 + text * 3 + chars * 0.22);
+  const credits = Math.round(chars * 0.185 * 10) / 10;
+  return {
+    scenes: list.length,
+    manim,
+    text,
+    seconds: Number(videoSeconds.toFixed(1)),
+    renderSeconds,
+    renderMinutes: Math.round((renderSeconds / 60) * 10) / 10,
+    narrationChars: chars,
+    credits,
+  };
+}
+
+/** 把分镜写进项目（新建或更新同一个草稿项目），返回给前端的项目摘要。 */
+function saveDraftProject(input) {  const { projectId, title, scenes, style, voice } = input;
+  let project = projectId ? P.loadProject(CFG.projectDir, String(projectId)) : null;
+  if (!project) {
+    project = P.createProject(CFG.projectDir, {
+      title: title || '未命名项目',
+      width: CFG.width, height: CFG.height, fps: CFG.fps, fade: CFG.fade,
+      voice: voice || '',
+      style: style || '',
+    });
+  }
+  project.title = String(title || project.title || '未命名项目').slice(0, 80);
+  // 空串表示"按人设决定"，这是契约的一部分，不能被 || 覆盖成别的
+  project.style = style == null ? project.style : String(style);
+  project.voice = voice == null ? project.voice : String(voice);
+  project.scenes = scenes.map((s) => P.normalizeScene(s));
+  P.saveProject(CFG.projectDir, project);
+  return {
+    id: project.id,
+    title: project.title,
+    scenes: project.scenes.length,
+    style: project.style,
+    voice: project.voice,
+  };
+}
+
 
 /*
  * 这里原来有一个 buildPlanPrompt：一次性让模型写整份"rich/draw 分镜"。
@@ -394,6 +845,11 @@ function parsePlan(text) {
   try {
     const obj = JSON.parse(s);
     if (obj && Array.isArray(obj.scenes) && obj.scenes.length) return obj;
+    // 单场脚本的响应形状是 {"manim":{"scene","code"}}，没有 scenes。
+    // 以前这里只认 scenes，于是每一场 manim 都被判成 PLAN_NOT_JSON 降级成文字卡 ——
+    // "画什么"再具体也出不了动画。两种形状都是合法规划结果。
+    if (obj && obj.manim && typeof obj.manim === 'object'
+      && typeof obj.manim.code === 'string' && obj.manim.code.trim()) return obj;
   } catch { }
   return null;
 }
@@ -647,14 +1103,27 @@ async function fetchSpeech(text, voice, outFile) {
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       log(`speak HTTP ${res.status}: ${String(body).slice(0, 200)}`);
-      return { ok: false, error: `SPEAK_HTTP_${res.status}`, status: res.status, detail: String(body).slice(0, 200) };
+      // speak 在 strict 模式下把失败原因写在 JSON 里（BREEZEBLUE_UNAVAILABLE /
+      // QUEUE_TIMEOUT / 重试次数）。面板要能说"已重试 4 次"，所以这里必须解析出来，
+      // 不能只回一个 SPEAK_HTTP_503。
+      const info = parseSpeakFailure(body);
+      return {
+        ok: false, error: `SPEAK_HTTP_${res.status}`, status: res.status,
+        speakError: info.speakError, attempts: info.attempts, retries: info.retries,
+        detail: String(body).slice(0, 400),
+      };
     }
     if (!ct.startsWith('audio/')) {
       // strict 模式下拿不到音色时 speak 会回 JSON（ok:false）而不是音频；
       // 任何非音频响应都当"没拿到"，不能拿它当静音混进去。
       const body = await res.text().catch(() => '');
       log(`speak 返回的不是音频（${ct || 'no content-type'}）: ${String(body).slice(0, 200)}`);
-      return { ok: false, error: 'SPEAK_NO_AUDIO', status: res.status, detail: String(body).slice(0, 200) };
+      const info = parseSpeakFailure(body);
+      return {
+        ok: false, error: 'SPEAK_NO_AUDIO', status: res.status,
+        speakError: info.speakError, attempts: info.attempts, retries: info.retries,
+        detail: String(body).slice(0, 400),
+      };
     }
     const buf = Buffer.from(await res.arrayBuffer());
     if (buf.length < 1000) return { ok: false, error: 'SPEAK_TOO_SHORT', status: res.status, detail: `${buf.length} bytes` };
@@ -667,6 +1136,24 @@ async function fetchSpeech(text, voice, outFile) {
     clearTimeout(timer);
   }
 }
+
+/**
+ * 从 speak 的失败响应里抽原因。响应可能是 JSON，也可能是纯文本/HTML（代理错误页），
+ * 所以解析失败一律退回空值，调用方按"连不上"处理。
+ */
+function parseSpeakFailure(body) {
+  const out = { speakError: '', attempts: 0, retries: 0 };
+  try {
+    const d = JSON.parse(String(body || ''));
+    if (!d || typeof d !== 'object') return out;
+    out.speakError = String(d.error || d.code || (d.lastError ? 'SPEAK_FAILED' : '') || '');
+    out.attempts = Number(d.attempts) || 0;
+    out.retries = Number(d.retries) || 0;
+    if (!out.attempts && d.billing && Number(d.billing.attempts)) out.attempts = Number(d.billing.attempts);
+  } catch { /* 非 JSON：保持空值 */ }
+  return out;
+}
+
 
 
 function pickBgm(nameOrPath) {
@@ -714,6 +1201,19 @@ function styleCfg(style) {
  *   manim 脚本 > matplotlib 代码 > draw 图元 > html > 文字卡
  * 有 draw 就一定会排在链条里，前一个引擎失败就轮到它。
  */
+/**
+ * 引擎名 → 面板上那句进度文案。用户只认识"manim"和"文字卡"，
+ * plot/draw/html 是内部回退路径，原样显示反而让人以为出错了。
+ */
+function engineLabel(eng) {
+  if (eng === 'manim') return 'manim';
+  if (eng === 'text') return '文字卡';
+  if (eng === 'plot') return '图表';
+  if (eng === 'draw') return '图形';
+  if (eng === 'html') return '讲解画面';
+  return String(eng || '画面');
+}
+
 function sceneEngines(s) {
   const sc = s || {};
   const hasManim = Boolean(sc.manim && typeof sc.manim.code === 'string' && sc.manim.code.trim());
@@ -876,7 +1376,15 @@ async function getSpeechCached(project, scene, voice, cdir) {
   const wav = path.join(cdir, `tts-${key}.wav`);
   const got = await fetchSpeech(text, voice, wav);
   if (!got || !got.ok) {
-    return { error: (got && got.error) || 'SPEAK_FAILED', status: (got && got.status) || 0, detail: (got && got.detail) || '', key };
+    return {
+      error: (got && got.error) || 'SPEAK_FAILED',
+      status: (got && got.status) || 0,
+      speakError: (got && got.speakError) || '',
+      attempts: (got && got.attempts) || 0,
+      retries: (got && got.retries) || 0,
+      detail: (got && got.detail) || '',
+      key,
+    };
   }
   const ms = await measureAudioMs(got.file);
   project.audioCache[key] = { wav: got.file, ms, at: new Date().toISOString() };
@@ -928,6 +1436,8 @@ async function renderProject(project, opts = {}, scope = 'auto') {
 
   try {
     if (!project.scenes.length) return { ok: false, error: 'NO_SCENES' };
+    const sceneTotal = project.scenes.length;
+    progressStart(project.id, sceneTotal);
 
     // ---- 0) 风格：项目钉死的 > 请求里的 > 人设决定的 ----
     const styleInfo = await resolveStyleFor({ styleId: opts.style || project.style });
@@ -947,6 +1457,10 @@ async function renderProject(project, opts = {}, scope = 'auto') {
     for (let i = 0; i < project.scenes.length; i++) {
       const s = project.scenes[i];
       if (!s.narration) { speeches.push(null); continue; }
+      progressUpdate(project.id, {
+        phase: 'voice', current: i, done: i, total: sceneTotal,
+        label: `正在合成第 ${i + 1}/${sceneTotal} 句旁白`,
+      });
       const got = await getSpeechCached(project, s, voice, cdir);
       if (!got || !got.wav) {
         missing.push({
@@ -954,6 +1468,9 @@ async function renderProject(project, opts = {}, scope = 'auto') {
           text: String(s.narration).slice(0, 40),
           error: (got && got.error) || 'SPEAK_FAILED',
           status: (got && got.status) || 0,
+          speakError: (got && got.speakError) || '',
+          attempts: (got && got.attempts) || 0,
+          retries: (got && got.retries) || 0,
           detail: (got && got.detail) || '',
         });
         speeches.push(null);
@@ -964,14 +1481,26 @@ async function renderProject(project, opts = {}, scope = 'auto') {
     }
     if (missing.length) {
       log(`渲染中止 VOICE_UNAVAILABLE：${missing.length}/${project.scenes.length} 条旁白没拿到（scene#${missing.map((m) => m.index).join(',')}）`);
+      // 说话失败最多重试了几次：面板要能说"已重试 4 次"，而不是只说"失败"。
+      const maxAttempts = missing.reduce((a, m) => Math.max(a, Number(m.attempts) || 0), 0);
+      const speakError = missing.find((m) => m.speakError) ? missing.find((m) => m.speakError).speakError : '';
+      progressUpdate(project.id, {
+        status: 'failed', phase: 'failed',
+        label: speakError === 'QUEUE_TIMEOUT' ? '配音排队超时' : '配音服务不可用',
+        error: 'VOICE_UNAVAILABLE', detail: speakError || missing[0].error,
+        attempts: maxAttempts, total: sceneTotal,
+      });
       return {
         ok: false,
         error: 'VOICE_UNAVAILABLE',
+        speakError,
+        attempts: maxAttempts,
         scenes: missing,
         hint: '有旁白没合成出来（speak strict 模式）。整片不渲染，避免产出"半真半假"的成片；修好音色后重试即可。',
         ms: Date.now() - started,
       };
     }
+
 
     // ---- 2) 时长 ----
     let finalPlan;
@@ -994,6 +1523,7 @@ async function renderProject(project, opts = {}, scope = 'auto') {
     const durations = [];
     let reused = 0;
     let rendered = 0;
+    const totalScenes = finalPlan.scenes.length;
     for (let i = 0; i < finalPlan.scenes.length; i++) {
       const s = finalPlan.scenes[i];
       const key = P.sceneKey(s, sceneCfg);
@@ -1003,10 +1533,19 @@ async function renderProject(project, opts = {}, scope = 'auto') {
       if (canReuse) {
         clips.push(hit.clip);
         reused += 1;
+        progressUpdate(project.id, {
+          phase: 'scenes', current: i, done: i + 1, total: totalScenes,
+          engine: 'cache', label: `第 ${i + 1}/${totalScenes} 场复用缓存`
+        });
       } else {
         // 按"手里有什么素材"排引擎链（sceneEngines），逐个试，谁先成用谁。
         // 有 draw 就一定会被轮到 —— 不会再出现"有 draw 却被 manim 分支吞掉"。
         const chain = sceneEngines(s);
+        const firstEng = chain[0] || 'text';
+        progressUpdate(project.id, {
+          phase: 'scenes', current: i, done: i, total: totalScenes,
+          engine: firstEng, label: `第 ${i + 1}/${totalScenes} 场 ${engineLabel(firstEng)} 渲染中…`,
+        });
         let clipFile = null;
         let engine = 'text';
         for (const eng of chain) {
@@ -1072,9 +1611,11 @@ async function renderProject(project, opts = {}, scope = 'auto') {
         rendered += 1;
       }
       durations.push(s.seconds);
+      progressUpdate(project.id, { phase: 'scenes', done: i + 1, total: totalScenes });
     }
 
     // ---- 4) 拼接（可缓存：画面没变就不用重拼）----
+    progressUpdate(project.id, { phase: 'concat', label: '正在拼接画面' });
     // 只换声音时最值钱的一步：拼接要跑一次全片编码，几十秒的片子就是 1~3 秒白花。
     const joinedKey = P.sha1(JSON.stringify({ clips: clips.map((c) => path.basename(c)), durations, fade: CFG.fade, w: CFG.width, h: CFG.height, fps: CFG.fps }));
     let joined = null;
@@ -1111,6 +1652,7 @@ async function renderProject(project, opts = {}, scope = 'auto') {
     // 项目目录里只留缓存与记录，避免两处路径含义不一致。
     const renderId = crypto.randomUUID();
     const outFile = path.join(CFG.outDir, `${renderId}.mp4`);
+    progressUpdate(project.id, { phase: 'mix', label: '正在混音' });
     const mixed = await R.mixAudio({
       ffmpeg: CFG.ffmpeg, videoIn: joined, narrations,
       bgm: pickBgm(opts.bgm || project.bgm), totalSeconds: finalPlan.totalSeconds, out: outFile,
@@ -1127,6 +1669,11 @@ async function renderProject(project, opts = {}, scope = 'auto') {
     project.renders = (project.renders || []).concat([record]).slice(-10);
     P.saveProject(CFG.projectDir, project);
     log(`project ${project.id} render scope=${scope} reused=${reused} rendered=${rendered} style=${style.id} ${Math.round(stat.size / 1024)}KB ${Date.now() - started}ms`);
+    progressUpdate(project.id, {
+      status: 'done', phase: 'done', done: totalScenes, total: totalScenes,
+      label: `做好了：${finalPlan.totalSeconds} 秒`,
+      renderId, file: outFile, seconds: finalPlan.totalSeconds, bytes: stat.size, ms: Date.now() - started,
+    });
 
     return {
       ok: true, ...record,
@@ -1166,23 +1713,38 @@ const server = http.createServer(async (req, res) => {
     // 渲染时能复用的片段直接复用，所以"改一场"只花一场的时间。
     if (req.method === 'POST' && p === '/v1/project') {
       const body = JSON.parse(await readBody(req) || '{}');
-      const project = P.createProject(CFG.projectDir, {
-        title: body.title || '未命名项目',
-        width: Number(body.width) || CFG.width,
-        height: Number(body.height) || CFG.height,
-        fps: Number(body.fps) || CFG.fps,
-        fade: body.fade == null ? CFG.fade : Number(body.fade),
-        voice: body.voice || '',
-        bgm: body.bgm || '',
-        // 空字符串 = 渲染时按人设自动选；写了就是钉死这个风格
-        style: body.style || '',
-        textEdgeFade: body.textEdgeFade == null ? null : Number(body.textEdgeFade),
-      });
+      // 带 id 且项目存在 = 原地更新（面板反复"补全 → 改 → 渲染"时，
+      // 不要每次生成一个新项目，否则项目列表里全是半成品）。
+      let project = body.id ? P.loadProject(CFG.projectDir, String(body.id)) : null;
+      if (project) {
+        if (body.title) project.title = String(body.title).slice(0, 80);
+        if (body.width) project.width = Number(body.width) || project.width;
+        if (body.height) project.height = Number(body.height) || project.height;
+        if (body.fps) project.fps = Number(body.fps) || project.fps;
+        if (body.fade != null) project.fade = Number(body.fade);
+        if (body.voice != null) project.voice = String(body.voice);
+        if (body.bgm != null) project.bgm = String(body.bgm);
+        if (body.style != null) project.style = String(body.style);
+        if (body.scenes) project.scenes = [];
+      } else {
+        project = P.createProject(CFG.projectDir, {
+          title: body.title || '未命名项目',
+          width: Number(body.width) || CFG.width,
+          height: Number(body.height) || CFG.height,
+          fps: Number(body.fps) || CFG.fps,
+          fade: body.fade == null ? CFG.fade : Number(body.fade),
+          voice: body.voice || '',
+          bgm: body.bgm || '',
+          // 空字符串 = 渲染时按人设自动选；写了就是钉死这个风格
+          style: body.style || '',
+          textEdgeFade: body.textEdgeFade == null ? null : Number(body.textEdgeFade),
+        });
+      }
       if (Array.isArray(body.scenes) && body.scenes.length) {
         project.scenes = body.scenes.slice(0, CFG.maxScenes).map((s) => P.normalizeScene(s));
-        P.saveProject(CFG.projectDir, project);
       }
-      log(`project created ${project.id} scenes=${project.scenes.length}`);
+      P.saveProject(CFG.projectDir, project);
+      log(`project saved ${project.id} scenes=${project.scenes.length}`);
       return json(res, 200, { ok: true, project });
     }
 
@@ -1235,7 +1797,26 @@ const server = http.createServer(async (req, res) => {
         // 还有场次没渲过，没法只做声音 —— 明确报错，别偷偷改成全量
         return json(res, 409, { ok: false, error: 'CLIPS_MISSING', hint: '先 scope=auto 渲一次画面，再单独重做声音' });
       }
-      const result = await renderProject(project, { voice: body.voice || project.voice, bgm: body.bgm || project.bgm, style: project.style }, scope);
+      let result;
+      try {
+        result = await renderProject(project, { voice: body.voice || project.voice, bgm: body.bgm || project.bgm, style: project.style }, scope);
+      } catch (err) {
+        progressUpdate(project.id, {
+          status: 'failed', phase: 'failed', label: '渲染异常',
+          error: 'RENDER_FAILED', detail: String((err && err.message) || err).slice(0, 300),
+        });
+        throw err;
+      }
+      if (!result.ok) {
+        // 只在还没被标成 failed 时补一笔（VOICE_UNAVAILABLE 已经自己写过了）
+        const rec = progressGet(project.id);
+        if (!rec || rec.status !== 'failed') {
+          progressUpdate(project.id, {
+            status: 'failed', phase: 'failed', label: '渲染失败',
+            error: result.error || '', detail: String(result.hint || result.detail || '').slice(0, 300),
+          });
+        }
+      }
       return json(res, result.ok ? 200 : renderErrorStatus(result), result);
     }
 
@@ -1275,6 +1856,105 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // -------------------------------------------------- 人设联动（绑定） ---
+    // 面板上那行"当前：大肥鱼（迷糊版）· 白板讲解 · 温柔口语"就是它。
+    // 音色由 speak 决定、风格由人设关键词映射、语气由人设正文抽 —— 三处各有来源，
+    // 这里合成一个解释，用户才知道"为什么这集是这个声音和样子"。
+    if (req.method === 'GET' && p === '/v1/persona-binding') {
+      const binding = await resolveBinding({ styleId: url.searchParams.get('style') || '' });
+      return json(res, 200, {
+        ok: true,
+        persona: binding.persona,
+        voice: binding.voice,
+        style: binding.style,
+        tone: binding.tone,
+        summary: binding.summary,
+      });
+    }
+
+    // 渲染进度：长请求的旁路信息，面板每 1~2 秒问一次。
+    if (req.method === 'GET' && p === '/v1/project/progress') {
+      const id = String(url.searchParams.get('id') || '');
+      if (!id) return json(res, 400, { ok: false, error: 'ID_REQUIRED' });
+      const rec = progressGet(id);
+      if (!rec) return json(res, 200, { ok: true, id, status: 'idle' });
+      return json(res, 200, Object.assign({ ok: true }, rec));
+    }
+
+    // ------------------------------------------------ 创作入口 A：写稿 ---
+    // 稿子 → 分镜。只拆场，不渲染、不写 manim 代码：用户下一步要改标题和秒数，
+    // 先花几十秒写代码是浪费。
+    if (req.method === 'POST' && p === '/v1/storyboard/from-script') {
+      const body = JSON.parse(await readBody(req) || '{}');
+      const script = String(body.script || '').trim();
+      if (!script) return json(res, 400, { ok: false, error: 'SCRIPT_REQUIRED' });
+      const binding = await resolveBinding({ styleId: body.style || '' });
+      const r = await splitScript(script, {
+        seconds: body.seconds,
+        style: binding.styleObject,
+        toneLines: tonePromptLines(binding, { spoken: false }),
+        req,
+      });
+      if (!r.ok) return json(res, 200, { ok: false, step: 'storyboard', error: r.error, raw: r.raw });
+      const saved = saveDraftProject({
+        projectId: body.projectId,
+        title: r.title,
+        scenes: r.scenes.map((s) => ({ text: s.text, narration: s.narration, seconds: s.seconds })),
+        style: body.style || '',
+        voice: body.voice || '',
+      });
+      log(`from-script ok：${r.scenes.length} 场，项目 ${saved.id}`);
+      return json(res, 200, {
+        ok: true,
+        project: saved,
+        title: r.title,
+        scenes: r.scenes,
+        warnings: r.warnings,
+        estimate: estimateRender(r.scenes),
+        style: binding.style,
+        voice: binding.voice,
+        tone: binding.tone,
+        bindingSummary: binding.summary,
+      });
+    }
+
+    // ------------------------------------------------ 创作入口 B：分镜 ---
+    // 用户自己填的每一场 → 补引擎与 manim 代码。visual_hint 是这一轮的主角：
+    // 它被当成"最高优先级的画面要求"喂给写脚本的模型。
+    if (req.method === 'POST' && p === '/v1/storyboard/from-scenes') {
+      const body = JSON.parse(await readBody(req) || '{}');
+      const list = Array.isArray(body.scenes) ? body.scenes.slice(0, CFG.maxScenes) : [];
+      if (!list.length) return json(res, 400, { ok: false, error: 'SCENES_REQUIRED' });
+      const binding = await resolveBinding({ styleId: body.style || '' });
+      const r = await fillScenes(list, { style: binding.styleObject, req });
+      if (!r.ok) return json(res, 200, { ok: false, step: 'storyboard', error: r.error, raw: r.raw });
+      const title = String(body.title || (list.find((s) => s && s.text) || {}).text || '未命名').slice(0, 60);
+      const saved = saveDraftProject({
+        projectId: body.projectId,
+        title,
+        scenes: r.scenes.map((s) => ({
+          text: s.text, narration: s.narration, seconds: s.seconds,
+          kind: s.kind, manim: s.manim || null,
+        })),
+        style: body.style || '',
+        voice: body.voice || '',
+      });
+      log(`from-scenes ok：${r.scenes.length} 场，manim ${r.stats.manim} 场，项目 ${saved.id}`);
+      return json(res, 200, {
+        ok: true,
+        project: saved,
+        title,
+        scenes: r.scenes,
+        stats: r.stats,
+        warnings: r.warnings,
+        estimate: estimateRender(r.scenes),
+        style: binding.style,
+        voice: binding.voice,
+        tone: binding.tone,
+        bindingSummary: binding.summary,
+      });
+    }
+
     // ---------------------------------------------------- 一次性渲染 ---
     if (req.method === 'GET' && p === '/v1/health') {
       // 注意：健康检查不查人设/不跑 manim —— 面板会高频轮询，这里必须便宜。
@@ -1301,15 +1981,23 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req) || '{}');
       const prompt = String(body.prompt || '').trim();
       if (!prompt) return json(res, 400, { ok: false, error: 'PROMPT_REQUIRED' });
-      const styleInfo = await resolveStyleFor({ styleId: body.style || '' });
+      // 人设决定风格，也决定旁白的口气；一次拿齐，避免风格与语气来自两次不同的人设读
+      const binding = await resolveBinding({ styleId: body.style || '' });
+      const styleInfo = binding.styleInfo;
       const two = await planTwoStage(prompt, {
         seconds: body.seconds, req, style: styleInfo.style,
+        toneLines: tonePromptLines(binding),
         stickerIds: Array.isArray(body.stickerIds) ? body.stickerIds : undefined,
       });
       if (!two.ok) return json(res, 200, { ok: false, step: 'plan', error: two.error, raw: two.raw });
+      const plan = normalizePlan(two.json);
       return json(res, 200, {
-        ok: true, plan: normalizePlan(two.json), visuals: two.visuals, manimRatio: two.manimRatio,
+        ok: true, plan, visuals: two.visuals, manimRatio: two.manimRatio,
+        estimate: estimateRender(plan.scenes),
         style: { id: styleInfo.id, name: styleInfo.style.name, reason: styleInfo.reason, source: styleInfo.source },
+        voice: binding.voice,
+        tone: binding.tone,
+        bindingSummary: binding.summary,
       });
     }
 
@@ -1328,16 +2016,24 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req) || '{}');
       const prompt = String(body.prompt || '').trim();
       if (!prompt) return json(res, 400, { ok: false, error: 'PROMPT_REQUIRED' });
-      const styleInfo = await resolveStyleFor({ styleId: body.style || '' });
+      const binding = await resolveBinding({ styleId: body.style || '' });
+      const styleInfo = binding.styleInfo;
       const two = await planTwoStage(prompt, {
         seconds: body.seconds, req, style: styleInfo.style,
+        toneLines: tonePromptLines(binding),
         stickerIds: withPlanHints(body, await stickerHints()).stickerIds,
       });
       if (!two.ok) return json(res, 200, { ok: false, step: 'plan', error: two.error, raw: two.raw });
       const plan = normalizePlan(two.json);
       const result = await renderPlan(plan, { voice: body.voice, bgm: body.bgm, style: styleInfo.id });
       log(`create ok=${result.ok} scenes=${plan.scenes.length} style=${styleInfo.id} ${result.ok ? `bytes=${result.bytes} ms=${result.ms}` : result.error}`);
-      return json(res, result.ok ? 200 : renderErrorStatus(result), Object.assign({ plan }, result));
+      return json(res, result.ok ? 200 : renderErrorStatus(result), Object.assign({
+        plan,
+        estimate: estimateRender(plan.scenes),
+        voice: binding.voice,
+        tone: binding.tone,
+        bindingSummary: binding.summary,
+      }, result));
     }
 
     return json(res, 404, { ok: false, error: 'not found' });
@@ -1366,5 +2062,9 @@ module.exports = {
   planWithNarration, wavDurationMs, parseWav, measureAudioMs, padWavToSeconds, guardAudioTail,
   normalizePlan, renderPlan, renderProject, start, server, CFG, P, S,
   sceneEngines, resolveStyleFor, styleCfg,
-  buildSkeletonPrompt, buildVisualPrompt,
+  buildSkeletonPrompt, buildVisualPrompt, buildScriptSplitPrompt,
+  // 三种创作入口 / 人设绑定（测试脚本直接调，不必起服务）
+  splitScript, fillScenes, decideTool, estimateRender, saveDraftProject,
+  resolveBinding, fetchPersona, fetchVoiceBinding, tonePromptLines,
+  progressGet, progressStart, progressUpdate, parseSpeakFailure,
 };
