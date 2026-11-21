@@ -739,8 +739,29 @@ async function renderProject(project, opts = {}, scope = 'auto') {
       } else {
         // 两种画面来源：讲解画面（GDI+ 绘图指令 → 分步图 → 片段）或文字卡（渐变 + 大字）
         let clipFile = null;
+        // 数学图形：交给 Python/matplotlib 真算真画。
+        // 放在 rich 分支之前，因为它和 rich 是并列的两种"讲解画面"。
+        if (s.kind === 'plot' && s.python && Pyplot && fs.existsSync(CFG.python)) {
+          try {
+            const py = await Pyplot.renderPyplot({
+              python: CFG.python, work, index: i, code: s.python,
+              w: CFG.width, h: CFG.height,
+            });
+            if (py && py.ok) {
+              const slides = HTMLScene
+                ? await HTMLScene.buildSlidesClip({ ffmpeg: CFG.ffmpeg, work, index: i, pngs: [py.png], seconds: s.seconds, fps: CFG.fps, w: CFG.width, h: CFG.height })
+                : null;
+              if (slides && slides.ok) clipFile = slides.file;
+              else log(`scene#${i} 数学图合成失败: ${(slides && slides.error || 'no slides')}`);
+            } else {
+              log(`scene#${i} matplotlib 失败，退回文字卡: ${(py && py.error || '').slice(0, 200)}`);
+            }
+          } catch (err) {
+            log(`scene#${i} matplotlib 异常: ${err && err.message || err}`);
+          }
+        }
         const wantsRich = (s.kind === 'rich' && (s.draw || s.html));
-        if (wantsRich && s.draw && GdiScene) {
+        if (!clipFile && wantsRich && s.draw && GdiScene) {
           try {
             const stills = await GdiScene.renderGdiStills({
               psScript: path.join(DIR, 'lib', 'draw.ps1'),
@@ -758,7 +779,7 @@ async function renderProject(project, opts = {}, scope = 'auto') {
           } catch (err) {
             log(`scene#${i} 讲解画面异常，退回文字卡: ${err && err.message || err}`);
           }
-        } else if (wantsRich && s.html && HTMLScene) {
+        } else if (!clipFile && wantsRich && s.html && HTMLScene) {
           // 旧路径：HTML/SVG 需要无头浏览器（服务器上跑不起来，仅开发机可用）
           try {
             const stills = await HTMLScene.renderHtmlStills({
