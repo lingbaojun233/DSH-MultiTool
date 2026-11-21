@@ -247,7 +247,7 @@ function protectedPath(pathname) {
     pathname === '/api/tts' || pathname === '/api/asr' ||
     pathname === '/api/history' || pathname === '/api/studio/create' ||
     pathname === '/api/studio/plan' || pathname === '/api/studio/render' ||
-    pathname === '/api/stickers/send';
+    pathname === '/api/stickers/send' || pathname === '/api/stickers/favorite';
 }
 
 /** 服务间直连 POST（视频模块 / io）：不走 req 透传，因为要拿回结果再二次加工。 */
@@ -642,7 +642,8 @@ const handler = async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/stickers') {
       const q = url.searchParams.get('q') || '';
       const limit = url.searchParams.get('limit') || '60';
-      const r = await fetch(`${STICKER_BASE}/v1/list?q=${encodeURIComponent(q)}&limit=${encodeURIComponent(limit)}`,
+      const fav = url.searchParams.get('favorite') === '1' ? '&favorite=1' : '';
+      const r = await fetch(`${STICKER_BASE}/v1/list?q=${encodeURIComponent(q)}&limit=${encodeURIComponent(limit)}${fav}`,
         { signal: AbortSignal.timeout(15000) });
       const data = await r.json().catch(() => null);
       if (!data) return sendJson(res, 502, { ok: false, error: '表情包模块没响应' });
@@ -702,8 +703,9 @@ const handler = async (req, res) => {
       const prompt = seen
         ? `（我发了一张表情包，画面上是：${seen}。就当我发了这张图，自然地接一句，别说你看到的是文字。）`
         : `（我发了一张表情包，表情叫「${label}」。就当我发了这张图，自然地接一句，别说你看到的是文字。）`;
+      // 带上目录，它才可能"回敬"一张 —— 否则它手里没有 id 可填
       const io = await postJson(IO_BASE, '/v1/input',
-        { text: prompt, sessionId: 'panel' },
+        { text: prompt, sessionId: 'panel', stickers: await stickerCatalogForPrompt() },
         { authorization: req.headers.authorization || '' }, 600000);
 
       const reply = (io.data && io.data.answer) || '';
@@ -727,6 +729,35 @@ const handler = async (req, res) => {
         ioOk: Boolean(io.data && io.data.ok),
         error: reply ? undefined : ((io.data && (io.data.error || io.data.code)) || `io HTTP ${io.status}`),
       });
+    }
+
+    // 收藏 / 取消收藏：面板只做同源代理，重复点也幂等（表情模块自己说了算）
+    if (req.method === 'POST' && url.pathname === '/api/stickers/favorite') {
+      const rawFav = await readBody(req, 64 * 1024);
+      let body = {};
+      try { body = JSON.parse(rawFav.toString('utf8')) || {}; } catch { }
+      const id = String(body.id || '');
+      if (!/^[0-9a-f]{6,40}$/i.test(id)) return sendJson(res, 400, { ok: false, error: 'BAD_ID' });
+      const name = String(body.name || '').trim().slice(0, 40);
+      const note = String(body.note || '').trim().slice(0, 160);
+      const payload = { id };
+      if (name) payload.name = name;
+      if (note) payload.note = note;
+      const r = await postJson(STICKER_BASE, '/v1/favorite', payload, {}, 20000);
+      if (!r.data) return sendJson(res, 502, { ok: false, error: `表情包模块没响应（HTTP ${r.status}）` });
+      log(`sticker favorite on id=${id} name=${name || '-'} ok=${r.data.ok} http=${r.status}`);
+      return sendJson(res, r.status || 200, r.data);
+    }
+
+    if (req.method === 'DELETE' && url.pathname === '/api/stickers/favorite') {
+      const id = String(url.searchParams.get('id') || '');
+      if (!/^[0-9a-f]{6,40}$/i.test(id)) return sendJson(res, 400, { ok: false, error: 'BAD_ID' });
+      const r = await fetch(`${STICKER_BASE}/v1/favorite?id=${encodeURIComponent(id)}`,
+        { method: 'DELETE', signal: AbortSignal.timeout(20000) });
+      const data = await r.json().catch(() => null);
+      if (!data) return sendJson(res, 502, { ok: false, error: '表情包模块没响应' });
+      log(`sticker favorite off id=${id} ok=${data.ok} http=${r.status}`);
+      return sendJson(res, r.status || 200, data);
     }
 
     // 视频创作：DSH 只写分镜，ffmpeg 渲染（模型不生成像素）
@@ -811,6 +842,21 @@ const handler = async (req, res) => {
     return sendJson(res, 500, { ok: false, error: err.message });
   }
 };
+
+/**
+ * 给提示词用的表情目录（id + 名字）。失败就返回 undefined ——
+ * 目录缺席只会让它不发图，不该让整轮对话挂掉。
+ */
+async function stickerCatalogForPrompt(limit = 80) {
+  try {
+    const r = await fetch(`${STICKER_BASE}/v1/list?limit=${limit}`, { signal: AbortSignal.timeout(8000) });
+    const data = await r.json().catch(() => null);
+    if (!data || !data.ok || !Array.isArray(data.items)) return undefined;
+    return data.items.slice(0, limit).map((it) => ({ id: it.id, name: it.mood || it.name || it.id }));
+  } catch {
+    return undefined;
+  }
+}
 
 const server = http.createServer(handler);
 

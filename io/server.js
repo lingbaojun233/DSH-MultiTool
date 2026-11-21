@@ -20,6 +20,18 @@ const { run, coreStatus, verifyUser } = require('./io.js');
 
 const HOST = process.env.DSH_IO_HOST || '127.0.0.1';
 const PORT = Number(process.env.DSH_IO_PORT || 8765);
+/**
+ * 插件产生的副作用动作（发表情、播放语音）先按 session 暂存，
+ * 等这一轮 /v1/input 返回时一起带回界面。用内存就够：
+ * 动作只在"这一轮结束"这个瞬间有用，丢了大不了这轮不显示。
+ */
+const actionQueue = new Map(); // sessionId -> [{type, ...}]
+
+function takeActions(sessionId) {
+  const list = actionQueue.get(sessionId) || [];
+  actionQueue.delete(sessionId);
+  return list;
+}
 const TOKEN = process.env.DSH_IO_TOKEN || '';
 const MAX_BODY = 1024 * 1024;
 
@@ -94,12 +106,34 @@ const server = http.createServer(async (req, res) => {
       timeoutMs: payload.timeoutMs || undefined,
       history: Array.isArray(payload.history) ? payload.history.slice(-8) : undefined,
       counterpart: payload.counterpart || undefined,
+      stickers: Array.isArray(payload.stickers) ? payload.stickers.slice(0, 80) : undefined,
       session,
     });
 
     log(`output ok=${result.ok} code=${result.code} ms=${result.ms} tokens=${result.tokens ? result.tokens.prompt + '+' + result.tokens.answer + '=' + result.tokens.total : '?'}`);
     const { events, ...rest } = result;
-    return json(res, result.ok ? 200 : 502, rest);
+    // 插件在这一轮里"做了点什么"（发表情、念一段）会挂在动作队列上，
+    // 随响应一起带回给界面执行 —— 模型自己没法直接操作 DOM。
+    const actions = takeActions(payload.sessionId || 'adhoc');
+    return json(res, result.ok ? 200 : 502, actions.length ? { ...rest, actions } : rest);
+  }
+
+  // 插件侧的动作入口：{type, payload} 按 session 暂存，由这一轮的响应带走
+  if (req.method === 'POST' && url.pathname === '/v1/action') {
+    let body;
+    try {
+      body = JSON.parse(await readBody(req));
+    } catch {
+      return json(res, 400, { ok: false, error: 'BAD_JSON' });
+    }
+    const sessionId = String(body.sessionId || 'adhoc');
+    const type = String(body.type || '');
+    if (!type) return json(res, 400, { ok: false, error: 'TYPE_REQUIRED' });
+    const queue = actionQueue.get(sessionId) || [];
+    queue.push({ type, ...(body.payload || {}) });
+    actionQueue.set(sessionId, queue.slice(-20));
+    log(`action ${type} session=${sessionId}`);
+    return json(res, 200, { ok: true, queued: queue.length });
   }
 
   return json(res, 404, { ok: false, error: 'not found' });

@@ -424,6 +424,61 @@ async function speakText(text, btn) {
   }
 }
 
+// 大肥鱼会自己发表情：回复里带 [sticker:<id>]，单独一行或句尾都可能。
+// 全角括号、冒号两侧的空格都认；[收藏这张] 是"把刚发的这张收起来"的指令，不能念出来。
+const REPLY_MARK_RE = /[ \t]*[\[【]\s*(?:sticker\s*[:：]\s*([0-9a-z][0-9a-z_-]{2,63})|收藏这张)\s*[\]】]/gi;
+
+/**
+ * 把回复拆成「文字 / 表情」段：正文去掉标记，表情按出现顺序排队。
+ * 返回 { text, segments, stickers, favorite }，text 是剥掉标记后的正文。
+ */
+function parseReplyMarks(text) {
+  const src = String(text == null ? '' : text);
+  const segments = [];
+  const stickers = [];
+  let favorite = false;
+  let cursor = 0;
+
+  REPLY_MARK_RE.lastIndex = 0;
+  let m;
+  while ((m = REPLY_MARK_RE.exec(src))) {
+    const before = src.slice(cursor, m.index);
+    if (before) segments.push({ kind: 'text', text: before });
+    cursor = m.index + m[0].length;
+    if (m[1]) {
+      const id = String(m[1]).trim();
+      stickers.push(id);
+      segments.push({ kind: 'sticker', id });
+    } else {
+      favorite = true;
+    }
+  }
+  const tail = src.slice(cursor);
+  if (tail) segments.push({ kind: 'text', text: tail });
+
+  const cleaned = src
+    .replace(REPLY_MARK_RE, '')
+    .replace(/[ \t]+$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  return { text: cleaned, segments, stickers, favorite };
+}
+
+/** 历史记录里的 stickers 字段：去掉正文标记已经渲染过的，免得同一张出现两次。 */
+function extraStickerIds(text, list) {
+  if (!Array.isArray(list) || !list.length) return [];
+  const seen = new Set(parseReplyMarks(text).stickers);
+  const out = [];
+  for (const raw of list) {
+    const id = String(raw || '').trim();
+    if (!/^[0-9a-z][0-9a-z_-]{2,63}$/i.test(id) || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
 /**
  * 一条回复拆成几条短消息：像真人那样一条一条发，而不是甩一大段。
  * 先按换行切（模型常这么分条），过长再按句末标点切，还长就硬切。
@@ -450,21 +505,44 @@ function splitBubbles(text) {
   return out.length ? out : [raw];
 }
 
-/** 按"多条消息"渲染；只有最后一条挂朗读按钮，读的是整段。 */
+/** 按"多条消息"渲染；只有最后一条文字挂朗读按钮，读的是整段（不含表情标记）。 */
 async function addReplySeries(text, meta, options = {}) {
-  const parts = splitBubbles(text);
-  if (!parts.length) return addMessage('assistant', '（空答案）', meta);
+  const parsed = parseReplyMarks(text);
+
+  // 标记处断开：文字段照旧拆气泡，表情位置插入一条纯图片气泡，顺序跟正文一致
+  const blocks = [];
+  for (const seg of parsed.segments) {
+    if (seg.kind === 'sticker') {
+      blocks.push({ kind: 'sticker', id: seg.id });
+    } else {
+      for (const part of splitBubbles(seg.text)) blocks.push({ kind: 'text', text: part });
+    }
+  }
+  if (!blocks.length) {
+    addMessage('assistant', '（空答案）', meta);
+    return null;
+  }
+
+  let lastTextIndex = -1;
+  for (let i = 0; i < blocks.length; i++) if (blocks[i].kind === 'text') lastTextIndex = i;
+
   let last = null;
-  for (let i = 0; i < parts.length; i++) {
-    const isLast = i === parts.length - 1;
-    last = addMessage('assistant', parts[i], isLast ? meta : '', { noSpeak: !isLast });
-    if (isLast) {
-      const btn = last.querySelector('.msg-tools .iconbtn');
-      if (btn) {
-        btn.title = '读出来（整段）';
-        btn.replaceWith(btn.cloneNode(true));
-        const fresh = last.querySelector('.msg-tools .iconbtn');
-        fresh.addEventListener('click', () => speakText(text, fresh));
+  for (let i = 0; i < blocks.length; i++) {
+    const isLast = i === blocks.length - 1;
+    const block = blocks[i];
+    if (block.kind === 'sticker') {
+      // 纯图片不挂朗读按钮：addMessage 只在有文字时才加 🔊
+      last = addMessage('assistant', '', isLast ? meta : '', { sticker: block.id });
+    } else {
+      last = addMessage('assistant', block.text, isLast ? meta : '', { noSpeak: i !== lastTextIndex });
+      if (i === lastTextIndex) {
+        const btn = last.querySelector('.msg-tools .iconbtn');
+        if (btn) {
+          btn.title = '读出来（整段）';
+          btn.replaceWith(btn.cloneNode(true));
+          const fresh = last.querySelector('.msg-tools .iconbtn');
+          fresh.addEventListener('click', () => speakText(parsed.text, fresh));
+        }
       }
     }
     if (!isLast && !options.instant) {
@@ -562,7 +640,11 @@ async function loadHistory() {
     for (const m of messages) {
       if (m.role === 'assistant') {
         const meta = typeof m.ms === 'number' ? `${(m.ms / 1000).toFixed(1)} 秒 · ${formatClock(m.ts)}` : formatClock(m.ts);
-        addReplySeries(m.text || '', meta + usageNote(m.usage), { instant: true });
+        await addReplySeries(m.text || '', meta + usageNote(m.usage), { instant: true });
+        // 历史里单独存了表情（正文可能没有标记）：补上还没渲染的那几张
+        for (const id of extraStickerIds(m.text || '', m.stickers)) {
+          addMessage('assistant', '', '', { sticker: id });
+        }
       } else if (m.role === 'user') {
         addMessage('user', m.text || '', formatClock(m.ts), m.sticker ? { sticker: m.sticker } : undefined);
       } else {
@@ -760,7 +842,8 @@ async function send() {
     const res = await apiFetch('/api/input', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text, sessionId: getSessionId(), history }),
+      // 带上表情目录，模型才可能输出 [sticker:<id>]；目录没加载就不传
+      body: JSON.stringify({ text, sessionId: getSessionId(), history, stickers: stickerCatalog() }),
     });
 
     if (res.status === 401) {
@@ -778,7 +861,9 @@ async function send() {
       const ms = typeof data.ms === 'number' ? data.ms : Math.round(performance.now() - started);
       recentTurns.push({ role: 'assistant', text: data.answer || '' });
       if (recentTurns.length > 12) recentTurns.splice(0, recentTurns.length - 12);
-      addReplySeries(data.answer || '（空答案）', `${(ms / 1000).toFixed(1)} 秒${usageNote(data.usage)} · ${formatClock(Date.now())}`);
+      await addReplySeries(data.answer || '（空答案）', `${(ms / 1000).toFixed(1)} 秒${usageNote(data.usage)} · ${formatClock(Date.now())}`);
+      // 插件在这一轮里"做了点什么"：发张表情、念一段。模型自己碰不到界面，靠这里落地。
+      applyActions(data.actions);
     } else {
       const detail = data.exitCode != null ? `exit=${data.exitCode}` : '';
       addMessage('error', data.error || data.code || '请求失败', detail);
@@ -795,8 +880,25 @@ async function send() {
   }
 }
 
-function autoGrow() {
-  inputEl.style.height = 'auto';
+/**
+ * 执行插件塞回来的动作。目前两种：
+ *   sticker —— 它自己挑了一张图，插一个图片气泡
+ *   speak   —— 它想直接念出来，走本地 TTS 播放
+ * 未知类型直接跳过：插件可能比面板新，不能让界面因为不认识就报错。
+ */
+function applyActions(actions) {
+  if (!Array.isArray(actions) || !actions.length) return;
+  for (const a of actions) {
+    if (!a || !a.type) continue;
+    if (a.type === 'sticker' && a.id) {
+      addMessage('assistant', '', '', { sticker: a.id });
+    } else if (a.type === 'speak' && a.text) {
+      speakText(String(a.text).slice(0, 300));
+    }
+  }
+}
+
+function autoGrow() {  inputEl.style.height = 'auto';
   inputEl.style.height = `${Math.min(inputEl.scrollHeight, 220)}px`;
 }
 
@@ -1746,20 +1848,25 @@ const stickerEls = {
   close: document.getElementById('stickerClose'),
   hint: document.getElementById('stickerHint'),
   look: document.getElementById('stickerLook'),
+  tabAll: document.getElementById('stickerTabAll'),
+  tabFav: document.getElementById('stickerTabFav'),
 };
 
 let stickerList = [];
 let stickerQuery = '';
 let stickerTimer = null;
+let stickerFavOnly = false;
 
 function renderStickerGrid(items) {
   if (!stickerEls.grid) return;
   stickerEls.grid.innerHTML = '';
   if (!items.length) {
-    stickerEls.hint.textContent = '没找到，换个词试试';
+    if (stickerEls.hint) {
+      stickerEls.hint.textContent = stickerFavOnly ? '还没有收藏，点右上角 ★ 收一张' : '没找到，换个词试试';
+    }
     return;
   }
-  stickerEls.hint.textContent = `共 ${items.length} 张 · 点一张直接发出去`;
+  if (stickerEls.hint) stickerEls.hint.textContent = `共 ${items.length} 张 · 点一张直接发出去`;
   for (const it of items) {
     const btn = document.createElement('button');
     btn.type = 'button';
@@ -1770,24 +1877,124 @@ function renderStickerGrid(items) {
     img.src = `/api/stickers/gif?id=${encodeURIComponent(it.id)}`;
     img.alt = it.mood || '';
     btn.appendChild(img);
+
+    // 右上角收藏星：只切收藏，不触发发送（stopPropagation）
+    const star = document.createElement('span');
+    star.className = 'sticker-star';
+    star.setAttribute('role', 'button');
+    star.tabIndex = 0;
+    paintStickerStar(star, it.favorite);
+    const toggle = (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      toggleFavorite(it, star);
+    };
+    star.addEventListener('click', toggle);
+    star.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') toggle(ev);
+    });
+    btn.appendChild(star);
+
     btn.addEventListener('click', () => sendSticker(it, btn));
     stickerEls.grid.appendChild(btn);
   }
 }
 
+function paintStickerStar(star, favorite) {
+  if (!star) return;
+  star.textContent = '★';
+  star.classList.toggle('on', Boolean(favorite));
+  star.setAttribute('aria-pressed', favorite ? 'true' : 'false');
+  star.title = favorite ? '取消收藏' : '收藏这张';
+}
+
+/** 点 ★：收藏 / 取消收藏。收藏页里取消后立刻把这张拿掉。 */
+async function toggleFavorite(item, star) {
+  if (!item || !item.id) return;
+  const want = !item.favorite;
+  const label = item.mood || item.name || item.id;
+  try {
+    const r = want
+      ? await apiJson('/api/stickers/favorite', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: item.id, name: label }),
+      })
+      : await apiJson(`/api/stickers/favorite?id=${encodeURIComponent(item.id)}`, { method: 'DELETE' });
+    if (!r || !r.ok) {
+      if (stickerEls.hint) stickerEls.hint.textContent = (want ? '收藏失败：' : '取消收藏失败：') + ((r && r.error) || '未知原因');
+      return;
+    }
+    item.favorite = want;
+    const row = stickerList.find((x) => x && x.id === item.id);
+    if (row) row.favorite = want;
+    paintStickerStar(star, want);
+    if (stickerEls.hint) stickerEls.hint.textContent = want ? `已收藏「${label}」★` : `已取消收藏「${label}」`;
+    if (stickerFavOnly && !want) renderStickerGrid(stickerList.filter((x) => x && x.favorite));
+  } catch (err) {
+    if (stickerEls.hint) stickerEls.hint.textContent = '收藏失败：' + ((err && err.message) || err);
+  }
+}
+
+/** 模型回了 [收藏这张]：把刚发出去的那张收进收藏夹（名字用当前 mood）。 */
+async function favoriteSentSticker(item) {
+  const name = item.mood || item.name || '';
+  try {
+    const r = await apiJson('/api/stickers/favorite', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: item.id, name }),
+    });
+    if (!r || !r.ok) {
+      if (stickerEls.hint) stickerEls.hint.textContent = '收藏失败：' + ((r && r.error) || '未知原因');
+      return false;
+    }
+    item.favorite = true;
+    const row = stickerList.find((x) => x && x.id === item.id);
+    if (row) row.favorite = true;
+    if (stickerEls.hint) stickerEls.hint.textContent = `已收藏「${name || item.id}」★`;
+    return true;
+  } catch (err) {
+    if (stickerEls.hint) stickerEls.hint.textContent = '收藏失败：' + ((err && err.message) || err);
+    return false;
+  }
+}
+
+/** 交给 io 的表情目录：模型看到 id 才可能输出 [sticker:<id>]（没加载就不传）。 */
+function stickerCatalog() {
+  if (!Array.isArray(stickerList) || !stickerList.length) return undefined;
+  return stickerList.slice(0, 80).map((it) => ({ id: it.id, name: it.mood || it.name || it.id }));
+}
+
+/** 面板没打开过时也先悄悄拉一份目录，正常聊天才能带上表情 id（失败就静默）。 */
+async function preloadStickerCatalog() {
+  if (stickerList.length) return;
+  try {
+    const data = await apiJson('/api/stickers?limit=80');
+    // 期间用户可能已经打开面板搜过一次，别拿旧结果盖掉
+    if (stickerList.length) return;
+    if (data && data.ok && Array.isArray(data.items) && data.items.length) stickerList = data.items;
+  } catch (err) {
+    /* 表情模块没起就保持空目录，不影响聊天 */
+  }
+}
+
 async function loadStickers(q) {
   stickerQuery = q || '';
-  if (stickerEls.hint) stickerEls.hint.textContent = '正在找…';
+  if (stickerEls.hint) stickerEls.hint.textContent = stickerFavOnly ? '正在找收藏…' : '正在找…';
   try {
-    const data = await apiJson(`/api/stickers?q=${encodeURIComponent(stickerQuery)}&limit=60`);
+    const fav = stickerFavOnly ? '&favorite=1' : '';
+    const data = await apiJson(`/api/stickers?q=${encodeURIComponent(stickerQuery)}&limit=60${fav}`);
     if (!data || !data.ok) {
-      stickerEls.hint.textContent = '表情包服务没响应（模块可能没起）';
+      if (stickerEls.hint) stickerEls.hint.textContent = '表情包服务没响应（模块可能没起）';
       return;
     }
     stickerList = Array.isArray(data.items) ? data.items : [];
-    renderStickerGrid(stickerList);
+    // 服务端约定 favorite=1 时收藏在前；收藏页只显示收藏，兜底自己再筛一遍
+    const view = stickerFavOnly ? stickerList.filter((it) => it && it.favorite) : stickerList;
+    renderStickerGrid(view);
   } catch (err) {
-    stickerEls.hint.textContent = '加载失败：' + (err && err.message || err);
+    if (stickerEls.hint) stickerEls.hint.textContent = '加载失败：' + ((err && err.message) || err);
   }
 }
 
@@ -1802,24 +2009,38 @@ async function sendSticker(item, btn) {
       body: JSON.stringify({ id: item.id, mood: item.mood, name: item.name, look }),
     });
     if (!r || !r.ok) {
-      stickerEls.hint.textContent = '没发出去：' + ((r && r.error) || '未知原因');
+      if (stickerEls.hint) stickerEls.hint.textContent = '没发出去：' + ((r && r.error) || '未知原因');
       return;
     }
     addMessage('user', `[表情] ${item.mood || item.name || ''}`, '', { sticker: item.id });
     toggleStickerPanel(false);
 
-    // 表情也算一轮对话，模型会接着说话；把它的回复按多气泡铺开
+    // 收藏指令先读出来：addReplySeries 会把标记从正文剥掉
+    const marks = parseReplyMarks(r.reply || '');
+
+    // 表情也算一轮对话，模型会接着说话；回复里的表情标记由 addReplySeries 铺成图片泡
     if (r.reply) {
       const meta = typeof r.ms === 'number' ? `${(r.ms / 1000).toFixed(1)} 秒 · ${formatClock(Date.now())}` : formatClock(Date.now());
       await addReplySeries(r.reply, meta, {});
     } else if (r.error) {
       addMessage('error', '它没接上话：' + r.error, formatClock(Date.now()));
     }
+
+    // 它说「把这张收起来」：收藏的就是刚发出去的那张
+    if (marks.favorite) await favoriteSentSticker(item);
   } catch (err) {
-    stickerEls.hint.textContent = '发送失败：' + (err && err.message || err);
+    if (stickerEls.hint) stickerEls.hint.textContent = '发送失败：' + ((err && err.message) || err);
   } finally {
     if (btn) btn.disabled = false;
   }
+}
+
+/** 全部 / 收藏 两个小标签页：切页只换请求参数，不改发送逻辑。 */
+function setStickerTab(fav) {
+  stickerFavOnly = Boolean(fav);
+  if (stickerEls.tabAll) stickerEls.tabAll.classList.toggle('active', !stickerFavOnly);
+  if (stickerEls.tabFav) stickerEls.tabFav.classList.toggle('active', stickerFavOnly);
+  loadStickers(stickerQuery);
 }
 
 function toggleStickerPanel(show) {
@@ -1837,3 +2058,8 @@ if (stickerEls.search) {
     stickerTimer = setTimeout(() => loadStickers(stickerEls.search.value.trim()), 300);
   });
 }
+if (stickerEls.tabAll) stickerEls.tabAll.addEventListener('click', () => setStickerTab(false));
+if (stickerEls.tabFav) stickerEls.tabFav.addEventListener('click', () => setStickerTab(true));
+
+// 页面一开就悄悄备一份表情目录，正常聊天才能让模型输出表情 id；失败不影响聊天
+preloadStickerCatalog();

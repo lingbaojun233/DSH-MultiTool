@@ -214,7 +214,27 @@ function registryBlock(options = {}) {
 }
 
 /** 把人格块、对话上下文、当前消息按固定顺序拼成 prompt。 */
-function composePrompt({ catalog, persona, user, history, task }) {
+/**
+ * 表情包能力说明。模型不能真的"发图片"，所以给它一个约定标记：
+ * 想发就在回答最后单独一行写 [sticker:<id>]，面板会把它渲染成图片气泡。
+ * 只传 id 和名字（不传路径），避免提示词被撑爆。
+ */
+function stickerBlock(stickers) {
+  const list = Array.isArray(stickers) ? stickers.filter((s) => s && s.id && s.name) : [];
+  if (!list.length) return '';
+  const shown = list.slice(0, 80);
+  const lines = [
+    '[表情包 · 你可以发表情]',
+    '想发一张表情时，在回答的最后单独一行写：[sticker:<id>]（不要解释这个标记，它会变成图片）。',
+    '如果这张让你很满意、想以后一直用，再单独一行写：[收藏这张]。',
+    '一次最多发两张。没合适的就别发，不要硬凑。',
+    '可用表情：',
+  ];
+  for (const s of shown) lines.push(`${s.id}=${String(s.name).slice(0, 20)}`);
+  return lines.join('\n');
+}
+
+function composePrompt({ catalog, persona, user, history, task, stickers }) {
   const sections = [];
 
   if (catalog) sections.push(catalog);
@@ -223,6 +243,10 @@ function composePrompt({ catalog, persona, user, history, task }) {
     sections.push('[人格设定 · 这是你的身份与行为准则，优先遵守]', persona);
   }
   if (user) sections.push(user);
+
+  const stickerText = stickerBlock(stickers);
+  if (stickerText) sections.push(stickerText);
+
   if (Array.isArray(history) && history.length) {
     const lines = ['[最近对话 · 用于理解指代与言外之意]'];
     for (const turn of history.slice(-8)) {
@@ -347,6 +371,7 @@ async function run(task, options = {}) {
     user: userCtx,
     history: options.history,
     task,
+    stickers: options.stickers,
   });
   // 成本可见性：每轮都记下输入/输出 token，否则"一次对话多少钱"只能靠猜。
   const promptTokens = estimateTokens(promptText);
@@ -361,6 +386,9 @@ async function run(task, options = {}) {
     DSH_USER_NAME: session && session.user ? String(session.user.displayName || session.user.username) : '',
     // 供插件里的 memory_search / memory_remember 按对话对象过滤
     DSH_COUNTERPART: options.counterpart == null ? '' : String(options.counterpart).slice(0, 60),
+    // 插件要"做点什么"（发张图、念一段）时，把动作发到这里，等这一轮结束随响应带回界面
+    DSH_SESSION_ID: options.sessionId || 'adhoc',
+    DSH_ACTION_URL: `${process.env.DSH_ACTION_URL || 'http://127.0.0.1:8765'}/v1/action`,
   });
 
   const result = await new Promise((resolve) => {
