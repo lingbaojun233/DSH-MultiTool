@@ -13,12 +13,26 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 
-function run(cmd, args, timeoutMs) {
+function run(cmd, args, timeoutMs, opts = {}) {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { windowsHide: true });
+    const child = spawn(cmd, args, {
+      windowsHide: true,
+      cwd: opts.cwd,
+      // 环境收窄：不给 PYTHONPATH（避免加载到工作区外的模块），
+      // 临时目录指到本次 work，进程能写的地方就只有这一个目录。
+      env: Object.assign({}, opts.env, {
+        PYTHONPATH: '',
+        PYTHONNOUSERSITE: '1',
+        PYTHONIOENCODING: 'utf-8',
+        TMPDIR: opts.cwd,
+        TEMP: opts.cwd,
+        TMP: opts.cwd,
+      }),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
     let out = '';
     let err = '';
-    const timer = setTimeout(() => { try { child.kill(); } catch { } }, timeoutMs);
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { } }, timeoutMs);
     child.stdout.on('data', (d) => { out += d.toString(); });
     child.stderr.on('data', (d) => { err += d.toString(); });
     child.on('error', (e) => { clearTimeout(timer); resolve({ code: -1, out, err: String(e && e.message || e) }); });
@@ -67,7 +81,9 @@ async function renderPyplot({ python, work, index, code, w = 1920, h = 1080, tim
   const script = path.join(work, `plot-${index}.py`);
   fs.writeFileSync(script, wrapScript(code, outFile.replace(/\\/g, '/'), w, h), 'utf8');
 
-  const r = await run(python, ['-X', 'utf8', script], timeoutMs);
+  // 工作区隔离：cwd 就是本次渲染的临时目录，写的任何相对路径都落在里面；
+  // 渲染完这个目录会被上层清掉。
+  const r = await run(python, ['-X', 'utf8', '-I', script], timeoutMs, { cwd: work });
   const exists = fs.existsSync(outFile) && fs.statSync(outFile).size > 5000;
   if (r.code !== 0 || !exists) {
     return { ok: false, error: `PYPLOT_FAILED(code=${r.code}) ${(r.err || r.out || '').slice(-400)}` };
