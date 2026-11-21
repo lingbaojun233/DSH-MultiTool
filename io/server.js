@@ -93,6 +93,7 @@ const server = http.createServer(async (req, res) => {
       permissionMode: payload.permissionMode || undefined,
       timeoutMs: payload.timeoutMs || undefined,
       history: Array.isArray(payload.history) ? payload.history.slice(-8) : undefined,
+      counterpart: payload.counterpart || undefined,
       session,
     });
 

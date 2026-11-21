@@ -155,6 +155,17 @@ function sameUser(a, b) {
   return left === right;
 }
 
+/**
+ * 对话对象归一化：空/缺省 → null（通用记忆，任何对话都能召回）；
+ * 其它 → 去空白、压到 60 字符的文本。
+ */
+function normCounterpart(value) {
+  if (value == null) return null;
+  const text = String(value).replace(/\s+/g, ' ').trim();
+  if (!text) return null;
+  return text.slice(0, 60);
+}
+
 /** 证据门槛：既不能缺，格式也要能定位（source:scope#locator）。 */
 function hasValidEvidence(evidence) {
   return typeof evidence === 'string' && EVIDENCE_PATTERN.test(evidence.trim());
@@ -426,8 +437,8 @@ function persistFacts(db, facts, ctx) {
     'SELECT id, object, status, support, evidence_event_ids, user_id FROM facts WHERE subject = ? AND predicate = ? AND deleted = 0',
   );
   const insertFact = db.prepare(
-    'INSERT INTO facts (subject, predicate, object, confidence, evidence_event_ids, first_seen, last_seen, status, salience, support, deleted, created_at, user_id)' +
-      ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)',
+    'INSERT INTO facts (subject, predicate, object, confidence, evidence_event_ids, first_seen, last_seen, status, salience, support, deleted, created_at, user_id, counterpart)' +
+      ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)',
   );
   const reinforceFact = db.prepare(
     'UPDATE facts SET support = support + 1, last_seen = ?, evidence_event_ids = ?, confidence = MAX(confidence, ?) WHERE id = ?',
@@ -469,6 +480,7 @@ function persistFacts(db, facts, ctx) {
       ctx.salience,
       ctx.nowIso,
       ctx.userId,
+      ctx.counterpart == null ? null : ctx.counterpart,
     );
     written.push({
       subject: fact.subject,
@@ -518,8 +530,7 @@ function computeSalience({ kind, textLength, hasFact, emotions }) {
  *            facts?:Array<{subject:string,predicate:string,object:string,status:string}>,
  *            factsSkipped?:number, salience?:number, detail?:string}}
  */
-function remember(db, input) {
-  // ---- 0. 入参与连接校验 -------------------------------------------------
+function remember(db, input) {  // ---- 0. 入参与连接校验 -------------------------------------------------
   if (!db || typeof db.prepare !== 'function') {
     return { stored: false, reason: 'error', detail: 'db 无效：需要 db/open.js 打开的 DatabaseSync 连接' };
   }
@@ -537,6 +548,8 @@ function remember(db, input) {
     };
   }
   const userId = parsedUser.userId;
+  // 对话对象：null = 通用记忆；有值 = 只属于跟这个人的对话
+  const counterpart = normCounterpart(src.counterpart);
 
   // ---- 1. 证据门槛：没有证据直接拒收，什么都不写 --------------------------
   const evidence = typeof src.evidence === 'string' ? src.evidence.trim() : '';
@@ -638,8 +651,8 @@ function remember(db, input) {
         .prepare(
           `INSERT INTO events
              (ts, channel, group_id, speaker_id, speaker_name, kind, content, raw_content,
-              evidence, confidence, salience, content_hash, deleted, merged_into, merge_count, created_at, user_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, 1, ?, ?)`,
+              evidence, confidence, salience, content_hash, deleted, merged_into, merge_count, created_at, user_id, counterpart)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, 1, ?, ?, ?)`,
         )
         .run(
           ts,
@@ -656,6 +669,7 @@ function remember(db, input) {
           hash,
           nowIso,
           userId,
+          counterpart,
         );
       const eventId = Number(info.lastInsertRowid);
 
@@ -673,6 +687,7 @@ function remember(db, input) {
         confidence,
         salience,
         userId,
+        counterpart,
       });
 
       return { eventId, entityNames, facts: factsResult.written, factsSkipped: factsResult.skipped };

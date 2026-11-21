@@ -241,6 +241,8 @@ async function recordTurn(task, answer, options = {}) {
   if (!memoryEnabled(options) || options.record === false) return;
   const sessionId = options.sessionId || 'adhoc';
   const userId = options.userId == null ? null : Number(options.userId);
+  // 对话对象：有值 = 这两条记忆只属于跟这个人的对话（QQ 参谋按联系人隔离）
+  const counterpart = options.counterpart == null ? null : String(options.counterpart).slice(0, 60);
   const stamp = Date.now();
   const events = [
     {
@@ -253,6 +255,7 @@ async function recordTurn(task, answer, options = {}) {
       kind: 'msg',
       confidence: 0.9,
       user_id: userId,
+      counterpart,
     },
   ];
   if (answer && String(answer).trim()) {
@@ -266,6 +269,7 @@ async function recordTurn(task, answer, options = {}) {
       kind: 'msg',
       confidence: 0.8,
       user_id: userId,
+      counterpart,
     });
   }
 
@@ -355,6 +359,8 @@ async function run(task, options = {}) {
     DSH_HOME: p.home,
     DSH_USER_ID: session && session.user ? String(session.user.id) : '',
     DSH_USER_NAME: session && session.user ? String(session.user.displayName || session.user.username) : '',
+    // 供插件里的 memory_search / memory_remember 按对话对象过滤
+    DSH_COUNTERPART: options.counterpart == null ? '' : String(options.counterpart).slice(0, 60),
   });
 
   const result = await new Promise((resolve) => {
@@ -430,7 +436,10 @@ async function run(task, options = {}) {
 
   // 落事件后再统计增量，保证 usage 里能看到这一轮写了什么（多花约 15ms）
   try {
-    await recordTurn(task, result.answer, Object.assign({}, options, { userId: session && session.user ? session.user.id : null }));
+    await recordTurn(task, result.answer, Object.assign({}, options, {
+    userId: session && session.user ? session.user.id : null,
+    counterpart: options.counterpart == null ? null : options.counterpart,
+  }));
   } catch {
     /* 记忆不可用不影响对话 */
   }

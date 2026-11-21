@@ -115,6 +115,26 @@ function userScopeSql(alias, userId) {
 }
 
 /**
+ * 对话对象归一化：空/缺省 → null（不过滤）；其它 → 去空白、压到 60 字符。
+ * 与 remember.js 的口径保持一致，否则"写进去的对象"和"检索时的对象"对不上。
+ */
+function readCounterpart(value) {
+  if (value == null) return null;
+  const text = String(value).replace(/\s+/g, ' ').trim();
+  if (!text) return null;
+  return text.slice(0, 60);
+}
+
+/**
+ * 可见性 SQL 片段：这个对话对象的 + 通用的（counterpart IS NULL）。
+ * 语义和 userScopeSql 一致 —— 通用记忆任何对话都能召回，专属记忆只回自己的对话。
+ */
+function counterpartScopeSql(alias, counterpart) {
+  if (counterpart == null) return '';
+  return ` AND (${alias}.counterpart IS NULL OR ${alias}.counterpart = ?)`;
+}
+
+/**
  * 查询词切分：整句 + 按标点/空白切出的词 + CJK 2-gram。
  * 为什么要 2-gram：中文里"小肥鱼今天过生日"和 query"小肥鱼生日"不会连续出现，
  * 整串 LIKE（以及 trigram 短语）都会漏，拆成双字后按命中比例打分才抓得住。
@@ -187,7 +207,7 @@ function readRange(context, nowMs) {
  * FTS 出错（语法/分词异常）也不让整个检索崩掉，同样落回 LIKE。
  * 两路都带 user_id 可见性过滤（userId 为 null 时不加）。
  */
-function ftsCandidates(db, query, userId) {
+function ftsCandidates(db, query, userId, counterpart) {
   const raw = String(query).trim();
   if (!raw) return [];
 
@@ -204,12 +224,13 @@ function ftsCandidates(db, query, userId) {
       // 参数顺序：MATCH 的短语串在前，user_id 在最后
       const params = [match];
       if (userId != null) params.push(userId);
+      if (counterpart != null) params.push(counterpart);
       const rows = db
         .prepare(
           `SELECT events_fts.rowid AS id
              FROM events_fts
              JOIN events ON events.id = events_fts.rowid
-            WHERE events_fts MATCH ? AND events.deleted = 0${userScopeSql('events', userId)}
+            WHERE events_fts MATCH ? AND events.deleted = 0${userScopeSql('events', userId)}${counterpartScopeSql('events', counterpart)}
             LIMIT ${ROUTE_LIMIT}`,
         )
         .all(...params);
@@ -223,11 +244,12 @@ function ftsCandidates(db, query, userId) {
   const where = terms.map(() => "content LIKE ? ESCAPE '\\'").join(' OR ');
   const params = terms.map((t) => `%${escapeLike(t)}%`);
   if (userId != null) params.push(userId); // 追加在词参数之后，占位符顺序一致
+  if (counterpart != null) params.push(counterpart);
   const rows = db
     .prepare(
       `SELECT id
          FROM events
-        WHERE deleted = 0 AND (${where})${userScopeSql('events', userId)}
+        WHERE deleted = 0 AND (${where})${userScopeSql('events', userId)}${counterpartScopeSql('events', counterpart)}
         ORDER BY ts DESC
         LIMIT ${ROUTE_LIMIT}`,
     )
@@ -240,7 +262,7 @@ function ftsCandidates(db, query, userId) {
  * LIKE 只做粗筛——aliases 是 JSON 文本，还要逐项确认，避免被 JSON 的括号/逗号误命中。
  * 实体表本身不分用户（人名/群名共享），但只召回当前用户可见的事件。
  */
-function entityCandidates(db, terms, userId) {
+function entityCandidates(db, terms, userId, counterpart) {
   if (!terms.length) return [];
 
   const entityIds = new Set();
@@ -272,13 +294,14 @@ function entityCandidates(db, terms, userId) {
   // 参数顺序：先实体 id 列表，再 user_id
   const params = [...ids];
   if (userId != null) params.push(userId);
+  if (counterpart != null) params.push(counterpart);
   // 一个实体可能挂很多事件，按最近优先取 20 条；GROUP BY 去掉同事件的多角色重复行
   const rows = db
     .prepare(
       `SELECT ee.event_id AS id, MAX(e.ts) AS last_ts
          FROM event_entities ee
          JOIN events e ON e.id = ee.event_id
-        WHERE ee.entity_id IN (${placeholders}) AND e.deleted = 0${userScopeSql('e', userId)}
+        WHERE ee.entity_id IN (${placeholders}) AND e.deleted = 0${userScopeSql('e', userId)}${counterpartScopeSql('e', counterpart)}
         GROUP BY ee.event_id
         ORDER BY last_ts DESC
         LIMIT ${ROUTE_LIMIT}`,
@@ -291,15 +314,16 @@ function entityCandidates(db, terms, userId) {
  * c) 时间窗：context 给了范围就用范围，否则最近 30 天。
  * 它提供的是"候选池"而不是答案：这些事件是否有相关性，由打分阶段按 query 词命中决定。
  */
-function windowCandidates(db, range, userId) {
-  // 参数顺序：since、until，然后 user_id
+function windowCandidates(db, range, userId, counterpart) {
+  // 参数顺序：since、until，然后 user_id、counterpart
   const params = [new Date(range.sinceMs).toISOString(), new Date(range.untilMs).toISOString()];
   if (userId != null) params.push(userId);
+  if (counterpart != null) params.push(counterpart);
   const rows = db
     .prepare(
       `SELECT id
          FROM events
-        WHERE deleted = 0 AND ts >= ? AND ts <= ?${userScopeSql('events', userId)}
+        WHERE deleted = 0 AND ts >= ? AND ts <= ?${userScopeSql('events', userId)}${counterpartScopeSql('events', counterpart)}
         ORDER BY ts DESC
         LIMIT ${ROUTE_LIMIT}`,
     )
@@ -325,7 +349,7 @@ function loadEvents(db, ids, userId) {
   const rows = db
     .prepare(
       `SELECT id, ts, channel, group_id, speaker_id, speaker_name, kind,
-              content, evidence, confidence, salience, user_id
+              content, evidence, confidence, salience, user_id, counterpart
          FROM events
         WHERE id IN (${placeholders}) AND deleted = 0${userScopeSql('events', userId)}`,
     )
@@ -551,6 +575,8 @@ function search(db, options = {}) {
   }
 
   const userId = readUserId(options.userId);
+  // 对话对象：null = 不按对象过滤（面板这类没有具体对象的场景）
+  const counterpart = readCounterpart(options.counterpart);
   const rawQuery = typeof options.query === 'string' ? options.query : String(options.query == null ? '' : options.query);
   const nowMs = toMs(options.now) ?? Date.now();
   const normalizedQuery = normalize(rawQuery).text;
@@ -580,9 +606,9 @@ function search(db, options = {}) {
     }
   };
 
-  addRoute(ftsCandidates(db, normalizedQuery, userId), 'fts');
-  addRoute(entityCandidates(db, terms, userId), 'entity');
-  addRoute(windowCandidates(db, range, userId), 'window');
+  addRoute(ftsCandidates(db, normalizedQuery, userId, counterpart), 'fts');
+  addRoute(entityCandidates(db, terms, userId, counterpart), 'entity');
+  addRoute(windowCandidates(db, range, userId, counterpart), 'window');
 
   if (!pool.size) return emptyResult(rawQuery, budget, recallQuestion);
 

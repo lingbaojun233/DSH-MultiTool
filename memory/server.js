@@ -110,8 +110,10 @@ const ROUTES = {
     if (!body || typeof body !== 'object') throw new MemoryError('E_BAD_REQUEST');
     // user_id：整数 = 该用户私有；不传/null = 共享记忆。remember 的入参名是 userId
     const userId = readUserId(body);
-    const result = remember(db, { ...body, userId });
-    audit('remember', { ts: new Date().toISOString(), userId, stored: result.stored, reason: result.reason, eventId: result.eventId || null });
+    // counterpart：对话对象（如 QQ 联系人名）。不传/null = 通用记忆，任何对话都能召回。
+    const counterpart = body.counterpart == null ? null : String(body.counterpart);
+    const result = remember(db, { ...body, userId, counterpart });
+    audit('remember', { ts: new Date().toISOString(), userId, counterpart, stored: result.stored, reason: result.reason, eventId: result.eventId || null });
 
     // 无证据是硬错误（约束 1），必须给结构化错误，而不是 ok:true + stored:false
     if (!result.stored && result.reason === 'no_evidence') {
@@ -126,15 +128,19 @@ const ROUTES = {
   'POST /v1/tools/memory_search': async (body) => {
     // user_id：整数 = 只看"自己 + 共享"；不传/null = 不过滤（兼容旧行为）
     const userId = readUserId(body);
+    // counterpart：给了就只召回"这个对象的 + 通用的"，别的对话里的事不串台
+    const counterpart = body && body.counterpart != null ? String(body.counterpart) : null;
     const result = search(db, {
       query: String((body && body.query) || ''),
       context: (body && body.context) || {},
       budget: (body && body.budget) || {},
       userId,
+      counterpart,
     });
     audit('search', {
       ts: new Date().toISOString(),
       userId,
+      counterpart,
       query: String((body && body.query) || ''),
       ids: result.items.map((item) => item.id),
       used: result.used,
