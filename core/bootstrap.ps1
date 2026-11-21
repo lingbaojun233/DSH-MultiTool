@@ -33,8 +33,8 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$DshVersion = '0.1.1-rc.2',
-    [string]$NodeVersion = '22.23.5',
+    [string]$DshVersion = '0.2.2-rc.5',
+    [string]$NodeVersion = '24.22.3',
     [string[]]$NodeMirrors = @(
         'https://npmmirror.com/mirrors/node',
         'https://mirrors.huaweicloud.com/nodejs',

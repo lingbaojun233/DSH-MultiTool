@@ -28,6 +28,15 @@ try { Overlay = require('./lib/overlay.js'); } catch { Overlay = null; }
 try { GdiScene = require('./lib/gdi-scene.js'); } catch { GdiScene = null; }
 try { Pyplot = require('./lib/pyplot.js'); } catch { Pyplot = null; }
 
+// 所有"分步静帧 → 片段"的路径统一走 buildStepClip（带淡入淡出 + 轻微推近），
+// 不再用 html-scene 里那版硬切。这里覆盖一次，调用点就不用逐个改。
+if (HTMLScene && typeof HTMLScene.buildSlidesClip === 'function') {
+  HTMLScene.buildSlidesClip = (a) => buildStepClip({
+    work: a.work, index: a.index, pngs: a.pngs,
+    seconds: a.seconds, fps: a.fps, w: a.w, h: a.h,
+  });
+}
+
 const DIR = __dirname;
 const HOST = '127.0.0.1';
 
@@ -232,6 +241,7 @@ function buildVisualPrompt(scene, kind) {
     '- {"step":2,"type":"circle","cx":.,"cy":.,"r":12,"fill":"#ffb36b"}',
     '- {"step":3,"type":"formula","x":.,"y":.,"size":46,"color":"#ffd08a","runs":[{"t":"ds² = g"},{"t":"μν","sub":true}]}',
     '分 2~4 步：先框架、再对象、最后公式。文字 x 取 120~1800，y 取 140~960。',
+    '风格：配色只用蓝 #58C4DD / 黄 #F0AC5F / 灰 #8FA3C8，白字 #EAF2FF；线宽 3~5；公式字号 44~56；不要大段文字。',
   ]).join('\n');
 }
 
@@ -628,6 +638,36 @@ async function renderPlan(plan, opts = {}) {
   };
 }
 
+/**
+ * 把若干张静帧串成一个"分步讲解"片段。
+ *
+ * 3B1B 那类片子的观感来自两点：每一步之间是**渐变**而不是硬切，且画面**一直在缓慢运动**。
+ * 所以这里每张图先各自做一次轻微 zoompan（1.00→1.04），再用 xfade 连接。
+ * 代价是每步多一次编码（约 0.3s/步），换来的是不再像 PPT 翻页。
+ */
+async function buildStepClip({ work, index, pngs, seconds, fps = 30, w, h, fade = 0.35 }) {
+  if (!pngs.length) return { ok: false, error: 'NO_PNGS' };
+  const n = pngs.length;
+  if (n === 1) {
+    return R.sceneClip({ ffmpeg: CFG.ffmpeg, work, index, stillPng: pngs[0], seconds, w, h, fps });
+  }
+  // 每步至少 0.8 秒，否则过渡会盖住内容
+  const minStep = 0.8;
+  const per = Math.max(minStep, (seconds + fade * (n - 1)) / n);
+  const clips = [];
+  for (let k = 0; k < n; k++) {
+    const c = await R.sceneClip({
+      ffmpeg: CFG.ffmpeg, work, index: `${index}-s${k}`, stillPng: pngs[k],
+      seconds: Number(per.toFixed(3)), w, h, fps,
+    });
+    if (!c.ok) return { ok: false, error: `STEP_CLIP_FAILED#${k}: ${(c.error || '').slice(0, 200)}` };
+    clips.push(c.file);
+  }
+  const out = path.join(work, `steps-${index}.mp4`);
+  const cat = await R.concatClips({ ffmpeg: CFG.ffmpeg, clips, durations: clips.map(() => per), out, fade });
+  return cat.ok ? { ok: true, file: out } : { ok: false, error: `STEP_CONCAT_FAILED: ${(cat.error || '').slice(0, 200)}` };
+}
+
 // ------------------------------------------------------- 项目渲染（增量） --
 
 /**
@@ -748,9 +788,7 @@ async function renderProject(project, opts = {}, scope = 'auto') {
               w: CFG.width, h: CFG.height,
             });
             if (py && py.ok) {
-              const slides = HTMLScene
-                ? await HTMLScene.buildSlidesClip({ ffmpeg: CFG.ffmpeg, work, index: i, pngs: [py.png], seconds: s.seconds, fps: CFG.fps, w: CFG.width, h: CFG.height })
-                : null;
+              const slides = await buildStepClip({ work, index: i, pngs: [py.png], seconds: s.seconds, fps: CFG.fps, w: CFG.width, h: CFG.height });
               if (slides && slides.ok) clipFile = slides.file;
               else log(`scene#${i} 数学图合成失败: ${(slides && slides.error || 'no slides')}`);
             } else {
