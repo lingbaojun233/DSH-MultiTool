@@ -2383,6 +2383,7 @@ function studioPlanFromScenes() {
       tool: String(s.tool || ''),
       manim: useManim ? s.manim : null,
     };
+    if (useManim) out.manimHint = String(s.manimHint || '');
     // 没改过的场照旧带上 kind（studio 可直通，不重算引擎）；改过的场故意不带：
     // 否则 kind:'text' 会让 studio 的 scenesLookFinal 误判成"已经补全"，又跳过重新生成。
     if (!s.dirty) out.kind = useManim ? 'manim' : 'text';
@@ -2406,6 +2407,10 @@ function adoptStudioScenes(data) {
   studioTitle = String(data.title || fallbackTitle || studioTitle || '').slice(0, 60) || studioTitle;
   studioScenes = list.map((s) => {
     const hasManim = Boolean(s && s.manim && s.manim.code);
+    // 代码是按哪句「画什么」生成的（studio 存成场景级 manimHint；老数据在 manim.hint）
+    const manimHint = hasManim
+      ? String((s.manimHint != null ? s.manimHint : (s.manim.hint != null ? s.manim.hint : (s.visual_hint || ''))) || '')
+      : '';
     // aivideo 必须整块带回来：kind/tool 丢了，下一次 studioPlanFromScenes 就会把它当文字卡。
     const wantsAi = Boolean(s && (s.kind === 'aivideo' || s.tool === 'aivideo'));
     const videoPrompt = String((s && s.video && s.video.prompt) || '').trim();
@@ -2425,7 +2430,9 @@ function adoptStudioScenes(data) {
       tool,
       kind: hasManim ? 'manim' : (wantsAi ? 'aivideo' : 'text'),
       // 顺手带上代码对应的「画什么」戳：studio 靠它判断这段代码有没有过期。
-      manim: hasManim ? { code: s.manim.code, scene: s.manim.scene || null, hint: s.manim.hint == null ? null : String(s.manim.hint) } : null,
+      // 场景级字段（不进 manim 对象），不会改变 studio 的画面缓存键。
+      manim: hasManim ? { code: s.manim.code, scene: s.manim.scene || null } : null,
+      manimHint,
       video: hasVideo ? { prompt: videoPrompt, size: (s.video && s.video.size) || '1280*720' } : null,
       status: (s && s.status) || (hasManim ? 'manim' : (hasVideo ? 'aivideo' : 'pending')),
       note: String((s && s.note) || ''),

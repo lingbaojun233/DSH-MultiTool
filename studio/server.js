@@ -1393,7 +1393,10 @@ function hintNorm(value) {
 /**
  * 这一场的 manim 代码是不是为**当前**的「画什么」生成的？
  *
- * 代码生成时会把它依据的 visual_hint 盖在 manim.hint 上（见 fillScenes / saveLibrary）。
+ * 代码生成时会把它依据的 visual_hint 记在**场景级 manimHint** 上（见 fillScenes /
+ * stampManimHint）。戳放在场景级而不是 manim 对象里，是为了不污染画面缓存键：
+ * sceneKey 会把 manim 整个序列化，戳塞进去会让老项目第一次重跑就全部重渲。
+ *
  * 用户只改「画什么」时，面板会清掉代码；但历史配方、API 调用方、旧版本存档都可能
  * 带着"旧代码 + 新描述"过来 —— 这里必须再拦一道，否则改了描述却继续按上一次的画。
  *
@@ -1403,16 +1406,21 @@ function hintNorm(value) {
 function manimHintMatches(scene) {
   const manim = scene && scene.manim;
   if (!manim || typeof manim.code !== 'string' || !manim.code.trim()) return true;
-  if (manim.hint == null) return true;
-  return hintNorm(manim.hint) === hintNorm(scene && scene.visual_hint);
+  // scene.manimHint 是正式字段；manim.hint 只用于兼容短命的中间版本
+  const stamp = scene && scene.manimHint != null
+    ? scene.manimHint
+    : (manim.hint != null ? manim.hint : null);
+  if (stamp == null) return true;
+  return hintNorm(stamp) === hintNorm(scene && scene.visual_hint);
 }
 
-/** 给已有的 manim 代码补一个「按这句画什么生成」的戳（只补缺，不覆盖）。 */
+/** 给已有的 manim 代码补一个「按这句画什么生成」的场景级戳（只补缺，不覆盖）。 */
 function stampManimHint(scene) {
   if (!scene || !scene.manim || typeof scene.manim.code !== 'string' || !scene.manim.code.trim()) return scene;
-  if (scene.manim.hint != null) return scene;
+  if (scene.manimHint != null) return scene;
+  const fromOldBuild = scene.manim && scene.manim.hint != null ? String(scene.manim.hint) : null;
   return Object.assign({}, scene, {
-    manim: Object.assign({}, scene.manim, { hint: String(scene.visual_hint || '') }),
+    manimHint: fromOldBuild != null ? fromOldBuild : String(scene.visual_hint || ''),
   });
 }
 
@@ -1600,7 +1608,8 @@ async function fillScenes(inputScenes, opts = {}) {
       const given = src.manim && typeof src.manim.code === 'string' ? src.manim.code.trim() : '';
       if (given && manimHintMatches(src)) {
         base.kind = 'manim';
-        base.manim = { code: given.slice(0, 8000), scene: (src.manim && src.manim.scene) || null, hint: String(base.visual_hint || '') };
+        base.manim = { code: given.slice(0, 8000), scene: (src.manim && src.manim.scene) || null };
+        base.manimHint = String(base.visual_hint || '');
         base.status = 'manim';
         manimCount += 1;
         scenes[i] = base;
@@ -1759,7 +1768,8 @@ async function fillScenes(inputScenes, opts = {}) {
       continue;
     }
     base.kind = 'manim';
-    base.manim = { code: clean.slice(0, 8000), scene: (manimObj && manimObj.scene) || null, hint: String(base.visual_hint || '') };
+    base.manim = { code: clean.slice(0, 8000), scene: (manimObj && manimObj.scene) || null };
+    base.manimHint = String(base.visual_hint || '');
     base.status = 'manim';
     manimCount += 1;
     scenes[i] = base;

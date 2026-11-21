@@ -222,9 +222,12 @@ function normalizeScene(raw, opts = {}) {
     ? String(manimSrc.scene) : null;
   // hint 是"这段代码是按哪句『画什么』生成的"的戳。必须一起存下来：
   // 面板改了「画什么」而代码还是旧的时，server.js 靠它判断"代码过期了，要重生成"。
-  // 不存这个戳，改了描述却继续用旧动画（用户实测的 bug）就永远查不出来。
-  const manimHint = manimSrc && manimSrc.hint != null ? String(manimSrc.hint).slice(0, 600) : null;
-  const manim = manimCode ? { code: manimCode.slice(0, 8000), scene: manimScene, hint: manimHint } : null;
+  // 注意它存在**场景级 manimHint**，不放进 manim 对象里 —— sceneKey 会把 manim 整个
+  // 序列化进画面缓存键，戳塞进去会让升级前的老项目第一次重跑就全部重渲。
+  // 为了兼容"戳曾经放在 manim.hint 里的中间版本"，两边都读，统一搬到 manimHint。
+  const manimHintRaw = manimSrc && manimSrc.hint != null ? manimSrc.hint : raw.manimHint;
+  const manim = manimCode ? { code: manimCode.slice(0, 8000), scene: manimScene } : null;
+  const manimHint = manimCode && manimHintRaw != null ? String(manimHintRaw).slice(0, 600) : '';
   // 「画什么」是用户写给画面的原始描述，也是重新生成代码的唯一依据。
   // 以前归一化时没有这个字段：写进项目/配方的分镜里 visual_hint 直接消失，
   // 面板重做时「画什么」一栏空白，而且没有任何东西能判断旧代码该不该作废。
@@ -275,6 +278,8 @@ function normalizeScene(raw, opts = {}) {
     // 现有 manim 代码是不是为这句描述生成的（见 server.js 的 manimHintMatches）。
     visual_hint: visualHint,
     tool,
+    // 代码是按哪句「画什么」生成的（空串 = 没记录）。场景级字段，不进 sceneKey。
+    manimHint,
     bg: { c0: hex(bg.c0, '#101a33'), c1: hex(bg.c1, '#3a2a5a') },
     image: raw.image ? String(raw.image).slice(0, 240) : null,
     // 参考图解析后的绝对路径（data/studio/uploads 下）；渲染层用它注入 manim / 文字卡
