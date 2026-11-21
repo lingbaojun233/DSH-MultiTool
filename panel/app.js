@@ -1105,6 +1105,67 @@ async function analyzePickedVideo() {
   }
 }
 
+// ------------------------------------------------- 视频创作（studio）----
+
+const studioEls = {
+  prompt: document.getElementById('studioPrompt'),
+  seconds: document.getElementById('studioSeconds'),
+  voice: document.getElementById('studioVoice'),
+  go: document.getElementById('studioGo'),
+  hint: document.getElementById('studioHint'),
+  plan: document.getElementById('studioPlan'),
+  video: document.getElementById('studioVideo'),
+};
+
+function renderStudioPlan(plan) {
+  if (!studioEls.plan || !plan) return;
+  const lines = [];
+  if (plan.title) lines.push(`《${plan.title}》 ${plan.totalSeconds || '?'} 秒`);
+  for (const s of (plan.scenes || [])) {
+    lines.push(`  ${s.seconds}s  ${s.text}${s.narration ? '  旁白：' + s.narration : ''}`);
+  }
+  studioEls.plan.textContent = lines.join('\n');
+}
+
+async function studioCreate() {
+  if (!studioEls.go) return;
+  const prompt = studioEls.prompt.value.trim();
+  if (!prompt) {
+    studioEls.hint.textContent = '先写一句想要什么';
+    return;
+  }
+  studioEls.go.disabled = true;
+  studioEls.video.classList.add('hidden');
+  studioEls.plan.textContent = '';
+  studioEls.hint.textContent = '它正在写分镜…（写完会用 ffmpeg 渲染，约 15~40 秒）';
+  try {
+    const r = await apiJson('/api/studio/create', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        prompt,
+        seconds: Number(studioEls.seconds.value) || 12,
+        voice: studioEls.voice.value,
+      }),
+    });
+    if (!r || !r.ok) {
+      studioEls.hint.textContent = '没做成：' + ((r && r.error) || '未知原因') +
+        (r && r.raw ? '\n模型返回：' + String(r.raw).slice(0, 300) : '');
+      return;
+    }
+    renderStudioPlan(r.plan);
+    studioEls.video.src = `/api/studio/video?id=${encodeURIComponent(r.jobId)}`;
+    studioEls.video.classList.remove('hidden');
+    studioEls.hint.textContent = `做好了：${r.seconds} 秒 / ${(r.bytes / 1048576).toFixed(1)} MB / 旁白 ${r.narrationCount} 条 / 渲染 ${(r.ms / 1000).toFixed(1)} 秒`;
+  } catch (err) {
+    studioEls.hint.textContent = '出错：' + (err && err.message || err);
+  } finally {
+    studioEls.go.disabled = false;
+  }
+}
+
+if (studioEls.go) studioEls.go.addEventListener('click', studioCreate);
+
 function setProgress(frac) {
   if (!videoEls.progress || !videoEls.bar) return;
   videoEls.progress.classList.remove('hidden');

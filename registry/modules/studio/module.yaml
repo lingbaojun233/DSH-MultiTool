@@ -1,0 +1,11 @@
+name: studio
+title: 视频创作
+when: 用户要求"做一个视频/短片"，需要把一句话变成一个 mp4 时
+not_when: 只是要分析已有视频（那是 video 模块），或需要真实素材拍摄时
+entry:
+  type: cmd
+  name: studio/start-server.cmd
+cost: 高
+readme: README.md
+version: 0.1.0
+scope: server

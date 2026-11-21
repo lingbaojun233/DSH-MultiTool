@@ -31,6 +31,7 @@ const SEPARATOR_BASE = process.env.DSH_SEPARATOR_URL || 'http://127.0.0.1:8768';
 const VIDEO_BASE = process.env.DSH_VIDEO_URL || 'http://127.0.0.1:8769';
 const SPEAK_BASE = process.env.DSH_SPEAK_URL || 'http://127.0.0.1:8770';
 const LISTEN_BASE = process.env.DSH_LISTEN_URL || 'http://127.0.0.1:8771';
+const STUDIO_BASE = process.env.DSH_STUDIO_URL || 'http://127.0.0.1:8772';
 
 // 浏览器上传的视频落在这里，处理完就删。放在 data\ 下（模块目录以外），
 // 这样一次 push 替换 panel\ 不会把正在传的文件搞坏。
@@ -43,6 +44,8 @@ const MAX_BODY = 1024 * 1024;
 
 // 默认写在模块目录之外，push 整目录替换也不会丢掉；DSH_PANEL_DATA 只给自测用
 const DATA_DIR = process.env.DSH_PANEL_DATA || path.join(ROOT, '..', 'data');
+// 必须放在 DATA_DIR 之后：const 有 TDZ，写前面会在模块加载时直接抛 ReferenceError
+const STUDIO_DIR = process.env.DSH_STUDIO_DIR || path.join(DATA_DIR, 'studio');
 const HISTORY_MAX_LINES = 1000;
 const HISTORY_TRIM_TO = 800;
 
@@ -240,7 +243,7 @@ function protectedPath(pathname) {
   return pathname === '/api/input' || pathname === '/api/persona' ||
     pathname.startsWith('/api/memory/') || pathname.startsWith('/api/video') ||
     pathname === '/api/tts' || pathname === '/api/asr' ||
-    pathname === '/api/history';
+    pathname === '/api/history' || pathname === '/api/studio/create';
 }
 
 /** 服务间直连 POST（视频模块 / io）：不走 req 透传，因为要拿回结果再二次加工。 */
@@ -591,6 +594,42 @@ const server = http.createServer(async (req, res) => {
       const r = await postJson(LISTEN_BASE, '/v1/transcribe', payload, {}, 120000);
       if (!r.data) return sendJson(res, 502, { ok: false, error: `listen module HTTP ${r.status}` });
       return sendJson(res, r.status || 200, r.data);
+    }
+
+    // 视频创作：DSH 只写分镜，ffmpeg 渲染（模型不生成像素）
+    if (req.method === 'POST' && url.pathname === '/api/studio/create') {
+      const rawStudio = await readBody(req, 1024 * 1024);
+      let body = {};
+      try { body = JSON.parse(rawStudio.toString('utf8')) || {}; } catch { }
+      const prompt = String(body.prompt || '').trim();
+      if (!prompt) return sendJson(res, 400, { ok: false, error: '先写一句想要什么' });
+      const r = await postJson(STUDIO_BASE, '/v1/create', {
+        prompt,
+        seconds: Number(body.seconds) || 12,
+        voice: body.voice || '',
+        bgm: body.bgm || '',
+      }, { authorization: req.headers.authorization || '' }, 1200000);
+      if (!r.data) return sendJson(res, 502, { ok: false, error: `studio HTTP ${r.status}` });
+      log(`studio create ok=${r.data.ok} job=${r.data.jobId || '-'} ms=${r.data.ms || 0}`);
+      return sendJson(res, r.status || 200, r.data);
+    }
+
+    // 成片取回。用不可猜的 UUID 当凭据，所以不额外要求 Bearer（<video> 带不了头）。
+    if (req.method === 'GET' && url.pathname === '/api/studio/video') {
+      const id = String(url.searchParams.get('id') || '');
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+        return sendJson(res, 400, { ok: false, error: 'BAD_ID' });
+      }
+      const file = path.join(STUDIO_DIR, `${id}.mp4`);
+      if (!fs.existsSync(file)) return sendJson(res, 404, { ok: false, error: 'NOT_FOUND' });
+      const stat = fs.statSync(file);
+      res.writeHead(200, {
+        'content-type': 'video/mp4',
+        'content-length': stat.size,
+        'accept-ranges': 'none',
+        'cache-control': 'no-store',
+      });
+      return fs.createReadStream(file).pipe(res);
     }
 
     if (req.method === 'GET' || req.method === 'HEAD') {

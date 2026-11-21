@@ -120,6 +120,38 @@
           <div id="videoFramesStrip" class="frames"></div>
         </section>
 
+        <section class="card" id="studioCard">
+          <h2>让它做一段视频</h2>
+          <label class="field">
+            <span>想要什么样的</span>
+            <input id="studioPrompt" placeholder="比如：做一段 12 秒的短片，讲讲下雨天不想出门" />
+          </label>
+          <div class="row">
+            <label class="field small">
+              <span>秒数</span>
+              <select id="studioSeconds">
+                <option value="8">8</option>
+                <option value="12" selected>12</option>
+                <option value="20">20</option>
+                <option value="30">30</option>
+              </select>
+            </label>
+            <label class="field small">
+              <span>音色</span>
+              <select id="studioVoice">
+                <option value="yaoyao" selected>yaoyao</option>
+                <option value="huayan">huayan</option>
+                <option value="huihui">huihui</option>
+                <option value="kangkang">kangkang</option>
+              </select>
+            </label>
+            <button id="studioGo" class="primary" type="button">开始创作</button>
+          </div>
+          <p class="muted" id="studioHint">先由它写分镜，再交给 ffmpeg 渲染 —— 模型不画像素，改一句分镜就能精确重渲。</p>
+          <div id="studioPlan" class="plan"></div>
+          <video id="studioVideo" class="studio-video hidden" controls preload="metadata"></video>
+        </section>
+
         <section class="card hidden" id="videoResultCard">
           <h2>大肥鱼说</h2>
           <div id="videoReply" class="reply"></div>

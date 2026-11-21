@@ -1,0 +1,18 @@
+{
+  "port": 8772,
+  "width": 1920,
+  "height": 1080,
+  "fps": 30,
+  "fade": 0.4,
+  "maxScenes": 8,
+  "minSceneSeconds": 2,
+  "maxTotalSeconds": 60,
+  "ffmpeg": "C:\\Apps\\DSH-MultiTool\\tools\\ffmpeg\\bin\\ffmpeg.exe",
+  "font": "C:\\Windows\\Fonts\\msyh.ttc",
+  "ioUrl": "http://127.0.0.1:8765",
+  "speakUrl": "http://127.0.0.1:8770",
+  "outDir": "C:\\Apps\\DSH-MultiTool\\data\\studio",
+  "bgmDir": "C:\\Apps\\DSH-MultiTool\\data\\studio\\bgm",
+  "planTimeoutMs": 180000,
+  "renderTimeoutMs": 600000
+}
