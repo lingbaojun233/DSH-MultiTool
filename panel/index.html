@@ -80,6 +80,12 @@
             <input id="videoFile" type="file" accept="video/*" hidden />
           </div>
 
+          <label class="checkline">
+            <input type="checkbox" id="videoAudio" checked />
+            <span>连声音一起听（上传原片：能听出响动、配乐、静音）</span>
+          </label>
+          <div class="progress hidden" id="videoProgress"><div class="bar" id="videoBar"></div></div>
+
           <label class="field">
             <span>想让我注意什么（可不填）</span>
             <input id="videoText" placeholder="比如：他为什么输了 / 这段值不值得看" />

@@ -21,6 +21,7 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 const HOST = process.env.DSH_PANEL_HOST || '127.0.0.1';
 const PORT = Number(process.env.DSH_PANEL_PORT || 8766);
@@ -30,6 +31,13 @@ const SEPARATOR_BASE = process.env.DSH_SEPARATOR_URL || 'http://127.0.0.1:8768';
 const VIDEO_BASE = process.env.DSH_VIDEO_URL || 'http://127.0.0.1:8769';
 const SPEAK_BASE = process.env.DSH_SPEAK_URL || 'http://127.0.0.1:8770';
 const LISTEN_BASE = process.env.DSH_LISTEN_URL || 'http://127.0.0.1:8771';
+
+// 浏览器上传的视频落在这里，处理完就删。放在 data\ 下（模块目录以外），
+// 这样一次 push 替换 panel\ 不会把正在传的文件搞坏。
+const UPLOAD_DIR = process.env.DSH_UPLOAD_DIR || path.join(__dirname, '..', 'data', 'uploads');
+const UPLOAD_TTL_MS = 30 * 60 * 1000;
+const UPLOAD_MAX_BYTES = Number(process.env.DSH_UPLOAD_MAX_BYTES || 2 * 1024 * 1024 * 1024);
+const uploads = new Map(); // id -> { file, name, bytes, at }
 const ROOT = __dirname;
 const MAX_BODY = 1024 * 1024;
 
@@ -230,8 +238,15 @@ function buildVideoTask(analysis, userText) {
   if (audio && audio.ok) {
     lines.push('');
     lines.push('【声音（听出来的）】');
-    if (audio.transcript) lines.push('听到的话：' + audio.transcript);
-    else lines.push('没听出成句的人话');
+    if (audio.transcript) {
+      // SAPI 背景嘈杂时会把噪声听成句子，置信度低于 0.5 就别当成原话
+      const shaky = typeof audio.confidence === 'number' && audio.confidence < 0.5;
+      lines.push(shaky
+        ? '听到的话（背景太吵，识别可能不准，别当原话引用）：' + audio.transcript
+        : '听到的话：' + audio.transcript);
+    } else {
+      lines.push('没听出成句的人话');
+    }
     if (audio.summary) lines.push('声音概况：' + audio.summary);
     if (Array.isArray(audio.events) && audio.events.length) {
       lines.push('声音事件：');
@@ -283,6 +298,81 @@ function proxy(req, res, ioPath, body, onDone, base, label) {
 
   if (body && body.length) upstream.write(body);
   upstream.end();
+}
+
+/** 视频分析结果 → 交给 io（大肥鱼用自己的口气说）→ 写历史 → 返回浏览器 */
+async function completeVideo(req, res, v, label) {
+  if (!v.data || !v.data.ok) {
+    return sendJson(res, 200, {
+      ok: false, step: 'video',
+      error: (v.data && v.data.error) || `video module HTTP ${v.status}`,
+    });
+  }
+  const io = await postJson(IO_BASE, '/v1/input',
+    { text: buildVideoTask(v.data, label), sessionId: 'panel-video' },
+    { authorization: req.headers.authorization || '' }, 600000);
+  const reply = (io.data && io.data.answer) || '';
+  appendHistory({ role: 'user', text: label ? `[视频] ${label}` : '[视频]', ts: Date.now() });
+  if (reply) appendHistory({ role: 'assistant', text: reply, ts: Date.now(), usage: (io.data && io.data.usage) || null });
+  return sendJson(res, 200, {
+    ok: true,
+    analysis: v.data,
+    reply,
+    ioOk: Boolean(io.data && io.data.ok),
+    tokens: (io.data && io.data.tokens) || null,
+  });
+}
+
+function sweepUploads() {
+  const now = Date.now();
+  for (const [id, u] of uploads) {
+    if (now - u.at > UPLOAD_TTL_MS) {
+      try { fs.unlinkSync(u.file); } catch { }
+      uploads.delete(id);
+    }
+  }
+}
+
+/**
+ * 浏览器把原片直接 PUT 上来，边收边写盘：不经过 base64（省 33% 体积），
+ * 也不在内存里攒（2GB 的片子也不会把面板撑爆）。
+ */
+function saveUpload(req, res, name, declaredSize) {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  sweepUploads();
+  const id = crypto.randomUUID();
+  const safe = path.basename(String(name || 'upload.bin')).slice(0, 120) || 'upload.bin';
+  const file = path.join(UPLOAD_DIR, id + path.extname(safe));
+  const ws = fs.createWriteStream(file);
+  let bytes = 0;
+  let aborted = false;
+
+  const fail = (code, msg) => {
+    if (aborted) return;
+    aborted = true;
+    try { ws.destroy(); } catch { }
+    try { fs.unlinkSync(file); } catch { }
+    if (!res.headersSent) sendJson(res, code, { ok: false, error: msg });
+  };
+
+  req.on('data', (chunk) => {
+    bytes += chunk.length;
+    if (bytes > UPLOAD_MAX_BYTES) {
+      fail(413, 'TOO_LARGE');
+      try { req.destroy(); } catch { }
+    }
+  });
+  req.on('aborted', () => fail(499, 'CLIENT_ABORTED'));
+  req.on('error', () => fail(500, 'UPLOAD_ERROR'));
+  ws.on('error', () => fail(500, 'DISK_ERROR'));
+  ws.on('finish', () => {
+    if (aborted) return;
+    if (bytes === 0) { fail(400, 'EMPTY_BODY'); return; }
+    uploads.set(id, { file, name: safe, bytes, at: Date.now() });
+    log(`upload ok id=${id} name=${safe} bytes=${bytes}`);
+    sendJson(res, 200, { ok: true, uploadId: id, name: safe, bytes });
+  });
+  req.pipe(ws);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -376,29 +466,33 @@ const server = http.createServer(async (req, res) => {
         isUrl ? { url: body.url, text: body.text, frames: body.frames }
           : { frames: body.frames, text: body.text }, {}, 900000);
 
-      if (!v.data || !v.data.ok) {
-        return sendJson(res, 200, {
-          ok: false, step: 'video',
-          error: (v.data && v.data.error) || `video module HTTP ${v.status}`,
-        });
+      return completeVideo(req, res, v, String(body.text || '').trim());
+    }
+
+    // 原片上传：XHR 直接 PUT 字节流，边收边写盘
+    if (req.method === 'PUT' && url.pathname === '/api/video/upload') {
+      return saveUpload(req, res, url.searchParams.get('name'), url.searchParams.get('size'));
+    }
+
+    // 上传完成后分析：服务器自己抽帧 + 听音轨（浏览器那条路只有帧，听不到声音）
+    if (req.method === 'POST' && url.pathname === '/api/video/analyze-file') {
+      const rawUp = await readBody(req, 1024 * 1024);
+      let body = {};
+      try { body = JSON.parse(rawUp.toString('utf8')) || {}; } catch { }
+      const id = String(body.uploadId || '');
+      const up = uploads.get(id);
+      if (!up) return sendJson(res, 404, { ok: false, error: 'UPLOAD_NOT_FOUND（可能已过期或服务重启过）' });
+
+      let v;
+      try {
+        v = await postJson(VIDEO_BASE, '/v1/analyze-file',
+          { filePath: up.file, text: body.text, frames: body.frames }, {}, 900000);
+      } finally {
+        // 不论成败都删掉原片，别把服务器磁盘塞满
+        try { fs.unlinkSync(up.file); } catch { }
+        uploads.delete(id);
       }
-
-      const label = String(body.text || '').trim();
-      const io = await postJson(IO_BASE, '/v1/input',
-        { text: buildVideoTask(v.data, label), sessionId: 'panel-video' },
-        { authorization: req.headers.authorization || '' }, 600000);
-      const reply = (io.data && io.data.answer) || '';
-
-      appendHistory({ role: 'user', text: label ? `[视频] ${label}` : '[视频]', ts: Date.now() });
-      if (reply) appendHistory({ role: 'assistant', text: reply, ts: Date.now(), usage: (io.data && io.data.usage) || null });
-
-      return sendJson(res, 200, {
-        ok: true,
-        analysis: v.data,
-        reply,
-        ioOk: Boolean(io.data && io.data.ok),
-        tokens: (io.data && io.data.tokens) || null,
-      });
+      return completeVideo(req, res, v, String(body.text || '').trim());
     }
 
     // 发声：把 wav 原样吐给浏览器，<audio> 直接用

@@ -293,6 +293,23 @@ async function hearAudio(file) {
   }
 }
 
+/** 服务器本地文件：抽帧 + 听音轨 + 视觉分析。链接下载和浏览器上传都走这里。 */
+async function analyzeLocalFile(file, userText, frameCount) {
+  if (!fs.existsSync(file)) return { ok: false, error: 'FILE_NOT_FOUND' };
+  const t0 = Date.now();
+  const grab = await extractFrames(file, frameCount || 8);
+  if (!grab.ok) return { ok: false, error: grab.error };
+
+  // 删文件之前先听一遍（调用方负责删）
+  const audio = await hearAudio(file);
+
+  const result = await analyzeFrames(grab.frames, userText || '');
+  result.duration = grab.duration;
+  result.audio = audio;
+  result.ms = Date.now() - t0;
+  return result;
+}
+
 // ------------------------------------------------------------------ routes --
 
 const server = http.createServer(async (req, res) => {
@@ -332,17 +349,20 @@ const server = http.createServer(async (req, res) => {
         log(`analyze-url download failed: ${dl.error}`);
         return json(res, 200, { ok: false, error: dl.error });
       }
-      const grab = await extractFrames(dl.file, body.frames || 8);
-      // 删除临时文件之前先让听力模块听一遍音轨（说话、响动、静音都算"听到"）
-      const audio = await hearAudio(dl.file);
+      const result = await analyzeLocalFile(dl.file, body.text || '', body.frames || 8);
       try { fs.rmSync(dl.dir, { recursive: true, force: true }); } catch { }
-      if (!grab.ok) return json(res, 200, { ok: false, error: grab.error });
-
-      const result = await analyzeFrames(grab.frames, body.text || '');
-      result.duration = grab.duration;
-      result.audio = audio;
       result.ms = Date.now() - t0;
-      log(`analyze-url ok=${result.ok} frames=${grab.frames.length} ms=${result.ms}`);
+      log(`analyze-url ok=${result.ok} ms=${result.ms}`);
+      return json(res, 200, result);
+    }
+
+    // 浏览器已把原片传上来（面板负责落盘和删除），这里只处理
+    if (req.method === 'POST' && p === '/v1/analyze-file') {
+      const body = JSON.parse(await readBody(req) || '{}');
+      const file = String(body.filePath || '');
+      if (!file) return json(res, 400, { ok: false, error: 'FILE_REQUIRED' });
+      const result = await analyzeLocalFile(file, body.text || '', body.frames || 8);
+      log(`analyze-file ok=${result.ok} file=${path.basename(file)} ms=${result.ms || 0}`);
       return json(res, 200, result);
     }
 

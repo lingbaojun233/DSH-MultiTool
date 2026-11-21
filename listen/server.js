@@ -590,6 +590,7 @@ const server = http.createServer(async (req, res) => {
           truncated,
           transcript: (asr.text || '').trim(),
           speechOk: Boolean(asr.ok),
+          confidence: typeof asr.confidence === 'number' ? asr.confidence : null,
           segments: prof.segments.length,
           events: desc.events,
           summary: desc.summary,

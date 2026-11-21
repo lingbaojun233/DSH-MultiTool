@@ -726,9 +726,36 @@ const videoEls = {
   synopsis: document.getElementById('videoSynopsis'),
   timeline: document.getElementById('videoTimeline'),
   onScreen: document.getElementById('videoOnScreen'),
+  audio: document.getElementById('videoAudio'),
+  progress: document.getElementById('videoProgress'),
+  bar: document.getElementById('videoBar'),
 };
 
 let pickedVideo = null;
+
+/** 原片直传：XHR 边发边报进度，不经过 base64。 */
+function uploadVideoFile(file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const qs = `name=${encodeURIComponent(file.name || 'video.bin')}&size=${file.size}`;
+    xhr.open('PUT', `/api/video/upload?${qs}`);
+    const h = authHeaders({});
+    Object.keys(h).forEach((k) => xhr.setRequestHeader(k, h[k]));
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total);
+    };
+    xhr.onload = () => {
+      let data = null;
+      try { data = JSON.parse(xhr.responseText); } catch { }
+      if (!data) return reject(new Error('服务器返回不是 JSON'));
+      if (!data.ok) return reject(new Error(data.error || `HTTP ${xhr.status}`));
+      resolve(data);
+    };
+    xhr.onerror = () => reject(new Error('上传失败（网络中断或面板不可达）'));
+    xhr.ontimeout = () => reject(new Error('上传超时'));
+    xhr.send(file);
+  });
+}
 
 function fmtClock(sec) {
   const s = Math.max(0, Math.round(sec));
@@ -845,24 +872,57 @@ function acceptPickedFile(file) {
 async function analyzePickedVideo() {
   if (!pickedVideo) return;
   const count = Number(videoEls.frames.value) || 8;
+  const wantAudio = videoEls.audio ? videoEls.audio.checked : true;
   videoEls.go.disabled = true;
-  videoEls.hint.textContent = `正在本机抽 ${count} 帧…`;
   try {
-    const frames = await sampleVideoFrames(pickedVideo, count);
-    renderFrameStrip(frames);
-    videoEls.hint.textContent = `抽到 ${frames.length} 帧，正在看（几十秒）…`;
-    const r = await apiJson('/api/video/analyze', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ frames, text: videoEls.text.value.trim() }),
-    });
+    let r;
+    if (wantAudio) {
+      // 传原片：服务器才能抽音轨（浏览器那条路只有帧，听不到声音）
+      videoEls.hint.textContent = '正在上传原片…0%';
+      setProgress(0);
+      const up = await uploadVideoFile(pickedVideo, (frac) => {
+        const pct = Math.round(frac * 100);
+        videoEls.hint.textContent = `正在上传原片…${pct}%（${(pickedVideo.size / 1048576).toFixed(0)} MB）`;
+        setProgress(frac);
+      });
+      videoEls.hint.textContent = '上传完了，服务器在抽帧、听音轨（几十秒）…';
+      setProgress(0.99);
+      r = await apiJson('/api/video/analyze-file', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ uploadId: up.uploadId, text: videoEls.text.value.trim(), frames: count }),
+      });
+    } else {
+      videoEls.hint.textContent = `正在本机抽 ${count} 帧…`;
+      const frames = await sampleVideoFrames(pickedVideo, count);
+      renderFrameStrip(frames);
+      videoEls.hint.textContent = `抽到 ${frames.length} 帧，正在看（几十秒）…`;
+      r = await apiJson('/api/video/analyze', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ frames, text: videoEls.text.value.trim() }),
+      });
+    }
     renderVideoResult(r);
     videoEls.hint.textContent = r && r.ok ? '看完了' : '没看成';
   } catch (err) {
     videoEls.hint.textContent = '出错：' + (err && err.message || err);
   } finally {
+    hideProgress();
     videoEls.go.disabled = false;
   }
+}
+
+function setProgress(frac) {
+  if (!videoEls.progress || !videoEls.bar) return;
+  videoEls.progress.classList.remove('hidden');
+  videoEls.bar.style.width = Math.max(0, Math.min(1, frac)) * 100 + '%';
+}
+
+function hideProgress() {
+  if (!videoEls.progress || !videoEls.bar) return;
+  videoEls.progress.classList.add('hidden');
+  videoEls.bar.style.width = '0%';
 }
 
 async function analyzeUrlVideo() {
