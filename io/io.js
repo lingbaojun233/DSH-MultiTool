@@ -256,7 +256,7 @@ function attachmentBlock(attachments) {
     const p = String(a.path || '').slice(0, 240);
     let hint = '';
     if (kind === 'video') hint = '→ 想知道内容就调用 watch（filePath 传这个路径）';
-    else if (kind === 'audio') hint = '→ 想听内容就调用 hear；只要文字用 transcribe';
+    else if (kind === 'audio') hint = '→ 想听内容就调用 hear；只要文字就 hear {words_only:true}';
     else if (kind === 'image') hint = a.description ? '→ 已经有人看过这张图，描述见下' : '→ 你看不到像素，只能凭文件名/描述说';
     else if (kind === 'text') hint = '→ 可以直接读这个文本文件';
     else hint = '→ 这种格式你看不了内容，只能凭文件名说，必要时让用户转成可读格式';

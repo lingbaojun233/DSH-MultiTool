@@ -123,6 +123,8 @@ const server = http.createServer(async (req, res) => {
       counterpart: payload.counterpart || undefined,
       stickers: Array.isArray(payload.stickers) ? payload.stickers.slice(0, 80) : undefined,
       attachments: Array.isArray(payload.attachments) ? payload.attachments.slice(0, 10) : undefined,
+      // 程序化任务（写分镜/排版）不需要人格口吻，否则它会开始聊天
+      persona: payload.persona === false ? false : undefined,
       session,
     });
 

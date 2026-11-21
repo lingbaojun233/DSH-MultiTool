@@ -62,13 +62,20 @@ function newId() {
  */
 function sceneKey(scene, cfg) {
   const payload = {
+    kind: String(scene.kind || 'text'),
     text: String(scene.text || ''),
+    html: String(scene.html || ''),
+    python: String(scene.python || ''),
+    draw: scene.draw || null,
+    steps: Array.isArray(scene.steps) ? scene.steps : null,
     seconds: Number(scene.seconds) || 0,
     textSize: scene.textSize || null,
     textColor: scene.textColor || null,
     bg: scene.bg || null,
     image: scene.image || null,
     motion: scene.motion || null,
+    // 表情叠加也影响画面，必须进缓存键 —— 否则改了表情却复用旧片段
+    stickers: Array.isArray(scene.stickers) ? scene.stickers : null,
     w: cfg.width, h: cfg.height, fps: cfg.fps,
   };
   return sha1(JSON.stringify(payload));
@@ -169,7 +176,22 @@ function normalizeScene(raw) {
   const hex = (v, fallback) => (/^#[0-9a-f]{6}$/i.test(String(v || '')) ? String(v) : fallback);
   const bg = raw.bg || {};
   const seconds = Math.min(12, Math.max(1, Number(raw.seconds) || 3));
+  const kind = ['text', 'rich', 'plot'].includes(raw.kind) ? raw.kind : 'text';
+  // 表情叠加：坐标用 0~1 相对值，渲染器自己换算成像素
+  const stickers = (Array.isArray(raw.stickers) ? raw.stickers : [])
+    .filter((s) => s && /^[0-9a-f]{6,40}$/i.test(String(s.id || '')))
+    .slice(0, 4)
+    .map((s) => ({
+      id: String(s.id),
+      at: Math.max(0, Number(s.at) || 0),
+      duration: Math.min(10, Math.max(0.4, Number(s.duration) || 1.6)),
+      x: Math.min(1, Math.max(0, s.x == null ? 0.82 : Number(s.x))),
+      y: Math.min(1, Math.max(0, s.y == null ? 0.22 : Number(s.y))),
+      scale: Math.min(0.6, Math.max(0.08, s.scale == null ? 0.22 : Number(s.scale))),
+      fade: Math.min(1, Math.max(0, s.fade == null ? 0.25 : Number(s.fade))),
+    }));
   return {
+    kind,
     text: String(raw.text || '').slice(0, 60),
     narration: String(raw.narration || '').slice(0, 200),
     seconds: Number(seconds.toFixed(2)),
@@ -178,6 +200,27 @@ function normalizeScene(raw) {
     motion: raw.motion || null,
     textSize: Number(raw.textSize) || null,
     textColor: raw.textColor || null,
+    // rich 场景用绘图指令（GDI+），html 是早期留给无头浏览器的路，保留但不再主推
+    python: raw.python ? String(raw.python).slice(0, 4000) : null,
+    draw: raw.draw && Array.isArray(raw.draw.shapes) ? {
+      title: String(raw.draw.title || raw.text || '').slice(0, 60),
+      bg1: raw.draw.bg1 || '#101a33',
+      bg2: raw.draw.bg2 || '#0b1220',
+      shapes: raw.draw.shapes.slice(0, 120).map((s) => {
+        const out = { type: String(s.type || 'text'), step: Math.min(9, Math.max(1, Number(s.step) || 1)) };
+        for (const k of ['x', 'y', 'x1', 'y1', 'x2', 'y2', 'cx', 'cy', 'r', 'w', 'h', 'size', 'width', 'text', 'color', 'fill', 'stroke', 'align', 'dash', 'arrow', 'bold']) {
+          if (s[k] != null) out[k] = s[k];
+        }
+        if (Array.isArray(s.runs)) out.runs = s.runs.slice(0, 20).map((r) => ({ t: String(r.t || '').slice(0, 20), sup: Boolean(r.sup), sub: Boolean(r.sub) }));
+        if (Array.isArray(s.points)) out.points = s.points.slice(0, 30);
+        return out;
+      }),
+    } : null,
+    html: raw.html ? String(raw.html).slice(0, 20000) : null,
+    steps: Array.isArray(raw.steps) ? raw.steps.map((s) => String(s).slice(0, 20)).slice(0, 6) : null,
+    stickers,
+    narrationMs: Number(raw.narrationMs) || 0,
+    actualSeconds: Number(raw.actualSeconds) || Number(seconds.toFixed(2)),
   };
 }
 

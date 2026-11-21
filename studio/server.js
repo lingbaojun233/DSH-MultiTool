@@ -17,6 +17,17 @@ const crypto = require('node:crypto');
 const R = require('./lib/render.js');
 const P = require('./lib/project.js');
 
+// 讲解画面（HTML/SVG → 无头浏览器截图）与表情叠加是后加的能力。
+// 用可选 require：模块还没落地时整套渲染照旧工作，不会因为缺文件起不来。
+let HTMLScene = null;
+let Overlay = null;
+let GdiScene = null;
+let Pyplot = null;
+try { HTMLScene = require('./lib/html-scene.js'); } catch { HTMLScene = null; }
+try { Overlay = require('./lib/overlay.js'); } catch { Overlay = null; }
+try { GdiScene = require('./lib/gdi-scene.js'); } catch { GdiScene = null; }
+try { Pyplot = require('./lib/pyplot.js'); } catch { Pyplot = null; }
+
 const DIR = __dirname;
 const HOST = '127.0.0.1';
 
@@ -43,6 +54,12 @@ const CFG = Object.assign({
   bgmDir: 'C:\\Apps\\DSH-MultiTool\\data\\studio\\bgm',
   // 项目（含分段缓存）放在 outDir 下的 projects\，和成片并列
   projectDir: 'C:\\Apps\\DSH-MultiTool\\data\\studio\\projects',
+  // 讲解画面用无头浏览器截图；没有它就只能退回文字卡
+  edgePath: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+  // 表情包（叠加时用）
+  stickerDir: 'C:\\Apps\\DSH-MultiTool\\data\\stickers\\send',
+  stickerUrl: 'http://127.0.0.1:8773',
+  python: 'C:\\Apps\\DSH-MultiTool\\tools\\python311\\python.exe',
   planTimeoutMs: 180000,
   renderTimeoutMs: 600000,
 }, readJson(path.join(DIR, 'config.json'), {}));
@@ -115,26 +132,194 @@ async function postJson(url, obj, headers = {}, timeoutMs = 60000) {
 
 // ------------------------------------------------------------------ 分镜 ----
 
-/** 让 DSH 写分镜。只给"怎么写分镜"的约束，不给它画图的机会。 */
+/**
+ * 取几个表情给模型挑。优先收藏的（那是它自己"满意的"），不够再补普通的。
+ * 只给 10 个：给太多它会挑花眼，而且提示词会变长。
+ */
+async function stickerHints(limit = 10) {
+  const grab = async (query) => {
+    try {
+      const res = await fetch(`${CFG.stickerUrl}/v1/list?${query}`, { signal: AbortSignal.timeout(5000) });
+      const data = await res.json().catch(() => null);
+      return data && data.ok && Array.isArray(data.items) ? data.items : [];
+    } catch { return []; }
+  };
+  const fav = await grab(`favorite=1&limit=${limit}`);
+  const all = fav.length >= 4 ? [] : await grab(`limit=${limit}`);
+  const seen = new Set();
+  const out = [];
+  for (const it of [...fav, ...all]) {
+    if (out.length >= limit) break;
+    if (!it || !it.id || seen.has(it.id)) continue;
+    seen.add(it.id);
+    out.push({ id: String(it.id), name: String(it.mood || it.name || it.id).slice(0, 16) });
+  }
+  return out;
+}
+
+/** 把表情提示并进写分镜的参数（body 里显式给了就不覆盖）。 */
+function withPlanHints(body, hints) {
+  const opts = Object.assign({}, body || {});
+  if (!Array.isArray(opts.stickerIds) && hints && hints.length) opts.stickerIds = hints;
+  return opts;
+}
+
+/**
+ * 让 DSH 写分镜。
+ *
+ * 两种场景：
+ *   text —— 渐变背景 + 一行大字（适合情绪、停顿、转场）
+ *   rich —— 一段 HTML 讲解画面（坐标轴、公式、图表、步骤），由无头浏览器截成图
+ *
+ * 为什么不直接让模型"画图"：它画不出像素，但**写 SVG/HTML 很在行**。
+ * 把"讲清楚"这件事交给它的排版能力，把"出像素"交给浏览器，分工才合理。
+ */
+/**
+ * 两段式规划：先只要分镜骨架（短、几乎不会跑偏），再逐场把"这一场讲什么"
+ * 翻成绘图指令。一次只问一场 —— 输出小，失败也只重试那一场。
+ */
+async function askJson(promptText, opts = {}) {
+  const call = async (text) => {
+    const r = await postJson(`${CFG.ioUrl}/v1/input`,
+      { text, sessionId: opts.sessionId || 'studio-plan', persona: false },
+      ioAuthHeaders(opts.req), CFG.planTimeoutMs);
+    return { ok: Boolean(r.data && r.data.ok), answer: (r.data && r.data.answer) || '' };
+  };
+  const first = await call(promptText);
+  if (!first.ok) return { ok: false, error: 'IO_FAILED' };
+  let parsed = parsePlan(first.answer);
+  if (parsed) return { ok: true, json: parsed };
+  // 重试：把它自己的输出贴回去，明确"只保留 JSON"
+  const repair = `${promptText}\n\n你上一次的输出不是合法 JSON（开头如下）：\n${String(first.answer).slice(0, 300)}\n\n现在只输出 JSON，第一个字符必须是 {。`;
+  const second = await call(repair);
+  parsed = second.ok ? parsePlan(second.answer) : null;
+  if (parsed) return { ok: true, json: parsed, repaired: true };
+  return { ok: false, error: 'PLAN_NOT_JSON', raw: String(second.answer || first.answer).slice(0, 400) };
+}
+
+function buildSkeletonPrompt(prompt, total) {
+  return [
+    '只输出 JSON，第一个字符必须是 {，不要解释。',
+    `给这个主题写分镜：${prompt}`,
+    `总时长约 ${total} 秒。`,
+    '{"title":"标题","scenes":[{"text":"这一场标题（≤14字）","narration":"旁白（≤30字，口语）","seconds":4,"visual":"text|draw|plot"}]}',
+    'visual：plot=需要精确数学图形（曲线/曲面/向量场，交给 Python）；draw=示意图（坐标轴/点/线/框/公式，交给 GDI）；text=纯文字卡（开场/转场/结论）。',
+    `至少一半场次用 plot 或 draw；每场 3~8 秒；场数 3~${CFG.maxScenes}。`,
+  ].join('\n');
+}
+
+function buildVisualPrompt(scene, kind) {
+  const head = [
+    '只输出 JSON，第一个字符必须是 {，不要解释。',
+    `要画这一场：标题「${scene.text}」，旁白「${scene.narration}」`,
+    '',
+  ];
+  if (kind === 'plot') {
+    return head.concat([
+      '{"python":"<matplotlib 代码>"}',
+      '代码要求：',
+      '- 已 import：matplotlib.pyplot as plt、numpy as np；中文字体已设好',
+      '- fig = plt.figure(figsize=(16,9), dpi=120)',
+      '- 必须 plt.tight_layout()；**不要** savefig / show（外部保存）',
+      '- 只画这一场要讲的，标题用 plt.title，坐标轴要有标签；≤40 行；不读文件、不联网、不 print',
+    ]).join('\n');
+  }
+  return head.concat([
+    '{"draw":{"bg1":"#101a33","bg2":"#0b1220","shapes":[...]}}',
+    '画布 1920x1080，原点左上，y 向下。图元（step=1~4 表示第几步出现）：',
+    '- {"step":1,"type":"line","x1":.,"y1":.,"x2":.,"y2":.,"color":"#7fb2ff","width":3,"arrow":true}',
+    '- {"step":1,"type":"text","x":.,"y":.,"text":"…","size":34,"color":"#e8eefc","align":"center"}',
+    '- {"step":2,"type":"circle","cx":.,"cy":.,"r":12,"fill":"#ffb36b"}',
+    '- {"step":3,"type":"formula","x":.,"y":.,"size":46,"color":"#ffd08a","runs":[{"t":"ds² = g"},{"t":"μν","sub":true}]}',
+    '分 2~4 步：先框架、再对象、最后公式。文字 x 取 120~1800，y 取 140~960。',
+  ]).join('\n');
+}
+
+async function planTwoStage(prompt, opts = {}) {
+  const total = Number(opts.seconds) || 12;
+  const skel = await askJson(buildSkeletonPrompt(prompt, total), opts);
+  if (!skel.ok) return skel;
+  const scenes = Array.isArray(skel.json.scenes) ? skel.json.scenes.slice(0, CFG.maxScenes) : [];
+  if (!scenes.length) return { ok: false, error: 'NO_SCENES' };
+
+  let visuals = 0;
+  for (const s of scenes) {
+    const kind = s.visual === 'plot' || s.visual === 'draw' ? s.visual : 'text';
+    if (kind === 'text') continue;
+    const r = await askJson(buildVisualPrompt(s, kind), { ...opts, sessionId: 'studio-visual' });
+    if (!r.ok) { log(`场「${s.text}」视觉生成失败，降级文字卡`); continue; }
+    if (kind === 'plot' && typeof r.json.python === 'string') {
+      s.python = r.json.python.slice(0, 4000); s.kind = 'plot'; visuals += 1;
+    } else if (kind === 'draw' && r.json.draw && Array.isArray(r.json.draw.shapes)) {
+      s.draw = r.json.draw; s.kind = 'rich'; visuals += 1;
+    } else {
+      log(`场「${s.text}」视觉 JSON 形状不对，降级文字卡`);
+    }
+  }
+  log(`两段式规划：${scenes.length} 场，${visuals} 场有图`);
+  return { ok: true, json: { title: skel.json.title || '', scenes }, visuals };
+}
+
 function buildPlanPrompt(prompt, opts) {
   const total = Number(opts.seconds) || 12;
-  return [
-    `我要做一段横屏短视频，主题：${prompt}`,
-    `总时长大约 ${total} 秒，画面上的文字要短。`,
+  const allowRich = opts.rich !== false;
+  const stickerIds = Array.isArray(opts.stickerIds) ? opts.stickerIds.slice(0, 10) : [];
+  const lines = [
+    `我要做一段横屏讲解视频，主题：${prompt}`,
+    `总时长大约 ${total} 秒。`,
     '',
-    '你只需要写分镜，不要写代码、不要画图、不要描述滤镜参数。画面由程序渲染。',
-    '只输出 JSON，不要代码块、不要解释：',
+    '输出 JSON，不要代码块、不要解释。格式如下（注意第一条就是 rich）：',
     '{"title":"一句话标题","scenes":[',
-    '  {"text":"画面上的大字，不超过 12 个字","narration":"这一场的旁白，可空，不超过 30 个字","seconds":3,"bg":{"c0":"#0b1a3a","c1":"#ff7a3d"}}',
+    '  {"kind":"rich","text":"这一场的标题","narration":"旁白","seconds":6,"steps":["p1","p2","p3"],',
+    '   "draw":{"bg1":"#101a33","bg2":"#0b1220","shapes":[',
+    '     {"step":1,"type":"line","x1":150,"y1":830,"x2":1780,"y2":830,"color":"#7fb2ff","width":3,"arrow":true},',
+    '     {"step":1,"type":"line","x1":220,"y1":930,"x2":220,"y2":220,"color":"#7fb2ff","width":3,"arrow":true},',
+    '     {"step":2,"type":"circle","cx":600,"cy":640,"r":12,"fill":"#ffb36b"},',
+    '     {"step":2,"type":"text","x":600,"y":690,"text":"A (2,1)","size":34,"color":"#e8eefc","align":"center"},',
+    '     {"step":3,"type":"text","x":960,"y":380,"text":"距离由度规决定","size":40,"color":"#ffd08a","align":"center","bold":true}',
+    '   ]}},',
+    '  {"kind":"text","text":"一句短话","narration":"旁白","seconds":3,"bg":{"c0":"#0b1a3a","c1":"#ff7a3d"}}',
     ']}',
     '',
-    '要求：',
-    `1. 场数 3~${CFG.maxScenes} 场，每场 2~5 秒，加起来接近 ${total} 秒。`,
-    '2. text 要像短视频字幕那样短，不要整句复述旁白。',
-    '3. narration 是给人听的，用口语、一句一个意思；第二场之后可以和上一场衔接。',
-    '4. bg.c0 / bg.c1 必须是十六进制颜色（如 #0b1a3a），两色要能表达这一场的情绪。',
-    '5. 不要出现 markdown、不要解释。',
-  ].join('\n');
+  ];
+
+  lines.push(
+    '## 硬性要求',
+    '- **至少 60% 的场次必须是 kind="rich"，且每场 rich 都要有 draw.shapes 图元。** 讲概念不画图等于没讲。',
+    '- text 场只用来开场、转场、下结论，不放讲解内容。',
+    '',
+    '## rich 怎么写（draw 绘图指令）',
+    '- 画布固定 1920x1080，原点在左上，y 向下。',
+    '- 只支持下面这些图元，每个都有 step（第几步出现，1~4）：',
+    '  {"step":1,"type":"line","x1":150,"y1":830,"x2":1780,"y2":830,"color":"#7fb2ff","width":3,"arrow":true}',
+    '  {"step":1,"type":"text","x":960,"y":120,"text":"正文或标注","size":34,"color":"#e8eefc","align":"center","bold":false}',
+    '  {"step":2,"type":"circle","cx":600,"cy":620,"r":12,"fill":"#ffb36b"}',
+    '  {"step":2,"type":"rect","x":120,"y":200,"w":420,"h":160,"fill":"#16203a","stroke":"#2a3a60","width":2}',
+    '  {"step":2,"type":"polyline","points":[[200,700],[400,500],[600,620]],"color":"#7fb2ff","width":3}',
+    '  {"step":3,"type":"formula","x":640,"y":380,"size":48,"color":"#ffd08a","runs":[{"t":"ds\u00b2 = g"},{"t":"\u03bc\u03bd","sub":true},{"t":" dx"},{"t":"\u03bc","sup":true},{"t":" dx"},{"t":"\u03bd","sup":true}]}',
+    '- 分 1~4 步：先画坐标轴/框架，再画对象（点、线、框），最后出公式或结论。',
+    '- 文字别贴边：x 取 120~1800，y 取 120~980；公式用 runs 拼上下标，**不要写 LaTeX 源码**。',
+    '- 动画靠"分步出现"实现，所以**每一场都要想清楚先给什么、再给什么**。',
+    '',
+  );
+  if (stickerIds.length) {
+    lines.push(
+      '',
+      '## 表情包（可选，用来加"大肥鱼"的在场感和趣味）',
+      '- 给某个场景加 stickers：{"id":"<下面列表里的 id>","at":1.2,"duration":1.6,"x":0.82,"y":0.2,"scale":0.22}',
+      '- x/y 是中心点相对位置（0~1），常用右上 0.82/0.2、左下 0.18/0.78；别挡住图和公式。',
+      '- 全片用 2~4 次就够，放在惊讶、吐槽、结论这种情绪点上。',
+      `- 可用表情：${stickerIds.map((s) => `${s.id}=${s.name}`).join('，')}`,
+    );
+  }
+  lines.push(
+    '',
+    '## 通用',
+    `- 场数 3~${CFG.maxScenes}，加起来接近 ${total} 秒。`,
+    '- narration 是给人听的：口语、一句一个意思，下一场可以接上一场。',
+    '- 不要出现 markdown、不要解释你的做法。',
+  );
+  return lines.join('\n');
 }
 
 function parsePlan(text) {
@@ -161,26 +346,20 @@ function normalizePlan(plan) {
   const optStr = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
   const MOTIONS = ['zoom-in', 'zoom-out', 'pan-left', 'pan-right'];
   const scenes = (plan.scenes || []).slice(0, CFG.maxScenes).map((s) => {
-    const seconds = Math.min(MAX_SCENE_SECONDS, Math.max(CFG.minSceneSeconds, Number(s.seconds) || 3));
-    const bg = s.bg || {};
-    const motion = optStr(s.motion);
-    return {
-      text: String(s.text || '').slice(0, 40),
-      narration: String(s.narration || '').slice(0, 80),
-      seconds,
-      bg: { c0: hex(bg.c0, '#101a33'), c1: hex(bg.c1, '#3a2a5a') },
-      textSize: Number(s.textSize) || null,
-      // 图片名（或绝对路径）：渲染层据此找素材；没有就是纯渐变+文字
-      image: optStr(s.image),
-      // 运镜：认识的四个值统一小写，不认识的原样透传
-      motion: motion ? (MOTIONS.includes(motion.toLowerCase()) ? motion.toLowerCase() : motion) : null,
-      // 先占位：正常是 0，等 TTS 量出真实长度后由 planWithNarration 覆盖。
-      // 提前放进对象是为了让 /v1/plan 的返回结构和 /v1/render 一致，面板不用判空。
-      narrationMs: 0,
-      actualSeconds: seconds,
-    };
+    // 统一交给 project.js 的 normalizeScene：字段白名单只该有一份。
+    // 之前这里手写了一份，结果 kind/html/steps/stickers 全被丢掉 —— 讲解画面永远出不来。
+    const normalized = P.normalizeScene(s);
+    normalized.seconds = Math.min(MAX_SCENE_SECONDS, Math.max(CFG.minSceneSeconds, Number(s.seconds) || normalized.seconds));
+    normalized.actualSeconds = normalized.seconds;
+    normalized.narrationMs = 0;
+    // 时长被夹回合法区间后，picture 缓存键依赖它，所以要在写完 seconds 之后再定
+    return normalized;
   });
-  if (!scenes.length) scenes.push({ text: String(plan.title || '短视频'), narration: '', seconds: 3, bg: { c0: '#101a33', c1: '#3a2a5a' }, textSize: null, image: null, motion: null, narrationMs: 0, actualSeconds: 3 });
+  if (!scenes.length) {
+    const fallback = P.normalizeScene({ text: plan.title || '短视频', seconds: 3 });
+    fallback.actualSeconds = fallback.seconds;
+    scenes.push(fallback);
+  }
 
   // 总时长封顶：超了就把每场按比例压回来
   // 注意这里只是"计划时长"的粗调；真正的封顶在 planWithNarration（那里知道旁白有多长，
@@ -558,21 +737,83 @@ async function renderProject(project, opts = {}, scope = 'auto') {
         clips.push(hit.clip);
         reused += 1;
       } else {
-        const still = await R.sceneStill({
-          ffmpeg: CFG.ffmpeg, work, index: i, scene: s,
-          w: CFG.width, h: CFG.height, font: CFG.font,
-          imageDir: CFG.imageDir, image: s.image || undefined, motion: s.motion || undefined,
-        });
-        if (!still.ok) return { ok: false, error: `SCENE_STILL_FAILED#${i}: ${(still.error || '').slice(0, 300)}` };
-        const clip = await R.sceneClip({
-          ffmpeg: CFG.ffmpeg, work, index: i, stillPng: still.png,
-          seconds: s.seconds, w: CFG.width, h: CFG.height, fps: CFG.fps,
-          image: s.image || undefined, motion: s.motion || undefined,
-        });
-        if (!clip.ok) return { ok: false, error: `SCENE_CLIP_FAILED#${i}: ${(clip.error || '').slice(0, 300)}` };
+        // 两种画面来源：讲解画面（GDI+ 绘图指令 → 分步图 → 片段）或文字卡（渐变 + 大字）
+        let clipFile = null;
+        const wantsRich = (s.kind === 'rich' && (s.draw || s.html));
+        if (wantsRich && s.draw && GdiScene) {
+          try {
+            const stills = await GdiScene.renderGdiStills({
+              psScript: path.join(DIR, 'lib', 'draw.ps1'),
+              work, index: i, spec: s.draw, w: CFG.width, h: CFG.height,
+            });
+            if (stills && stills.ok) {
+              const slides = HTMLScene
+                ? await HTMLScene.buildSlidesClip({ ffmpeg: CFG.ffmpeg, work, index: i, pngs: stills.pngs, seconds: s.seconds, fps: CFG.fps, w: CFG.width, h: CFG.height })
+                : await R.concatClips({ ffmpeg: CFG.ffmpeg, clips: stills.pngs, out: path.join(work, `slides-${i}.mp4`) });
+              if (slides && slides.ok) clipFile = slides.file;
+              else log(`scene#${i} 讲解画面合成失败，退回文字卡: ${(slides && slides.error || '').slice(0, 200)}`);
+            } else {
+              log(`scene#${i} 讲解画面绘制失败，退回文字卡: ${(stills && stills.error || '').slice(0, 200)}`);
+            }
+          } catch (err) {
+            log(`scene#${i} 讲解画面异常，退回文字卡: ${err && err.message || err}`);
+          }
+        } else if (wantsRich && s.html && HTMLScene) {
+          // 旧路径：HTML/SVG 需要无头浏览器（服务器上跑不起来，仅开发机可用）
+          try {
+            const stills = await HTMLScene.renderHtmlStills({
+              edgePath: CFG.edgePath, work, index: i,
+              html: s.html, title: s.text, steps: s.steps,
+              w: CFG.width, h: CFG.height, timeoutMs: 30000,
+            });
+            if (stills && stills.ok) {
+              const slides = await HTMLScene.buildSlidesClip({
+                ffmpeg: CFG.ffmpeg, work, index: i, pngs: stills.pngs,
+                seconds: s.seconds, fps: CFG.fps, w: CFG.width, h: CFG.height,
+              });
+              if (slides && slides.ok) clipFile = slides.file;
+              else log(`scene#${i} 讲解画面合成失败，退回文字卡: ${(slides && slides.error || '').slice(0, 200)}`);
+            } else {
+              log(`scene#${i} 讲解画面截图失败，退回文字卡: ${(stills && stills.error || '').slice(0, 200)}`);
+            }
+          } catch (err) {
+            log(`scene#${i} 讲解画面异常，退回文字卡: ${err && err.message || err}`);
+          }
+        }
+        if (!clipFile) {
+          const still = await R.sceneStill({
+            ffmpeg: CFG.ffmpeg, work, index: i, scene: s,
+            w: CFG.width, h: CFG.height, font: CFG.font,
+            imageDir: CFG.imageDir, image: s.image || undefined, motion: s.motion || undefined,
+          });
+          if (!still.ok) return { ok: false, error: `SCENE_STILL_FAILED#${i}: ${(still.error || '').slice(0, 300)}` };
+          const clip = await R.sceneClip({
+            ffmpeg: CFG.ffmpeg, work, index: i, stillPng: still.png,
+            seconds: s.seconds, w: CFG.width, h: CFG.height, fps: CFG.fps,
+            image: s.image || undefined, motion: s.motion || undefined,
+          });
+          if (!clip.ok) return { ok: false, error: `SCENE_CLIP_FAILED#${i}: ${(clip.error || '').slice(0, 300)}` };
+          clipFile = clip.file;
+        }
+
+        // 表情叠加：加"大肥鱼"的在场感。失败不致命 —— 画面对了比表情重要。
+        if (Array.isArray(s.stickers) && s.stickers.length && Overlay) {
+          try {
+            const ov = await Overlay.overlayStickers({
+              ffmpeg: CFG.ffmpeg, stickerDir: CFG.stickerDir, work, index: i,
+              videoIn: clipFile, out: path.join(work, `ov-${i}.mp4`),
+              w: CFG.width, h: CFG.height, stickers: s.stickers,
+            });
+            if (ov && ov.ok && ov.applied > 0) clipFile = ov.file;
+            else log(`scene#${i} 表情叠加跳过: ${(ov && (ov.warning || ov.error) || '').slice(0, 160)}`);
+          } catch (err) {
+            log(`scene#${i} 表情叠加异常: ${err && err.message || err}`);
+          }
+        }
+
         const dest = path.join(cdir, `clip-${key}.mp4`);
-        fs.copyFileSync(clip.file, dest);
-        project.cache[key] = { clip: dest, at: new Date().toISOString() };
+        fs.copyFileSync(clipFile, dest);
+        project.cache[key] = { clip: dest, rich: Boolean(wantsRich), at: new Date().toISOString() };
         clips.push(dest);
         rendered += 1;
       }
@@ -749,16 +990,9 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req) || '{}');
       const prompt = String(body.prompt || '').trim();
       if (!prompt) return json(res, 400, { ok: false, error: 'PROMPT_REQUIRED' });
-      const io = await postJson(`${CFG.ioUrl}/v1/input`,
-        { text: buildPlanPrompt(prompt, body), sessionId: 'studio-plan' },
-        ioAuthHeaders(req),
-        CFG.planTimeoutMs);
-      if (!io.data || !io.data.ok) {
-        return json(res, 200, { ok: false, step: 'plan', error: (io.data && (io.data.error || io.data.code)) || `io HTTP ${io.status}` });
-      }
-      const parsed = parsePlan(io.data.answer);
-      if (!parsed) return json(res, 200, { ok: false, step: 'plan', error: 'PLAN_NOT_JSON', raw: String(io.data.answer || '').slice(0, 800) });
-      return json(res, 200, { ok: true, plan: normalizePlan(parsed) });
+      const two = await planTwoStage(prompt, { seconds: body.seconds, req });
+      if (!two.ok) return json(res, 200, { ok: false, step: 'plan', error: two.error, raw: two.raw });
+      return json(res, 200, { ok: true, plan: normalizePlan(two.json), visuals: two.visuals });
     }
 
     if (req.method === 'POST' && p === '/v1/render') {
@@ -776,7 +1010,7 @@ const server = http.createServer(async (req, res) => {
       const prompt = String(body.prompt || '').trim();
       if (!prompt) return json(res, 400, { ok: false, error: 'PROMPT_REQUIRED' });
       const io = await postJson(`${CFG.ioUrl}/v1/input`,
-        { text: buildPlanPrompt(prompt, body), sessionId: 'studio-plan' },
+        { text: buildPlanPrompt(prompt, withPlanHints(body, await stickerHints())), sessionId: 'studio-plan', persona: false },
         ioAuthHeaders(req),
         CFG.planTimeoutMs);
       if (!io.data || !io.data.ok) {
