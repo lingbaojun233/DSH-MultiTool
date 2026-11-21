@@ -32,8 +32,8 @@ start http://127.0.0.1:8766/
 .\install.ps1 -Root D:\DSH -PortBase 9000
 ```
 
-> **已验证**：全新目录 `install.ps1 -Root <临时目录> -PortBase 19000` 跑通 —— 9 个服务全部监听、面板首页 HTTP 200、10 个计划任务注册成功、重复执行不报错不重复建任务。
-> 详细清单见 [QUICKSTART.md](QUICKSTART.md)。
+> **已验证**（在一台干净临时目录实跑，端口错开生产）：全新安装 21 秒完成，9 个服务全部监听、面板首页 **HTTP 200**、`io /v1/health` 返回 `ready:true`、6 个插件全部装入、10 个计划任务注册成功；在这个新装的实例上真调 `make_video {plan_only:true}` **返回 7 场分镜**（`mode:"script"`，不是报错）；重复执行安装脚本退出码 0、任务不重复、密钥不丢；`uninstall.ps1` 能停任务并删干净目录。
+> 完整清单与未验证项见 [QUICKSTART.md](QUICKSTART.md)。
 
 **安装脚本会做 8 件事**：拷文件 → 装便携 Node + DSH 核心 → 装 6 个插件 → 写密钥模板 → 配端口 → 注册 10 个计划任务 → 起服务 → 等面板返回 200。第一次约 5–15 分钟（下载 Node 与 npm 依赖）。
 
@@ -125,7 +125,11 @@ DEEPSEEK_API_KEY=sk-...
 | studio | +7 | 8772 | 视频创作引擎（分镜 → 动画 → 渲染） |
 | sticker | +8 | 8773 | 表情包 |
 
-同一台机器跑第二套：换 `-PortBase` **并且**换 `-TaskPrefix`，否则计划任务会互相覆盖。
+同一台机器跑第二套：`-PortBase` 和 `-TaskPrefix` **都要换**，否则计划任务会互相覆盖。
+
+```powershell
+.\install.ps1 -Root D:\DSH -PortBase 19000 -TaskPrefix DSH-MultiTool-2
+```
 
 所有服务默认只监听 `127.0.0.1`。要在别的机器上访问，用 SSH 隧道：
 

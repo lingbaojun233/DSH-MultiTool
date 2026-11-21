@@ -84,7 +84,11 @@ DEEPSEEK_API_KEY=sk-你的key
 | studio | base + 7 | 视频创作引擎 |
 | sticker | base + 8 | 表情包 |
 
-同一台机器上想跑第二套，换个 `-PortBase` 即可（例如 `19000`）。
+同一台机器上想跑第二套，两个参数都要换（换端口 + 换任务名前缀，否则计划任务会互相覆盖）：
+
+```powershell
+.\install.ps1 -Root D:\DSH -PortBase 19000 -TaskPrefix DSH-MultiTool-2
+```
 
 ---
 
@@ -103,19 +107,24 @@ DEEPSEEK_API_KEY=sk-你的key
 
 ## 6. 已验证 / 未验证
 
-**本版本实际跑通过：**
+**本版本实际跑通过**（在服务器上用一个干净临时目录 `C:\Apps\DSH-MultiTool-test`、`-PortBase 19000`、任务前缀 `DSH-MultiTool-TEST` 实测）：
 
-- `install.ps1 -Root <临时目录> -PortBase 19000` 全新安装到干净目录，9 个服务全部监听，面板首页返回 HTTP 200，10 个计划任务注册成功
-- 重复执行 `install.ps1` 不报错、不重复建任务、不覆盖已填的密钥
-- `uninstall.ps1` 停任务 + 删目录后可再次全新安装
-- 面板登录 / 聊天 / `make_video {plan_only:true}` 返回分镜
+- 全新安装 21 秒完成（npm 缓存已热；冷缓存约 2–5 分钟，视 GitHub 连通性而定）
+- 9 个服务全部监听 19000–19008；面板首页 `GET /` 返回 **HTTP 200**；`io /v1/health` 返回 `ready:true`
+- 6 个插件全部落到 `node_modules` 并出现在 profile 的 bundle 列表里
+- 10 个计划任务注册成功（9 个开机自启 + 1 个每日 03:00）
+- 此安装上真调 `make_video {plan_only:true}` → 返回 7 场分镜（`mode:"script"`，24 秒），不是报错
+- 重复执行 `install.ps1`：退出码 0、任务仍是 10 个不重复、每个 `start-server.cmd` 的管理块只有 1 段、密钥和邀请码保持不变、9 个端口继续可连
+- `uninstall.ps1 -Force`：10 个任务全部移除、目录删除干净、遗留的 node.exe 按「本安装端口 + 本安装路径」精确回收
+- 全程生产的 `C:\Apps\DSH-MultiTool` 与其 10 个计划任务状态**前后一致**（脚本对比 `TaskName=State` 无差异）
 
 **未在本版本验证：**
 
-- 在**没有网络的机器**上安装（脚本需要 npm 与 GitHub）
-- Windows 10 家庭版（计划任务以 SYSTEM 运行，需专业版/服务器版策略允许）
-- 从零下载 Node 的**失败重试**路径（镜像回退逻辑来自 `core\bootstrap.ps1`，本版本用 `-CoreFrom` 复用已有核心做的验证）
-- 公网 HTTPS 访问（面板默认只听 127.0.0.1；对外需要反向代理或自己配证书）
+- 从零下载 Node 与 dsh 的完整路径（本次验证用 `-CoreFrom` 复用了已有核心；下载与镜像回退逻辑来自已随仓维护的 `core\bootstrap.ps1`）
+- 完全没有外网的机器（安装需要 npm 与 GitHub）
+- Windows 10 家庭版（计划任务以 SYSTEM 运行）
+- 公网 HTTPS 访问（面板默认只听 127.0.0.1；对外需要反向代理或自备证书）
+- 语音合成 / 视频真实渲染（本次未填 BreezeBlue Key，也未放 ffmpeg；只验证了视频分镜规划）
 
 ---
 
@@ -151,9 +160,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1
 
 # 想留记忆库和历史，只删程序
 powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1 -KeepData
+
+# 装的时候换过端口/任务前缀，卸载时也要带上，否则找不到那些任务
+powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1 -Root D:\DSH -PortBase 19000 -TaskPrefix DSH-MultiTool-2
 ```
 
-卸载只按计划任务名停服务，**不会杀你机器上别的 node 进程**。
+卸载只按计划任务名停服务。极少数情况下 `cmd.exe` 被停掉而它启动的 `node.exe` 还在跑（会占着端口和
+`memory.db`），此时卸载脚本只回收「监听本安装端口 **且** 命令行里带本安装路径」的 `node.exe`，
+**不会碰机器上其它 node 进程**。
 
 ---
 
