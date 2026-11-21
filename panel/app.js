@@ -420,7 +420,57 @@ async function speakText(text, btn) {
   }
 }
 
-function addMessage(role, text, meta) {
+/**
+ * 一条回复拆成几条短消息：像真人那样一条一条发，而不是甩一大段。
+ * 先按换行切（模型常这么分条），过长再按句末标点切，还长就硬切。
+ */
+function splitBubbles(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return [];
+  const out = [];
+  const pushChunk = (chunk) => {
+    const s = chunk.trim();
+    if (!s) return;
+    if (s.length <= 60) { out.push(s); return; }
+    const parts = s.split(/(?<=[。！？!?…~～])\s*/).map((x) => x.trim()).filter(Boolean);
+    if (parts.length <= 1) {
+      for (let i = 0; i < s.length; i += 40) out.push(s.slice(i, i + 40));
+      return;
+    }
+    for (const p of parts) {
+      if (p.length <= 60) out.push(p);
+      else for (let i = 0; i < p.length; i += 40) out.push(p.slice(i, i + 40));
+    }
+  };
+  for (const line of raw.split(/\n+/)) pushChunk(line);
+  return out.length ? out : [raw];
+}
+
+/** 按"多条消息"渲染；只有最后一条挂朗读按钮，读的是整段。 */
+async function addReplySeries(text, meta, options = {}) {
+  const parts = splitBubbles(text);
+  if (!parts.length) return addMessage('assistant', '（空答案）', meta);
+  let last = null;
+  for (let i = 0; i < parts.length; i++) {
+    const isLast = i === parts.length - 1;
+    last = addMessage('assistant', parts[i], isLast ? meta : '', { noSpeak: !isLast });
+    if (isLast) {
+      const btn = last.querySelector('.msg-tools .iconbtn');
+      if (btn) {
+        btn.title = '读出来（整段）';
+        btn.replaceWith(btn.cloneNode(true));
+        const fresh = last.querySelector('.msg-tools .iconbtn');
+        fresh.addEventListener('click', () => speakText(text, fresh));
+      }
+    }
+    if (!isLast && !options.instant) {
+      await new Promise((r) => setTimeout(r, 380));
+    }
+  }
+  return last;
+}
+
+function addMessage(role, text, meta, options) {
   // showEmpty() 会重建节点头，这里按选择器找当前节点，避免用失效引用
   const placeholder = logEl.querySelector('.empty');
   if (placeholder) placeholder.remove();
@@ -442,7 +492,7 @@ function addMessage(role, text, meta) {
   wrap.appendChild(bubble);
 
   // 每条回复都可以点「读出来」（本地 SAPI 合成，不花 API 钱）
-  if (role === 'assistant' && text) {
+  if (role === 'assistant' && text && !(options && options.noSpeak)) {
     const tools = document.createElement('div');
     tools.className = 'msg-tools';
     const btn = document.createElement('button');
@@ -497,7 +547,7 @@ async function loadHistory() {
     for (const m of messages) {
       if (m.role === 'assistant') {
         const meta = typeof m.ms === 'number' ? `${(m.ms / 1000).toFixed(1)} 秒 · ${formatClock(m.ts)}` : formatClock(m.ts);
-        addMessage('assistant', m.text || '', meta + usageNote(m.usage));
+        addReplySeries(m.text || '', meta + usageNote(m.usage), { instant: true });
       } else if (m.role === 'user') {
         addMessage('user', m.text || '', formatClock(m.ts));
       } else {
@@ -640,7 +690,7 @@ async function sendWithVideo(text) {
 
     if (data && data.ok) {
       const ms = Math.round(performance.now() - started);
-      const replyWrap = addMessage('assistant', data.reply || '（空答案）',
+      const replyWrap = await addReplySeries(data.reply || '（空答案）',
         `${(ms / 1000).toFixed(1)} 秒${data.tokens ? ' · ' + data.tokens.total + ' token' : ''} · ${formatClock(Date.now())}`);
       attachVideoDetails(replyWrap, data.analysis);
     } else {
@@ -713,7 +763,7 @@ async function send() {
       const ms = typeof data.ms === 'number' ? data.ms : Math.round(performance.now() - started);
       recentTurns.push({ role: 'assistant', text: data.answer || '' });
       if (recentTurns.length > 12) recentTurns.splice(0, recentTurns.length - 12);
-      addMessage('assistant', data.answer || '（空答案）', `${(ms / 1000).toFixed(1)} 秒${usageNote(data.usage)} · ${formatClock(Date.now())}`);
+      addReplySeries(data.answer || '（空答案）', `${(ms / 1000).toFixed(1)} 秒${usageNote(data.usage)} · ${formatClock(Date.now())}`);
     } else {
       const detail = data.exitCode != null ? `exit=${data.exitCode}` : '';
       addMessage('error', data.error || data.code || '请求失败', detail);

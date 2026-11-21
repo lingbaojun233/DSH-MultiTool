@@ -220,24 +220,15 @@ function buildVideoTask(analysis, userText) {
   const lines = [];
   lines.push(userText ? `我给你发了一段视频，说：${userText}` : '我给你发了一段视频。');
   lines.push('');
-  lines.push('【视频内容（已经有人帮你看过了，描述如下）】');
+  lines.push('【视频内容（已经有人帮你看过了）】');
   lines.push(analysis.synopsis || analysis.answer || '（没描述出来）');
-  if (Array.isArray(analysis.timeline) && analysis.timeline.length) {
-    lines.push('时间线：');
-    for (const t of analysis.timeline.slice(0, 20)) {
-      lines.push(`- ${t.t || '?'} ${t.what || ''}`);
-    }
-  }
   if (Array.isArray(analysis.highlights) && analysis.highlights.length) {
-    lines.push('要点：' + analysis.highlights.join('；'));
+    lines.push('要点：' + analysis.highlights.slice(0, 2).join('；'));
   }
-  if (analysis.onScreen) lines.push('画面上出现的文字：' + analysis.onScreen);
 
   // 听力模块听出来的东西：谁在说话、有什么响动、有多吵
   const audio = analysis.audio;
   if (audio && audio.ok) {
-    lines.push('');
-    lines.push('【声音（听出来的）】');
     if (audio.transcript) {
       // SAPI 背景嘈杂时会把噪声听成句子，置信度低于 0.5 就别当成原话
       const shaky = typeof audio.confidence === 'number' && audio.confidence < 0.5;
@@ -245,19 +236,18 @@ function buildVideoTask(analysis, userText) {
         ? '听到的话（背景太吵，识别可能不准，别当原话引用）：' + audio.transcript
         : '听到的话：' + audio.transcript);
     } else {
-      lines.push('没听出成句的人话');
+      lines.push('声音：没听出成句的人话');
     }
     if (audio.summary) lines.push('声音概况：' + audio.summary);
     if (Array.isArray(audio.events) && audio.events.length) {
-      lines.push('声音事件：');
-      for (const e of audio.events.slice(0, 8)) lines.push(`- ${e.t || '?'} ${e.desc || ''}`);
+      lines.push('声音事件：' + audio.events.slice(0, 4).map((e) => `${e.t} ${e.desc}`).join('；'));
     }
-    lines.push('【声音结束】');
   }
   lines.push('【描述结束】');
   lines.push('');
-  lines.push('用你自己的口气回我：先给一句直接看法（这视频怎么样、值不值得看），再补一两点你自己注意到的东西或者想问的。');
-  lines.push('不要复述时间线，不要写成报告。');
+  lines.push('用你自己的口气回我，分成 2~3 条短消息，一条一行，每条不超过 20 字：');
+  lines.push('第一条直接说你的看法（好看/一般/没意思），后面的补你自己注意到的东西或者想问的。');
+  lines.push('不要复述时间线，不要写成报告，不要每句都提问。');
   return lines.join('\n');
 }
 

@@ -30,7 +30,8 @@ const CFG = Object.assign({
   model: 'qwen3.8-flash',
   fallbackModel: 'qwen4-max',
   maxFrames: 16,
-  frameMaxSide: 896,
+  defaultFrames: 6,
+  frameMaxSide: 768,
   requestTimeoutMs: 180000,
   ffmpeg: 'C:\\Apps\\DSH-MultiTool\\tools\\ffmpeg\\bin\\ffmpeg.exe',
   ytdlp: 'C:\\Apps\\DSH-MultiTool\\tools\\yt-dlp.exe',
@@ -101,10 +102,10 @@ function buildVideoPrompt(frameTimes, userText) {
     '注意：你只拿到了画面帧，没有拿到音频。音轨由另一个模块单独处理。',
     '所以不要对"有没有声音""听没听到"下任何结论，也不要猜音效或配乐；只描述看得见的东西。',
     '看不清就说不确定，不要编。',
-    '只输出 JSON：',
-    '{"synopsis":"这段视频在讲什么，三句以内",',
-    ' "timeline":[{"t":"时间点","what":"这一帧发生了什么"}],',
-    ' "highlights":["最值得注意的事，1~3 条"],',
+    '只输出 JSON，越短越好：',
+    '{"synopsis":"这段视频在讲什么，两句以内，不超过 80 字",',
+    ' "timeline":[{"t":"时间点","what":"这一帧发生了什么（一句话）"}],',
+    ' "highlights":["最值得注意的事，最多 2 条"],',
     ' "on_screen":"画面上能读到的关键文字，没有就空字符串"}',
   ].filter(Boolean).join('\n');
 }
@@ -117,7 +118,7 @@ async function chatWithFrames(model, frames, userText) {
   const body = {
     model,
     messages: [{ role: 'user', content }],
-    max_tokens: 1600,
+    max_tokens: 900,
     temperature: 0.3,
   };
 
@@ -213,7 +214,10 @@ async function probeDuration(file) {
   return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
 }
 
-/** 均匀取样：不追求覆盖每一秒，只要能把"这段视频发生了什么"讲清楚。 */
+/**
+ * 均匀取样：一次 ffmpeg 出全部帧（fps 滤镜），而不是每帧起一个进程。
+ * 之前 8 帧要 spawn 9 次 ffmpeg，光进程启动就吃掉好几秒。
+ */
 async function extractFrames(file, count) {
   const ff = ffmpegPath();
   if (!ff) return { ok: false, error: 'FFMPEG_MISSING' };
@@ -222,24 +226,33 @@ async function extractFrames(file, count) {
 
   const n = Math.max(1, Math.min(CFG.maxFrames, Number(count) || 8));
   const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vid-'));
-  const frames = [];
-  for (let i = 0; i < n; i++) {
-    // 取每段的中点，避开片头和片尾的空白
-    const t = duration * (i + 0.5) / n;
-    const out = path.join(outDir, `f${String(i).padStart(2, '0')}.jpg`);
-    const r = await run(ff, [
-      '-ss', String(t.toFixed(3)), '-i', file,
-      '-frames:v', '1',
-      '-vf', `scale='min(${CFG.frameMaxSide},iw)':-2`,
-      '-q:v', '4', '-y', out,
-    ], 60000);
-    if (r.code === 0 && fs.existsSync(out)) {
-      const b64 = fs.readFileSync(out).toString('base64');
-      frames.push({ t: fmtTime(t), dataUrl: `data:image/jpeg;base64,${b64}` });
-    }
-  }
+  const fps = n / Math.max(0.1, duration);
+
+  const r = await run(ff, [
+    '-hide_banner', '-loglevel', 'error',
+    '-i', file,
+    '-vf', `fps=${fps.toFixed(6)},scale='min(${CFG.frameMaxSide},iw)':-2`,
+    '-frames:v', String(n),
+    '-q:v', '4', '-y',
+    path.join(outDir, 'f%03d.jpg'),
+  ], 60000);
+
+  const files = fs.existsSync(outDir)
+    ? fs.readdirSync(outDir).filter((f) => f.endsWith('.jpg')).sort()
+    : [];
+
+  const frames = files.map((f, i) => {
+    const buf = fs.readFileSync(path.join(outDir, f));
+    return {
+      // fps 滤镜出的第 i 帧大约落在 (i+0.5)/fps 秒处
+      t: fmtTime((i + 0.5) / fps),
+      dataUrl: `data:image/jpeg;base64,${buf.toString('base64')}`,
+    };
+  });
   try { fs.rmSync(outDir, { recursive: true, force: true }); } catch { }
-  return { ok: frames.length > 0, frames, duration, error: frames.length ? undefined : 'NO_FRAME_EXTRACTED' };
+
+  if (frames.length) return { ok: true, frames, duration };
+  return { ok: false, error: `NO_FRAME_EXTRACTED${r.code !== 0 ? ': ' + (r.stderr || '').slice(0, 160) : ''}` };
 }
 
 async function downloadVideo(url) {
@@ -297,16 +310,23 @@ async function hearAudio(file) {
 async function analyzeLocalFile(file, userText, frameCount) {
   if (!fs.existsSync(file)) return { ok: false, error: 'FILE_NOT_FOUND' };
   const t0 = Date.now();
-  const grab = await extractFrames(file, frameCount || 8);
+
+  // 听音轨和视觉分析互不依赖：让它们在后台并行，别串行等。
+  const audioPromise = hearAudio(file).catch(() => null);
+
+  const grab = await extractFrames(file, frameCount || CFG.defaultFrames);
   if (!grab.ok) return { ok: false, error: grab.error };
 
-  // 删文件之前先听一遍（调用方负责删）
-  const audio = await hearAudio(file);
-
+  const tVision = Date.now();
   const result = await analyzeFrames(grab.frames, userText || '');
+  const visionMs = Date.now() - tVision;
+
+  const audio = await audioPromise;
   result.duration = grab.duration;
   result.audio = audio;
   result.ms = Date.now() - t0;
+  result.timing = { visionMs, audioMs: audio && audio.ms ? audio.ms : null, frames: grab.frames.length };
+  log(`timing file=${path.basename(file)} total=${result.ms}ms vision=${visionMs}ms frames=${grab.frames.length} audio=${audio && audio.ms ? audio.ms + 'ms' : '-'}`);
   return result;
 }
 
