@@ -32,6 +32,7 @@ const VIDEO_BASE = process.env.DSH_VIDEO_URL || 'http://127.0.0.1:8769';
 const SPEAK_BASE = process.env.DSH_SPEAK_URL || 'http://127.0.0.1:8770';
 const LISTEN_BASE = process.env.DSH_LISTEN_URL || 'http://127.0.0.1:8771';
 const STUDIO_BASE = process.env.DSH_STUDIO_URL || 'http://127.0.0.1:8772';
+const STICKER_BASE = process.env.DSH_STICKER_URL || 'http://127.0.0.1:8773';
 
 // 浏览器上传的视频落在这里，处理完就删。放在 data\ 下（模块目录以外），
 // 这样一次 push 替换 panel\ 不会把正在传的文件搞坏。
@@ -243,7 +244,9 @@ function protectedPath(pathname) {
   return pathname === '/api/input' || pathname === '/api/persona' ||
     pathname.startsWith('/api/memory/') || pathname.startsWith('/api/video') ||
     pathname === '/api/tts' || pathname === '/api/asr' ||
-    pathname === '/api/history' || pathname === '/api/studio/create';
+    pathname === '/api/history' || pathname === '/api/studio/create' ||
+    pathname === '/api/studio/plan' || pathname === '/api/studio/render' ||
+    pathname === '/api/stickers/send';
 }
 
 /** 服务间直连 POST（视频模块 / io）：不走 req 透传，因为要拿回结果再二次加工。 */
@@ -596,6 +599,50 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, r.status || 200, r.data);
     }
 
+    // 表情包：列表 + 取图 + 发一张（发不经过模型，只写进历史）
+    if (req.method === 'GET' && url.pathname === '/api/stickers') {
+      const q = url.searchParams.get('q') || '';
+      const limit = url.searchParams.get('limit') || '60';
+      const r = await fetch(`${STICKER_BASE}/v1/list?q=${encodeURIComponent(q)}&limit=${encodeURIComponent(limit)}`,
+        { signal: AbortSignal.timeout(15000) });
+      const data = await r.json().catch(() => null);
+      if (!data) return sendJson(res, 502, { ok: false, error: '表情包模块没响应' });
+      return sendJson(res, 200, data);
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/stickers/gif') {
+      const id = String(url.searchParams.get('id') || '');
+      if (!/^[0-9a-f]{6,40}$/i.test(id)) return sendJson(res, 400, { ok: false, error: 'BAD_ID' });
+      const r = await fetch(`${STICKER_BASE}/v1/gif?id=${encodeURIComponent(id)}`, { signal: AbortSignal.timeout(20000) });
+      if (!r.ok) return sendJson(res, 404, { ok: false, error: 'NOT_FOUND' });
+      const buf = Buffer.from(await r.arrayBuffer());
+      res.writeHead(200, {
+        'content-type': 'image/gif',
+        'content-length': buf.length,
+        'cache-control': 'public, max-age=604800',
+      });
+      return res.end(buf);
+    }
+
+    // 发一张表情：不进模型，只作为一条消息记进历史（刷新后还在）
+    if (req.method === 'POST' && url.pathname === '/api/stickers/send') {
+      const user = await currentUser(req);
+      if (!user) return sendJson(res, 401, { ok: false, error: '未登录或会话已过期' });
+      const raw = await readBody(req, 64 * 1024);
+      let body = {};
+      try { body = JSON.parse(raw.toString('utf8')) || {}; } catch { }
+      const id = String(body.id || '');
+      if (!/^[0-9a-f]{6,40}$/i.test(id)) return sendJson(res, 400, { ok: false, error: 'BAD_ID' });
+      const label = String(body.mood || body.name || '表情').slice(0, 40);
+      appendHistory(user.id, {
+        role: 'user',
+        text: `[表情] ${label}`,
+        sticker: id,
+        ts: Date.now(),
+      });
+      return sendJson(res, 200, { ok: true, id, label });
+    }
+
     // 视频创作：DSH 只写分镜，ffmpeg 渲染（模型不生成像素）
     if (req.method === 'POST' && url.pathname === '/api/studio/create') {
       const rawStudio = await readBody(req, 1024 * 1024);
@@ -611,6 +658,43 @@ const server = http.createServer(async (req, res) => {
       }, { authorization: req.headers.authorization || '' }, 1200000);
       if (!r.data) return sendJson(res, 502, { ok: false, error: `studio HTTP ${r.status}` });
       log(`studio create ok=${r.data.ok} job=${r.data.jobId || '-'} ms=${r.data.ms || 0}`);
+      return sendJson(res, r.status || 200, r.data);
+    }
+
+    // 只写分镜：把「写」和「渲染」拆开，人在面板里改完再花那 15~40 秒。
+    if (req.method === 'POST' && url.pathname === '/api/studio/plan') {
+      const rawPlan = await readBody(req, 1024 * 1024);
+      let body = {};
+      try { body = JSON.parse(rawPlan.toString('utf8')) || {}; } catch { }
+      const prompt = String(body.prompt || '').trim();
+      if (!prompt) return sendJson(res, 400, { ok: false, error: '先写一句想要什么' });
+      const r = await postJson(STUDIO_BASE, '/v1/plan', {
+        prompt,
+        seconds: Number(body.seconds) || 12,
+      }, { authorization: req.headers.authorization || '' }, 180000);
+      if (!r.data) return sendJson(res, 502, { ok: false, error: `studio HTTP ${r.status}` });
+      const scenes = (r.data.plan && Array.isArray(r.data.plan.scenes)) ? r.data.plan.scenes.length : 0;
+      log(`studio plan ok=${r.data.ok} scenes=${scenes} ms=${r.data.ms || 0}`);
+      return sendJson(res, r.status || 200, r.data);
+    }
+
+    // 用面板改过的分镜重渲：分镜本身只有几 KB，1MB 上限绰绰有余。
+    // 只校验「像不像一份分镜」，具体字段让 studio 自己判（它才是渲染方，规则改了我不用跟着改）。
+    if (req.method === 'POST' && url.pathname === '/api/studio/render') {
+      const rawRender = await readBody(req, 1024 * 1024);
+      let body = {};
+      try { body = JSON.parse(rawRender.toString('utf8')) || {}; } catch { }
+      const plan = body.plan;
+      if (!plan || !Array.isArray(plan.scenes) || !plan.scenes.length) {
+        return sendJson(res, 400, { ok: false, error: '分镜是空的' });
+      }
+      const r = await postJson(STUDIO_BASE, '/v1/render', {
+        plan,
+        voice: body.voice || '',
+        bgm: body.bgm || '',
+      }, { authorization: req.headers.authorization || '' }, 1200000);
+      if (!r.data) return sendJson(res, 502, { ok: false, error: `studio HTTP ${r.status}` });
+      log(`studio render ok=${r.data.ok} job=${r.data.jobId || '-'} ms=${r.data.ms || 0}`);
       return sendJson(res, r.status || 200, r.data);
     }
 

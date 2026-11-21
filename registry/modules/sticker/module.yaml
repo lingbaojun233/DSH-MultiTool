@@ -1,0 +1,11 @@
+name: sticker
+title: 表情包
+when: 用户想发一张表情包、用图片回应情绪，或要"来一张合适的图"时
+not_when: 需要模型现场画图（这是现成的表情包，不是生成）
+entry:
+  type: cmd
+  name: sticker/start-server.cmd
+cost: 低
+readme: README.md
+version: 0.1.0
+scope: server

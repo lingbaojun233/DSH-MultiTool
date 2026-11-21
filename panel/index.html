@@ -46,11 +46,20 @@
         </div>
       </div>
       <footer class="composer">
+        <div id="stickerPanel" class="sticker-panel hidden">
+          <div class="sticker-head">
+            <input id="stickerSearch" placeholder="找个表情：不想上班 / 开心 / 睡觉" />
+            <button id="stickerClose" class="iconbtn" type="button" title="收起">✕</button>
+          </div>
+          <div id="stickerGrid" class="sticker-grid"></div>
+          <p id="stickerHint" class="muted"></p>
+        </div>
         <div id="attachList" class="attach-list hidden"></div>
         <textarea id="input" rows="3" placeholder="输入内容… 也可以先点 📎 挂一段视频" spellcheck="false"></textarea>
         <div class="composer-actions">
           <button id="attach" class="iconbtn" type="button" title="挂一个视频（发送时会抽帧并听声音）">📎</button>
           <button id="mic" class="iconbtn mic" type="button" title="按住说话：点一下开始录，再点一下结束">🎤</button>
+          <button id="stickerBtn" class="iconbtn" type="button" title="表情包">😀</button>
           <input id="attachFile" type="file" accept="video/*" hidden />
           <span class="hint">Ctrl+Enter 发送 · Enter 换行</span>
           <button id="send" class="primary">发送</button>
@@ -146,10 +155,24 @@
               </select>
             </label>
             <button id="studioGo" class="primary" type="button">开始创作</button>
+            <button id="studioPlanOnly" class="ghost" type="button" title="只写分镜、先不渲染，写完可以在下面改">只写分镜</button>
           </div>
           <p class="muted" id="studioHint">先由它写分镜，再交给 ffmpeg 渲染 —— 模型不画像素，改一句分镜就能精确重渲。</p>
           <div id="studioPlan" class="plan"></div>
+          <pre id="studioRaw" class="raw hidden"></pre>
           <video id="studioVideo" class="studio-video hidden" controls preload="metadata"></video>
+        </section>
+
+        <!-- 分镜编辑区：默认隐藏，拿到分镜（只写分镜 / 一键出片）后才铺开 -->
+        <section class="card hidden" id="studioEditCard">
+          <h2>分镜 <span class="muted" id="studioEditMeta">还没有分镜</span></h2>
+          <div id="sceneList" class="scene-list"></div>
+          <div class="scene-foot">
+            <button id="sceneAdd" class="ghost" type="button">加一场</button>
+            <span class="muted scene-note">总时长 = 各场之和 − 0.4 × (场数 − 1)</span>
+            <button id="studioRender" class="primary" type="button">重新渲染</button>
+          </div>
+          <p class="muted" id="sceneHint">改完点「重新渲染」——不过 ffmpeg 是整段重渲，改一句也要重来一次。</p>
         </section>
 
         <section class="card hidden" id="videoResultCard">

@@ -521,3 +521,79 @@ details#videoDetails summary { cursor: pointer; font-size: 12px; color: var(--mu
 .plan { white-space: pre-line; font-size: 12.5px; color: var(--muted); margin: 8px 0; }
 .plan:empty { display: none; }
 .studio-video { width: 100%; border-radius: 8px; border: 1px solid var(--border); margin-top: 8px; background: #000; }
+/* 模型吐回来但不合格式的原始输出：等宽、可滚、别把卡片撑爆 */
+.raw {
+  max-height: 180px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+  font: 12px/1.5 ui-monospace, Consolas, monospace; color: var(--muted);
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 10px; margin: 8px 0 0;
+}
+/* ------------------------------------------------------- 分镜编辑区 -- */
+.scene-list { display: flex; flex-direction: column; gap: 10px; margin: 4px 0 0; }
+.scene-list > .muted { margin: 0; font-size: 12.5px; }
+
+.scene {
+  display: flex; flex-direction: column; gap: 8px;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--bg); padding: 10px 12px;
+}
+
+.scene-head { display: flex; align-items: center; justify-content: space-between; }
+.scene-no { font-size: 12px; font-weight: 600; color: var(--muted); }
+
+.scene-del {
+  background: none; border: 1px solid var(--border); color: var(--muted);
+  border-radius: 6px; padding: 2px 9px; font-size: 12px; line-height: 1.5;
+}
+.scene-del:hover:not(:disabled) { color: var(--err); border-color: var(--err); }
+
+/* 卡片里 field 之间的间距由 .scene 的 gap 管，别再叠一层 margin */
+.scene .field { margin-bottom: 0; }
+
+/* 秒数/颜色/运动横排，图片单独占一行剩下的宽度 */
+.scene-grid { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; }
+.scene-grid .field { flex: 1 1 140px; min-width: 0; }
+.scene-grid .field.small { flex: 0 0 82px; }
+
+.scene input[type="color"] {
+  height: 32px; padding: 3px; cursor: pointer;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+}
+
+.scene-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+.scene-note { margin-left: auto; margin-right: 2px; font-size: 11.5px; }
+
+/* 创作卡片多了一个按钮：窄屏时让它换行，别把选择框挤没 */
+#studioCard .row { flex-wrap: wrap; }
+
+/* --------------------------------------------------------- 表情包 -- */
+.sticker-panel {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px;
+  margin-bottom: 8px;
+  background: var(--panel, #fff);
+}
+.sticker-head { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+.sticker-head input { flex: 1; }
+.sticker-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
+  gap: 6px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.sticker-cell {
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+  line-height: 0;
+  overflow: hidden;
+}
+.sticker-cell:hover { border-color: var(--accent, #4a7dff); }
+.sticker-cell img { width: 100%; height: 72px; object-fit: contain; }
+.sticker-cell:disabled { opacity: .5; cursor: default; }
+.bubble-media { padding: 4px; background: transparent !important; border: none !important; }
+.bubble-sticker { width: 140px; height: 140px; object-fit: contain; border-radius: 8px; display: block; }

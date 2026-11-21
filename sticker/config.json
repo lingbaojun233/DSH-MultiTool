@@ -1,0 +1,6 @@
+{
+  "port": 8773,
+  "dataDir": "C:\\Apps\\DSH-MultiTool\\data\\stickers",
+  "defaultLimit": 60,
+  "maxLimit": 200
+}

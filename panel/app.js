@@ -481,12 +481,23 @@ function addMessage(role, text, meta, options) {
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
 
-  const html = role === 'assistant' ? renderMarkdown(text) : null;
-  if (html !== null) {
-    bubble.classList.add('md');
-    bubble.innerHTML = html;
+  if (options && options.sticker) {
+    // 表情是图片气泡：文字只作为 alt（无图时也能看出是什么）
+    const img = document.createElement('img');
+    img.className = 'bubble-sticker';
+    img.alt = text || '表情';
+    img.loading = 'lazy';
+    img.src = `/api/stickers/gif?id=${encodeURIComponent(options.sticker)}`;
+    bubble.appendChild(img);
+    bubble.classList.add('bubble-media');
   } else {
-    bubble.textContent = text;
+    const html = role === 'assistant' ? renderMarkdown(text) : null;
+    if (html !== null) {
+      bubble.classList.add('md');
+      bubble.innerHTML = html;
+    } else {
+      bubble.textContent = text;
+    }
   }
 
   wrap.appendChild(bubble);
@@ -549,7 +560,7 @@ async function loadHistory() {
         const meta = typeof m.ms === 'number' ? `${(m.ms / 1000).toFixed(1)} 秒 · ${formatClock(m.ts)}` : formatClock(m.ts);
         addReplySeries(m.text || '', meta + usageNote(m.usage), { instant: true });
       } else if (m.role === 'user') {
-        addMessage('user', m.text || '', formatClock(m.ts));
+        addMessage('user', m.text || '', formatClock(m.ts), m.sticker ? { sticker: m.sticker } : undefined);
       } else {
         addMessage('error', m.text || '（错误）', formatClock(m.ts));
       }
@@ -1112,10 +1123,259 @@ const studioEls = {
   seconds: document.getElementById('studioSeconds'),
   voice: document.getElementById('studioVoice'),
   go: document.getElementById('studioGo'),
+  planOnly: document.getElementById('studioPlanOnly'),
   hint: document.getElementById('studioHint'),
   plan: document.getElementById('studioPlan'),
+  raw: document.getElementById('studioRaw'),
   video: document.getElementById('studioVideo'),
+  editCard: document.getElementById('studioEditCard'),
+  editMeta: document.getElementById('studioEditMeta'),
+  sceneList: document.getElementById('sceneList'),
+  sceneAdd: document.getElementById('sceneAdd'),
+  render: document.getElementById('studioRender'),
+  sceneHint: document.getElementById('sceneHint'),
 };
+
+/**
+ * 分镜的唯一真相：这个数组。DOM 只是它的投影。
+ * 输入事件直接改数组元素、只刷新顶部那行总时长 —— 绝不整块重建，
+ * 否则每敲一个字 innerHTML 重来一次，光标会跳回开头。
+ * 只有「场次增减 / 换了一份新分镜」才重排 DOM。
+ */
+let studioScenes = [];
+let studioTitle = '';
+let studioBusy = false;
+
+// 分镜里的 bg 允许缺，但 <input type="color"> 必须有个值，所以给一套兜底色
+const SCENE_BG_FALLBACK = { c0: '#0b1a3a', c1: '#ff7a3d' };
+const SCENE_SECONDS_MIN = 2;
+const SCENE_SECONDS_MAX = 6;
+const SCENE_GAP_SECONDS = 0.4; // studio 里相邻两场留的淡入淡出重叠
+
+/** 场秒数夹到 2~6：模型偶尔会写 1.5 或 8，别让它把总时长算歪。 */
+function sceneSeconds(scene) {
+  const n = Number(scene && scene.seconds);
+  if (!Number.isFinite(n)) return SCENE_SECONDS_MIN;
+  return Math.min(SCENE_SECONDS_MAX, Math.max(SCENE_SECONDS_MIN, n));
+}
+
+/** 总时长 = 各场之和 − 0.4×(场数−1)，和 studio 的算法保持一致。 */
+function sceneTotalSeconds() {
+  const count = studioScenes.length;
+  if (!count) return 0;
+  const sum = studioScenes.reduce((acc, s) => acc + sceneSeconds(s), 0);
+  const total = sum - SCENE_GAP_SECONDS * (count - 1);
+  return Math.max(0, Math.round(total * 10) / 10);
+}
+
+/** 服务端分镜 → 内存数组。image / motion 可能是 null，统一成空串给控件用。 */
+function scenesFromPlan(plan) {
+  const list = Array.isArray(plan && plan.scenes) ? plan.scenes : [];
+  return list.map((s) => {
+    const bg = (s && s.bg) || {};
+    return {
+      text: String((s && s.text) || ''),
+      narration: String((s && s.narration) || ''),
+      seconds: sceneSeconds(s),
+      c0: String(bg.c0 || ''),
+      c1: String(bg.c1 || ''),
+      image: s && s.image ? String(s.image) : '',
+      motion: s && s.motion ? String(s.motion) : '',
+    };
+  });
+}
+
+/** 内存数组 → 交给 studio 的 plan。空的 image / motion 发 null，别把空串塞给 ffmpeg。 */
+function planFromScenes() {
+  const scenes = studioScenes.map((s) => ({
+    text: String(s.text || '').trim(),
+    narration: String(s.narration || '').trim(),
+    seconds: sceneSeconds(s),
+    bg: {
+      c0: s.c0 || SCENE_BG_FALLBACK.c0,
+      c1: s.c1 || SCENE_BG_FALLBACK.c1,
+    },
+    image: String(s.image || '').trim() || null,
+    motion: s.motion || null,
+  }));
+  return { title: studioTitle, totalSeconds: sceneTotalSeconds(), scenes };
+}
+
+/** 造一个 label + 控件。一场 7 个控件，手写七遍太啰嗦。 */
+function sceneField(labelText, control, className) {
+  const label = document.createElement('label');
+  label.className = className ? `field ${className}` : 'field';
+  const span = document.createElement('span');
+  span.textContent = labelText;
+  label.append(span, control);
+  return label;
+}
+
+/** data-field 是事件委托的钩子：input 事件靠它知道改的是哪一栏。 */
+function sceneInput(type, field, value, className) {
+  const el = document.createElement('input');
+  el.type = type;
+  el.dataset.field = field;
+  if (className) el.className = className;
+  el.value = value == null ? '' : String(value);
+  return el;
+}
+
+function sceneMotionSelect(value) {
+  const select = document.createElement('select');
+  select.dataset.field = 'motion';
+  const options = [
+    ['', '（不指定）'],
+    ['zoom-in', 'zoom-in'],
+    ['zoom-out', 'zoom-out'],
+    ['pan-left', 'pan-left'],
+    ['pan-right', 'pan-right'],
+  ];
+  for (const [val, label] of options) {
+    const option = document.createElement('option');
+    option.value = val;
+    option.textContent = label;
+    select.append(option);
+  }
+  select.value = value || '';
+  return select;
+}
+
+/** 整块重建。只在增删场次 / 换新分镜时调用，输入过程中不走这里。 */
+function renderSceneList() {
+  if (!studioEls.sceneList) return;
+  studioEls.sceneList.textContent = '';
+  if (!studioScenes.length) {
+    const tip = document.createElement('p');
+    tip.className = 'muted';
+    tip.textContent = '还没有分镜：先点上面的「只写分镜」，或者「加一场」手写一场。';
+    studioEls.sceneList.append(tip);
+    return;
+  }
+
+  studioScenes.forEach((scene, index) => {
+    const row = document.createElement('div');
+    row.className = 'scene';
+    row.dataset.index = String(index);
+
+    const head = document.createElement('div');
+    head.className = 'scene-head';
+    const no = document.createElement('span');
+    no.className = 'scene-no';
+    no.textContent = `第 ${index + 1} 场`;
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'scene-del';
+    del.textContent = '删除这场';
+    head.append(no, del);
+    row.append(head);
+
+    row.append(sceneField('画面上的字', sceneInput('text', 'text', scene.text, 'scene-text')));
+    row.append(sceneField('旁白（可空，会念出来）', sceneInput('text', 'narration', scene.narration, 'scene-narration')));
+
+    const grid = document.createElement('div');
+    grid.className = 'scene-grid';
+    const seconds = sceneInput('number', 'seconds', sceneSeconds(scene), 'scene-seconds');
+    seconds.min = String(SCENE_SECONDS_MIN);
+    seconds.max = String(SCENE_SECONDS_MAX);
+    seconds.step = '0.5';
+    grid.append(sceneField('秒数 2~6', seconds, 'small'));
+    grid.append(sceneField('底色', sceneInput('color', 'c0', scene.c0 || SCENE_BG_FALLBACK.c0, 'scene-c0'), 'small'));
+    grid.append(sceneField('渐变色', sceneInput('color', 'c1', scene.c1 || SCENE_BG_FALLBACK.c1, 'scene-c1'), 'small'));
+
+    const image = sceneInput('text', 'image', scene.image, 'scene-image');
+    image.placeholder = '可空，比如 sunset.jpg';
+    grid.append(sceneField('图片', image));
+
+    grid.append(sceneField('运动', sceneMotionSelect(scene.motion), 'small'));
+    row.append(grid);
+
+    studioEls.sceneList.append(row);
+  });
+}
+
+/** 顶部那行：标题 + 场数 + 总时长。编辑时只动这行字，不动输入框，所以光标不跳。 */
+function updateSceneMeta() {
+  if (!studioEls.editMeta) return;
+  const count = studioScenes.length;
+  if (!count) {
+    studioEls.editMeta.textContent = studioTitle ? `《${studioTitle}》· 还没有分镜` : '还没有分镜';
+    return;
+  }
+  const title = studioTitle ? `《${studioTitle}》` : '未命名';
+  studioEls.editMeta.textContent = `${title} · ${count} 场 · 总时长 ${sceneTotalSeconds().toFixed(1)} 秒`;
+}
+
+/**
+ * 输入事件（input / change 共用）：用 target 找到那一行，直接改数组元素。
+ * 不重排 DOM，只 updateSceneMeta —— 这是全文最重要的一行约束。
+ */
+function onSceneEdit(event) {
+  const control = event.target.closest('[data-field]');
+  if (!control) return;
+  const row = control.closest('.scene');
+  if (!row) return;
+  const scene = studioScenes[Number(row.dataset.index)];
+  if (!scene) return;
+
+  const field = control.dataset.field;
+  if (field === 'seconds') {
+    // 输入过程中不夹紧（想打 5 先被改成 2 会没法打字），失焦(change)时再收一下
+    const n = Number(control.value);
+    if (control.value !== '' && Number.isFinite(n)) scene.seconds = n;
+    if (event.type === 'change') {
+      scene.seconds = sceneSeconds(scene);
+      control.value = String(scene.seconds);
+    }
+  } else {
+    scene[field] = control.value;
+  }
+
+  // 用户一动手，上面那份服务端写的纯文本分镜就过时了：清掉（.plan:empty 会自动隐藏）
+  if (studioEls.plan && studioEls.plan.textContent) studioEls.plan.textContent = '';
+  updateSceneMeta();
+}
+
+/** 场次少了/多了才重排 DOM，所以删除走完整的 renderSceneList。 */
+function onSceneListClick(event) {
+  const del = event.target.closest('.scene-del');
+  if (!del) return;
+  const row = del.closest('.scene');
+  if (!row) return;
+  const index = Number(row.dataset.index);
+  if (!Number.isFinite(index)) return;
+  studioScenes.splice(index, 1);
+  renderSceneList();
+  updateSceneMeta();
+}
+
+function addScene() {
+  studioScenes.push({
+    text: '',
+    narration: '',
+    seconds: 3,
+    c0: SCENE_BG_FALLBACK.c0,
+    c1: SCENE_BG_FALLBACK.c1,
+    image: '',
+    motion: '',
+  });
+  renderSceneList();
+  updateSceneMeta();
+  // 新加的一场直接把光标放进去，省一次点击
+  const texts = studioEls.sceneList ? studioEls.sceneList.querySelectorAll('.scene-text') : [];
+  if (texts.length) texts[texts.length - 1].focus();
+}
+
+/** 拿到分镜就铺到编辑区：默认隐藏的那张卡片在这里露出来。 */
+function showScenes(plan) {
+  if (!plan) return;
+  studioTitle = String(plan.title || '');
+  studioScenes = scenesFromPlan(plan);
+  renderStudioPlan(plan);
+  if (studioEls.editCard) studioEls.editCard.classList.remove('hidden');
+  renderSceneList();
+  updateSceneMeta();
+}
 
 function renderStudioPlan(plan) {
   if (!studioEls.plan || !plan) return;
@@ -1127,6 +1387,64 @@ function renderStudioPlan(plan) {
   studioEls.plan.textContent = lines.join('\n');
 }
 
+/** 忙的时候三个动作按钮一起锁：写分镜 / 重渲 / 一键出片 是互斥的。 */
+function setStudioBusy(on) {
+  studioBusy = Boolean(on);
+  [studioEls.go, studioEls.planOnly, studioEls.render].forEach((el) => {
+    if (el) el.disabled = studioBusy;
+  });
+}
+
+/** 失败一律说清 error；模型吐了 raw 也贴出来，方便看是哪里不合格式。 */
+function studioFailure(r, hintEl) {
+  const reason = (r && (r.error || r.message)) || '未知原因';
+  if (hintEl) hintEl.textContent = '没做成：' + reason;
+  if (!studioEls.raw) return;
+  const raw = r && (r.raw || r.detail);
+  if (raw) {
+    studioEls.raw.textContent = '模型返回：' + String(raw).slice(0, 2000);
+    studioEls.raw.classList.remove('hidden');
+  } else {
+    studioEls.raw.textContent = '';
+    studioEls.raw.classList.add('hidden');
+  }
+}
+
+/**
+ * 面板自己的 JSON POST：非 2xx 也要把 body 读出来。
+ * apiJson 在 4xx/5xx 时直接返回 null，代理写在 body 里的真正原因
+ * （studio 没起、分镜不合法、模型吐的 raw）就全丢了，界面只剩「未知原因」。
+ */
+async function studioPost(url, payload) {
+  const res = await apiFetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (res.status === 401) {
+    handleUnauthorized('会话过期，请重新登录');
+    return { ok: false, error: '登录已过期，请重新登录' };
+  }
+  const data = await res.json().catch(() => null);
+  return data || { ok: false, error: `面板回了 HTTP ${res.status}` };
+}
+
+/** 渲染成功：<video> 走不可猜的 jobId，体积/时长/旁白条数照旧报出来。 */
+function studioRenderOk(r, hintEl, prefix) {
+  if (!r || !r.jobId) {
+    studioFailure(r, hintEl);
+    return;
+  }
+  studioEls.video.src = `/api/studio/video?id=${encodeURIComponent(r.jobId)}`;
+  studioEls.video.classList.remove('hidden');
+  const mb = typeof r.bytes === 'number' ? (r.bytes / 1048576).toFixed(1) : '?';
+  const ms = Number(r.ms) || 0;
+  const took = ms > 0 ? (ms / 1000).toFixed(1) + ' 秒' : '?';
+  if (hintEl) {
+    hintEl.textContent = `${prefix}${r.seconds} 秒 / ${mb} MB / 旁白 ${r.narrationCount} 条 / 用时 ${took}`;
+  }
+}
+
 async function studioCreate() {
   if (!studioEls.go) return;
   const prompt = studioEls.prompt.value.trim();
@@ -1134,37 +1452,90 @@ async function studioCreate() {
     studioEls.hint.textContent = '先写一句想要什么';
     return;
   }
-  studioEls.go.disabled = true;
+  setStudioBusy(true);
   studioEls.video.classList.add('hidden');
   studioEls.plan.textContent = '';
   studioEls.hint.textContent = '它正在写分镜…（写完会用 ffmpeg 渲染，约 15~40 秒）';
   try {
-    const r = await apiJson('/api/studio/create', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        prompt,
-        seconds: Number(studioEls.seconds.value) || 12,
-        voice: studioEls.voice.value,
-      }),
+    const r = await studioPost('/api/studio/create', {
+      prompt,
+      seconds: Number(studioEls.seconds.value) || 12,
+      voice: studioEls.voice.value,
     });
-    if (!r || !r.ok) {
-      studioEls.hint.textContent = '没做成：' + ((r && r.error) || '未知原因') +
-        (r && r.raw ? '\n模型返回：' + String(r.raw).slice(0, 300) : '');
-      return;
-    }
-    renderStudioPlan(r.plan);
-    studioEls.video.src = `/api/studio/video?id=${encodeURIComponent(r.jobId)}`;
-    studioEls.video.classList.remove('hidden');
-    studioEls.hint.textContent = `做好了：${r.seconds} 秒 / ${(r.bytes / 1048576).toFixed(1)} MB / 旁白 ${r.narrationCount} 条 / 渲染 ${(r.ms / 1000).toFixed(1)} 秒`;
+    if (!r || !r.ok) return studioFailure(r, studioEls.hint);
+    studioRenderOk(r, studioEls.hint, '做好了：');
+    // 一键出片之后也铺一份可编辑分镜：想改一句再重渲，不用从头描述一遍
+    showScenes(r.plan);
   } catch (err) {
     studioEls.hint.textContent = '出错：' + (err && err.message || err);
   } finally {
-    studioEls.go.disabled = false;
+    setStudioBusy(false);
+  }
+}
+
+/** 只写分镜：不渲染，先把可编辑的东西拿到手（花几秒而不是几十秒）。 */
+async function studioMakePlan() {
+  if (studioBusy) return;
+  const prompt = studioEls.prompt.value.trim();
+  if (!prompt) {
+    studioEls.hint.textContent = '先写一句想要什么';
+    return;
+  }
+  setStudioBusy(true);
+  if (studioEls.raw) studioEls.raw.classList.add('hidden');
+  studioEls.hint.textContent = '正在写分镜…（只写不渲染，几秒就好）';
+  try {
+    const r = await studioPost('/api/studio/plan', {
+      prompt,
+      seconds: Number(studioEls.seconds.value) || 12,
+    });
+    if (!r || !r.ok) return studioFailure(r, studioEls.hint);
+    showScenes(r.plan);
+    studioEls.hint.textContent = '分镜写好了：下面每一场都能改，改完点「重新渲染」。';
+  } catch (err) {
+    studioEls.hint.textContent = '出错：' + (err && err.message || err);
+  } finally {
+    setStudioBusy(false);
+  }
+}
+
+/** 用改过的分镜重渲。整段重渲（ffmpeg 没有片段替换），所以老老实实等 15~40 秒。 */
+async function studioRenderPlan() {
+  if (studioBusy) return;
+  if (!studioScenes.length) {
+    studioEls.sceneHint.textContent = '分镜是空的：先点「只写分镜」，或者「加一场」。';
+    return;
+  }
+  if (!studioScenes.some((s) => String(s.text || '').trim() || String(s.narration || '').trim())) {
+    studioEls.sceneHint.textContent = '每场都空着，渲出来会是纯色块；先写点字。';
+    return;
+  }
+  const plan = planFromScenes();
+  setStudioBusy(true);
+  if (studioEls.raw) studioEls.raw.classList.add('hidden');
+  // 旧成片先留着：这次要是失败，用户手里至少还有上一版能看
+  studioEls.sceneHint.textContent = '渲染中…约 15~40 秒';
+  try {
+    const r = await studioPost('/api/studio/render', { plan, voice: studioEls.voice.value });
+    if (!r || !r.ok) return studioFailure(r, studioEls.sceneHint);
+    studioRenderOk(r, studioEls.sceneHint, '重新渲染好了：');
+  } catch (err) {
+    studioEls.sceneHint.textContent = '出错：' + (err && err.message || err);
+  } finally {
+    setStudioBusy(false);
   }
 }
 
 if (studioEls.go) studioEls.go.addEventListener('click', studioCreate);
+if (studioEls.planOnly) studioEls.planOnly.addEventListener('click', studioMakePlan);
+if (studioEls.render) studioEls.render.addEventListener('click', studioRenderPlan);
+if (studioEls.sceneAdd) studioEls.sceneAdd.addEventListener('click', addScene);
+if (studioEls.sceneList) {
+  // 事件委托：行是动态生成的，绑一次就够。input 直接改数组，不重建 DOM。
+  studioEls.sceneList.addEventListener('input', onSceneEdit);
+  studioEls.sceneList.addEventListener('change', onSceneEdit);
+  studioEls.sceneList.addEventListener('click', onSceneListClick);
+}
 
 function setProgress(frac) {
   if (!videoEls.progress || !videoEls.bar) return;
@@ -1357,3 +1728,96 @@ async function boot() {
 
 setInterval(refreshHealth, 15000);
 boot();
+
+// ------------------------------------------------------------- 表情包 ----
+// 发一张表情不经过模型：只 POST 一条消息进历史，然后把气泡插到聊天里。
+// 这样它和"说话"是两条路，表情不会被模型改写，也不会多花 token。
+
+const stickerEls = {
+  btn: document.getElementById('stickerBtn'),
+  panel: document.getElementById('stickerPanel'),
+  grid: document.getElementById('stickerGrid'),
+  search: document.getElementById('stickerSearch'),
+  close: document.getElementById('stickerClose'),
+  hint: document.getElementById('stickerHint'),
+};
+
+let stickerList = [];
+let stickerQuery = '';
+let stickerTimer = null;
+
+function renderStickerGrid(items) {
+  if (!stickerEls.grid) return;
+  stickerEls.grid.innerHTML = '';
+  if (!items.length) {
+    stickerEls.hint.textContent = '没找到，换个词试试';
+    return;
+  }
+  stickerEls.hint.textContent = `共 ${items.length} 张 · 点一张直接发出去`;
+  for (const it of items) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'sticker-cell';
+    btn.title = it.mood || it.name || it.id;
+    const img = document.createElement('img');
+    img.loading = 'lazy';
+    img.src = `/api/stickers/gif?id=${encodeURIComponent(it.id)}`;
+    img.alt = it.mood || '';
+    btn.appendChild(img);
+    btn.addEventListener('click', () => sendSticker(it, btn));
+    stickerEls.grid.appendChild(btn);
+  }
+}
+
+async function loadStickers(q) {
+  stickerQuery = q || '';
+  if (stickerEls.hint) stickerEls.hint.textContent = '正在找…';
+  try {
+    const data = await apiJson(`/api/stickers?q=${encodeURIComponent(stickerQuery)}&limit=60`);
+    if (!data || !data.ok) {
+      stickerEls.hint.textContent = '表情包服务没响应（模块可能没起）';
+      return;
+    }
+    stickerList = Array.isArray(data.items) ? data.items : [];
+    renderStickerGrid(stickerList);
+  } catch (err) {
+    stickerEls.hint.textContent = '加载失败：' + (err && err.message || err);
+  }
+}
+
+async function sendSticker(item, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const r = await apiJson('/api/stickers/send', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: item.id, mood: item.mood, name: item.name }),
+    });
+    if (!r || !r.ok) {
+      stickerEls.hint.textContent = '没发出去：' + ((r && r.error) || '未知原因');
+      return;
+    }
+    addMessage('user', `[表情] ${item.mood || item.name || ''}`, '', { sticker: item.id });
+    toggleStickerPanel(false);
+  } catch (err) {
+    stickerEls.hint.textContent = '发送失败：' + (err && err.message || err);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function toggleStickerPanel(show) {
+  if (!stickerEls.panel) return;
+  const next = show === undefined ? stickerEls.panel.classList.contains('hidden') : show;
+  stickerEls.panel.classList.toggle('hidden', !next);
+  if (next) loadStickers(stickerQuery);
+}
+
+if (stickerEls.btn) stickerEls.btn.addEventListener('click', () => toggleStickerPanel());
+if (stickerEls.close) stickerEls.close.addEventListener('click', () => toggleStickerPanel(false));
+if (stickerEls.search) {
+  stickerEls.search.addEventListener('input', () => {
+    clearTimeout(stickerTimer);
+    stickerTimer = setTimeout(() => loadStickers(stickerEls.search.value.trim()), 300);
+  });
+}
