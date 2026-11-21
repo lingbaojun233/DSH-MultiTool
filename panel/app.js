@@ -684,7 +684,7 @@ async function sendWithVideo(text) {
     const data = await apiJson('/api/video/analyze-file', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ uploadId: up.uploadId, text, frames: 8 }),
+      body: JSON.stringify({ uploadId: up.uploadId, text, frames: 6 }),
     });
     pending.remove();
 
