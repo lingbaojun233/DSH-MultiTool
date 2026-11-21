@@ -95,7 +95,22 @@ const server = http.createServer(async (req, res) => {
     if (!text.trim()) return json(res, 400, { ok: false, error: 'text is required' });
 
     // 身份必须在最前面校验：没有有效会话就不进入模型
-    const session = await verifyUser(req.headers.authorization || '');
+    let session = await verifyUser(req.headers.authorization || '');
+    if (!session) {
+      // 内部服务通道：插件（在 DSH 进程里）拿不到用户 token，
+      // 但 studio 这类"服务替模型去调 io"的场景必须能用。
+      // 只认回环 + 共享密钥，且用户 id 由调用方给出 —— 公网拿不到这个密钥。
+      const secret = process.env.DSH_INTERNAL_TOKEN || '';
+      const presented = String(req.headers['x-dsh-internal'] || '');
+      const fromLoopback = String(req.socket && req.socket.remoteAddress || '').replace(/^::ffff:/, '') === '127.0.0.1';
+      if (secret && presented === secret && fromLoopback) {
+        const uid = Number(req.headers['x-dsh-user'] || payload.userId || 0);
+        if (Number.isInteger(uid) && uid > 0) {
+          session = { user: { id: uid, username: `tool#${uid}`, displayName: '工具', role: 'service' } };
+          log(`internal call accepted for user #${uid}`);
+        }
+      }
+    }
     if (!session) {
       return json(res, 401, { ok: false, code: 'E_UNAUTHORIZED', message: '需要登录（Authorization: Bearer <token>）' });
     }
@@ -107,6 +122,7 @@ const server = http.createServer(async (req, res) => {
       history: Array.isArray(payload.history) ? payload.history.slice(-8) : undefined,
       counterpart: payload.counterpart || undefined,
       stickers: Array.isArray(payload.stickers) ? payload.stickers.slice(0, 80) : undefined,
+      attachments: Array.isArray(payload.attachments) ? payload.attachments.slice(0, 10) : undefined,
       session,
     });
 

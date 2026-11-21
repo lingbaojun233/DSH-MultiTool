@@ -48,6 +48,8 @@ const CFG = Object.assign({
 }, readJson(path.join(DIR, 'config.json'), {}));
 
 if (!CFG.projectDir) CFG.projectDir = path.join(CFG.outDir, 'projects');
+// 内部服务令牌：插件替模型调 io 时用（插件没有用户 token）
+if (!CFG.internalToken) CFG.internalToken = process.env.DSH_INTERNAL_TOKEN || '';
 
 // 图片素材目录：分镜里 image 只是文件名时，render.js 要去某个目录下找图。
 // 必须放在 CFG 合并之后补默认值 —— 默认值依赖 CFG.outDir，而 config.json 可能改了 outDir。
@@ -641,6 +643,21 @@ async function renderProject(project, opts = {}, scope = 'auto') {
   }
 }
 
+/**
+ * 调 io 的身份头。
+ * 面板直连时带用户 token；插件（在 DSH 进程里，只有服务身份）调过来时没有 token，
+ * 就用内部令牌 + 它传的 x-dsh-user —— 否则 make_plan/make_video 必然 E_UNAUTHORIZED。
+ */
+function ioAuthHeaders(req, userId) {
+  const headers = { authorization: String((req && req.headers && req.headers.authorization) || '') };
+  if (CFG.internalToken) {
+    headers['x-dsh-internal'] = CFG.internalToken;
+    const uid = Number((req && req.headers && req.headers['x-dsh-user']) || userId || 0);
+    if (Number.isInteger(uid) && uid > 0) headers['x-dsh-user'] = String(uid);
+  }
+  return headers;
+}
+
 // ------------------------------------------------------------------ routes --
 
 const server = http.createServer(async (req, res) => {
@@ -734,7 +751,7 @@ const server = http.createServer(async (req, res) => {
       if (!prompt) return json(res, 400, { ok: false, error: 'PROMPT_REQUIRED' });
       const io = await postJson(`${CFG.ioUrl}/v1/input`,
         { text: buildPlanPrompt(prompt, body), sessionId: 'studio-plan' },
-        { authorization: String(req.headers.authorization || '') },
+        ioAuthHeaders(req),
         CFG.planTimeoutMs);
       if (!io.data || !io.data.ok) {
         return json(res, 200, { ok: false, step: 'plan', error: (io.data && (io.data.error || io.data.code)) || `io HTTP ${io.status}` });
@@ -760,7 +777,7 @@ const server = http.createServer(async (req, res) => {
       if (!prompt) return json(res, 400, { ok: false, error: 'PROMPT_REQUIRED' });
       const io = await postJson(`${CFG.ioUrl}/v1/input`,
         { text: buildPlanPrompt(prompt, body), sessionId: 'studio-plan' },
-        { authorization: String(req.headers.authorization || '') },
+        ioAuthHeaders(req),
         CFG.planTimeoutMs);
       if (!io.data || !io.data.ok) {
         return json(res, 200, { ok: false, step: 'plan', error: (io.data && (io.data.error || io.data.code)) || `io HTTP ${io.status}` });

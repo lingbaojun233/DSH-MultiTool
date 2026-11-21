@@ -234,7 +234,37 @@ function stickerBlock(stickers) {
   return lines.join('\n');
 }
 
-function composePrompt({ catalog, persona, user, history, task, stickers }) {
+/**
+ * 附件说明块。
+ *
+ * 为什么不让面板自己"处理"文件：不同文件该用不同工具 —— 视频要 watch、音频要 hear、
+ * 图片要先看一眼再说话。把这些决策交给模型，比在面板里写死 if-else 更灵活，
+ * 也不会因为新加一种文件类型就要改前端。
+ *
+ * 面板只负责把文件落到服务器并告诉这里"这是什么、路径在哪"。
+ */
+function attachmentBlock(attachments) {
+  const list = Array.isArray(attachments) ? attachments.filter((a) => a && (a.path || a.name)) : [];
+  if (!list.length) return '';
+  const lines = ['[附件 · 用户这一条消息里带了文件]'];
+  for (const a of list) {
+    const kind = String(a.kind || 'other');
+    const name = String(a.name || '').slice(0, 80);
+    const p = String(a.path || '').slice(0, 240);
+    let hint = '';
+    if (kind === 'video') hint = '→ 想知道内容就调用 watch（filePath 传这个路径）';
+    else if (kind === 'audio') hint = '→ 想听内容就调用 hear；只要文字用 transcribe';
+    else if (kind === 'image') hint = a.description ? '→ 已经有人看过这张图，描述见下' : '→ 你看不到像素，只能凭文件名/描述说';
+    else if (kind === 'text') hint = '→ 可以直接读这个文本文件';
+    else hint = '→ 这种格式你看不了内容，只能凭文件名说，必要时让用户转成可读格式';
+    lines.push(`- ${name}（${kind}）${p ? '：' + p : ''} ${hint}`);
+    if (a.description) lines.push(`  画面描述：${String(a.description).slice(0, 200)}`);
+  }
+  lines.push('回复时不要罗列路径，就当自己已经看到了这些文件。');
+  return lines.join('\n');
+}
+
+function composePrompt({ catalog, persona, user, history, task, stickers, attachments }) {
   const sections = [];
 
   if (catalog) sections.push(catalog);
@@ -246,6 +276,9 @@ function composePrompt({ catalog, persona, user, history, task, stickers }) {
 
   const stickerText = stickerBlock(stickers);
   if (stickerText) sections.push(stickerText);
+
+  const attachText = attachmentBlock(attachments);
+  if (attachText) sections.push(attachText);
 
   if (Array.isArray(history) && history.length) {
     const lines = ['[最近对话 · 用于理解指代与言外之意]'];
@@ -372,6 +405,7 @@ async function run(task, options = {}) {
     history: options.history,
     task,
     stickers: options.stickers,
+    attachments: options.attachments,
   });
   // 成本可见性：每轮都记下输入/输出 token，否则"一次对话多少钱"只能靠猜。
   const promptTokens = estimateTokens(promptText);
