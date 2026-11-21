@@ -674,6 +674,22 @@ const handler = async (req, res) => {
       const id = String(body.id || '');
       if (!/^[0-9a-f]{6,40}$/i.test(id)) return sendJson(res, 400, { ok: false, error: 'BAD_ID' });
       const label = String(body.mood || body.name || '表情').slice(0, 40);
+
+      // 有表情名就用名字（快）；没名字或用户勾了"看图"才花一次视觉调用。
+      // 外部传进来的 GIF 本来就没有名字，靠这条路径识字。
+      let seen = '';
+      const wantsLook = body.look === true || !String(body.mood || '').trim();
+      if (wantsLook) {
+        try {
+          const d = await fetch(`${STICKER_BASE}/v1/describe?id=${encodeURIComponent(id)}`,
+            { signal: AbortSignal.timeout(90000) });
+          const dj = await d.json().catch(() => null);
+          if (dj && dj.ok && dj.description) seen = String(dj.description).slice(0, 160);
+        } catch (err) {
+          log(`sticker describe failed: ${err.message}`);
+        }
+      }
+
       appendHistory(user.id, {
         role: 'user',
         text: `[表情] ${label}`,
@@ -681,9 +697,11 @@ const handler = async (req, res) => {
         ts: Date.now(),
       });
 
-      // 把"我发了什么图"翻译成模型能读的一句话。图本身进不了上下文，
-      // 但表情名是语义标签，足够它接话。
-      const prompt = `（我发了一张表情包，表情叫「${label}」。就当我发了这张图，自然地接一句，别说你看到的是文字。）`;
+      // 把"我发了什么图"翻译成模型能读的一句话。有画面描述就优先用它，
+      // 否则退回到表情名 —— 名字是语义标签，也足够接话。
+      const prompt = seen
+        ? `（我发了一张表情包，画面上是：${seen}。就当我发了这张图，自然地接一句，别说你看到的是文字。）`
+        : `（我发了一张表情包，表情叫「${label}」。就当我发了这张图，自然地接一句，别说你看到的是文字。）`;
       const io = await postJson(IO_BASE, '/v1/input',
         { text: prompt, sessionId: 'panel' },
         { authorization: req.headers.authorization || '' }, 600000);
@@ -698,11 +716,12 @@ const handler = async (req, res) => {
           ts: Date.now(),
         });
       }
-      log(`sticker send id=${id} label=${label} reply=${reply ? 'yes' : 'no'} io=${io.status}`);
+      log(`sticker send id=${id} label=${label} look=${seen ? 'yes' : 'no'} reply=${reply ? 'yes' : 'no'} io=${io.status}`);
       return sendJson(res, 200, {
         ok: true,
         id,
         label,
+        seen,
         reply,
         ms: (io.data && io.data.ms) || null,
         ioOk: Boolean(io.data && io.data.ok),

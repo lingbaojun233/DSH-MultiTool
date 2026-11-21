@@ -16,6 +16,8 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
+const { spawn } = require('node:child_process');
 
 const DIR = __dirname;
 const HOST = '127.0.0.1';
@@ -29,10 +31,15 @@ const CFG = Object.assign({
   dataDir: 'C:\\Apps\\DSH-MultiTool\\data\\stickers',
   defaultLimit: 60,
   maxLimit: 200,
+  ffmpeg: 'C:\\Apps\\DSH-MultiTool\\tools\\ffmpeg\\bin\\ffmpeg.exe',
+  // 借视频模块的视觉能力（它持有 key，sticker 不该再存一份）
+  videoUrl: 'http://127.0.0.1:8769',
+  describeTimeoutMs: 60000,
 }, readJson(path.join(DIR, 'config.json'), {}));
 
 const SEND_DIR = path.join(CFG.dataDir, 'send');
 const CATALOG_FILE = path.join(CFG.dataDir, 'catalog.json');
+const DESCRIBE_FILE = path.join(CFG.dataDir, 'descriptions.json');
 
 function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}`;
@@ -41,6 +48,87 @@ function log(msg) {
     fs.mkdirSync(path.join(DIR, '..', 'logs'), { recursive: true });
     fs.appendFileSync(path.join(DIR, '..', 'logs', 'sticker.log'), line + '\n');
   } catch { }
+}
+
+// ---------------------------------------------------------------- 识图 ----
+
+/**
+ * 从 GIF 里抽一帧。优先取第 12 帧（约 0.8 秒，绕开开场白），
+ * 短图（不足 13 帧）就退回第一帧 —— 否则抽出来是空图，视觉模型会瞎猜。
+ */
+function extractFrame(gifPath, outPng) {
+  return new Promise((resolve) => {
+    const tryFrame = (vf, cb) => {
+      const args = ['-hide_banner', '-loglevel', 'error', '-y', '-i', gifPath];
+      if (vf) args.push('-vf', vf);
+      args.push('-frames:v', '1', outPng);
+      const child = spawn(CFG.ffmpeg, args, { windowsHide: true });
+      let err = '';
+      child.stderr.on('data', (d) => { err += d.toString('utf8'); });
+      child.on('error', (e) => cb(false, String(e && e.message || e)));
+      child.on('close', (code) => {
+        const ok = code === 0 && fs.existsSync(outPng) && fs.statSync(outPng).size > 1000;
+        cb(ok, err);
+      });
+    };
+    tryFrame('select=eq(n\\,12)', (ok, err1) => {
+      if (ok) return resolve({ ok: true, png: outPng });
+      tryFrame(null, (ok2, err2) => {
+        resolve({ ok: ok2, png: outPng, error: (err2 || err1 || '').slice(0, 200) });
+      });
+    });
+  });
+}
+
+function readDescriptions() {
+  return readJson(DESCRIBE_FILE, {}) || {};
+}
+
+/** 让视觉模型描述一张表情。结果按 id 缓存：同一张图不该反复花钱。 */
+async function describeSticker(id, force) {
+  const cache = readDescriptions();
+  if (!force && cache[id] && cache[id].text) {
+    return { ok: true, id, description: cache[id].text, cached: true, at: cache[id].at };
+  }
+  const gif = path.join(SEND_DIR, `${id}.gif`);
+  if (!fs.existsSync(gif)) return { ok: false, error: 'NOT_FOUND' };
+
+  const work = path.join(os.tmpdir(), `sticker-${id}-${Date.now()}.png`);
+  const frame = await extractFrame(gif, work);
+  if (!frame.ok) return { ok: false, error: 'FRAME_EXTRACT_FAILED', detail: frame.error };
+
+  let dataUrl;
+  try {
+    dataUrl = 'data:image/png;base64,' + fs.readFileSync(work).toString('base64');
+  } finally {
+    try { fs.unlinkSync(work); } catch { }
+  }
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), CFG.describeTimeoutMs);
+  try {
+    const res = await fetch(`${CFG.videoUrl}/v1/look`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        image: dataUrl,
+        prompt: '用一句中文描述这张表情图：里面画的是什么、什么情绪/动作、图上有没有字。不要客套，不超过 40 字。',
+      }),
+      signal: ctrl.signal,
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data || !data.ok || !data.description) {
+      return { ok: false, error: (data && data.error) || `look HTTP ${res.status}` };
+    }
+    cache[id] = { text: data.description, at: new Date().toISOString(), model: data.model || '' };
+    try { fs.writeFileSync(DESCRIBE_FILE, JSON.stringify(cache, null, 1), 'utf8'); } catch { }
+    log(`described ${id}: ${data.description}`);
+    return { ok: true, id, description: data.description, cached: false, model: data.model };
+  } catch (err) {
+    return { ok: false, error: String(err && err.message || err) };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ------------------------------------------------------------------ 目录 ----
@@ -239,6 +327,15 @@ const server = http.createServer(async (req, res) => {
       if (!scored.length) return json(res, 200, { ok: false, error: 'NO_MATCH', items: catalog.items.slice(0, 3) });
       const top = scored[0].it;
       return json(res, 200, { ok: true, sticker: top, candidates: scored.slice(0, 5).map((x) => x.it) });
+    }
+
+    // 识图：没有表情名（外部传来的图）时靠它，结果会缓存
+    if ((req.method === 'GET' || req.method === 'POST') && p === '/v1/describe') {
+      const id = String(url.searchParams.get('id') || '');
+      if (!/^[0-9a-f]{6,40}$/i.test(id)) return json(res, 400, { ok: false, error: 'BAD_ID' });
+      const force = url.searchParams.get('force') === '1';
+      const r = await describeSticker(id, force);
+      return json(res, 200, r);
     }
 
     if (req.method === 'GET' && p === '/v1/gif') {

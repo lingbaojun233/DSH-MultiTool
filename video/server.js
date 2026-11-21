@@ -110,6 +110,45 @@ function buildVideoPrompt(frameTimes, userText) {
   ].filter(Boolean).join('\n');
 }
 
+/** 看一张图（不是视频）。给没有自己 key 的模块复用视觉能力，比如表情包。 */
+async function lookAtImage(model, dataUrl, prompt) {
+  const body = {
+    model,
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: prompt },
+        { type: 'image_url', image_url: { url: dataUrl } },
+      ],
+    }],
+    max_tokens: 200,
+    temperature: 0.3,
+  };
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), CFG.requestTimeoutMs);
+  try {
+    const res = await fetch(`${CFG.gateway}/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${API_KEY}` },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    const text = await res.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch { }
+    if (!res.ok) {
+      return { ok: false, status: res.status, error: (data && data.error && data.error.message) || text.slice(0, 300) };
+    }
+    const answer = data && data.choices && data.choices[0] && data.choices[0].message
+      ? String(data.choices[0].message.content || '') : '';
+    return { ok: true, answer, usage: data.usage || null, model };
+  } catch (err) {
+    return { ok: false, status: 0, error: String(err && err.message || err) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function chatWithFrames(model, frames, userText) {
   const content = [{ type: 'text', text: buildVideoPrompt(frames.map((f) => f.t), userText) }];
   for (const f of frames) {
@@ -344,6 +383,26 @@ const server = http.createServer(async (req, res) => {
         hasKey: Boolean(API_KEY),
         ffmpeg: Boolean(ffmpegPath()),
         ytdlp: Boolean(ytdlpPath()),
+      });
+    }
+
+    // 通用"看一张图"，供表情包这类模块复用视觉能力（它们不持有 key）
+    if (req.method === 'POST' && p === '/v1/look') {
+      const body = JSON.parse(await readBody(req) || '{}');
+      let dataUrl = String(body.image || '');
+      if (!dataUrl.startsWith('data:image/')) {
+        return json(res, 400, { ok: false, error: 'IMAGE_REQUIRED' });
+      }
+      const prompt = String(body.prompt
+        || '用一句中文描述这张表情图：画的是什么、什么情绪、有没有字。不要客套，不超过 40 字。');
+      const model = String(body.model || CFG.model || 'qwen3.8-flash');
+      const r = await lookAtImage(model, dataUrl, prompt);
+      return json(res, 200, {
+        ok: r.ok,
+        description: r.ok ? String(r.answer || '').replace(/\s+/g, ' ').trim().slice(0, 200) : '',
+        model: r.model || model,
+        error: r.ok ? undefined : r.error,
+        usage: r.usage || null,
       });
     }
 

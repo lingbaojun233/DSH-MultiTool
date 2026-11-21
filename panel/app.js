@@ -1745,6 +1745,7 @@ const stickerEls = {
   search: document.getElementById('stickerSearch'),
   close: document.getElementById('stickerClose'),
   hint: document.getElementById('stickerHint'),
+  look: document.getElementById('stickerLook'),
 };
 
 let stickerList = [];
@@ -1792,12 +1793,13 @@ async function loadStickers(q) {
 
 async function sendSticker(item, btn) {
   if (btn) btn.disabled = true;
-  if (stickerEls.hint) stickerEls.hint.textContent = '发出去了，等它接话…';
+  const look = Boolean(stickerEls.look && stickerEls.look.checked);
+  if (stickerEls.hint) stickerEls.hint.textContent = look ? '先让它看一眼这张图…' : '发出去了，等它接话…';
   try {
     const r = await apiJson('/api/stickers/send', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ id: item.id, mood: item.mood, name: item.name }),
+      body: JSON.stringify({ id: item.id, mood: item.mood, name: item.name, look }),
     });
     if (!r || !r.ok) {
       stickerEls.hint.textContent = '没发出去：' + ((r && r.error) || '未知原因');
