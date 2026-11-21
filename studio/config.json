@@ -28,7 +28,11 @@
     "personaTimeoutMs":  6000,
     "defaultStyle":  "whiteboard",
     "textEdgeFade":  0.15,
-    "maxAiVideo": 2,
+    "maxAiVideo": 1,
+    "maxAiVideoNote":  "每条 AI 视频 100~400 秒（实测约 100 秒，排队/重试时到 400 秒）；默认一集 2 条",
+    "jobConcurrency":  1,
+    "defaultUserId":  1,
+    "aivideoImage":  false,
     "wanTimeoutMs":  480000,
     "wanKeyPath":  "C:\\Apps\\DSH-MultiTool\\secrets\\wan.key",
     "wanKeyJson":  "C:\\Apps\\DSH-MultiTool\\video\\secrets.json"

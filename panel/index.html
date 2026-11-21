@@ -85,33 +85,18 @@
       </div>
     </section>
 
-    <!-- 视频页：三种创作方式（写稿 / 分镜 / 全自动）共用一条操作栏 -->
+    <!-- 视频页：默认只有 输入框 + 时长 + 开始做 + 任务列表 -->
     <section id="view-video" class="view" role="tabpanel">
-      <div class="pane">
-        <p class="view-note muted">
-          做视频：人设决定音色、风格和说话的口气。三种做法都先出分镜，确认后再渲染。
-        </p>
-
-        <p class="studio-binding" id="studioBinding">正在读人设绑定…</p>
-
-        <div class="studio-tabs" role="tablist" aria-label="创作方式">
-          <button class="studio-tab active" data-mode="script" role="tab" aria-selected="true">写稿</button>
-          <button class="studio-tab" data-mode="scenes" role="tab" aria-selected="false">分镜</button>
-          <button class="studio-tab" data-mode="auto" role="tab" aria-selected="false">全自动</button>
-        </div>
-
-        <!-- 一、写稿：一段稿子 → 4~10 场分镜 -->
-        <section class="card studio-pane" id="paneScript">
-          <h2>写稿</h2>
-          <label class="field">
-            <span>稿子（尽量用原话，不改写成书面语）</span>
-            <textarea id="studioScript" class="studio-textarea" rows="8"
-              placeholder="导数是变化率。先看一条曲线，上面取两个点，连成一条割线……"></textarea>
-          </label>
-          <div class="row">
-            <label class="field small">
+      <div class="pane studio-root">
+        <!-- 一、想做什么：一个输入框干三种事，用户不用选 -->
+        <section class="card studio-hero">
+          <label class="studio-ask" for="studioInput">你想做什么视频？</label>
+          <textarea id="studioInput" class="studio-input" rows="3"
+            placeholder="一句话说个题目，比如「讲讲导数是什么」；也可以直接贴一整段稿子"></textarea>
+          <div class="studio-hero-foot">
+            <label class="studio-seconds">
               <span>时长</span>
-              <select id="scriptSeconds">
+              <select id="studioSeconds">
                 <option value="30">30 秒</option>
                 <option value="60" selected>60 秒</option>
                 <option value="90">90 秒</option>
@@ -119,79 +104,72 @@
                 <option value="180">180 秒</option>
               </select>
             </label>
-            <label class="field small">
-              <span>风格</span>
-              <select id="scriptStyle" class="studio-style"></select>
-            </label>
-            <label class="field small">
-              <span>音色</span>
-              <select id="scriptVoice" class="studio-voice"></select>
-            </label>
-            <button id="studioScriptGo" class="primary" type="button">生成分镜</button>
+            <button id="studioGo" class="primary studio-go" type="button">开始做</button>
           </div>
-          <p class="muted" id="studioScriptHint">拆成 4~10 场，每场的旁白尽量用你的原话。</p>
+          <!-- 可选参考图：一行小字，不占地方；有图才出现缩略图 -->
+          <div class="studio-ref">
+            <button id="studioRefBtn" class="studio-ref-btn" type="button">+ 参考图（可选）</button>
+            <span id="studioRefThumb" class="studio-ref-thumb hidden">
+              <img id="studioRefImg" alt="参考图">
+              <button id="studioRefClear" class="studio-ref-x" type="button" title="去掉这张图">×</button>
+            </span>
+            <span id="studioRefHint" class="studio-ref-hint muted">画面会参考这张图</span>
+          </div>
+          <p class="studio-hint muted" id="studioHint">一句话说题目就行；贴整段稿子也行，它自己看得出来。</p>
+          <p id="studioStartError" class="studio-error hidden" role="alert"></p>
         </section>
 
-        <!-- 二、分镜：用户自己填每一场，三层都能留空 -->
-        <section class="card studio-pane hidden" id="paneScenes">
-          <h2>分镜 <span class="muted" id="studioEditMeta">还没有分镜</span></h2>
-          <div id="sceneList" class="scene-list"></div>
-          <div class="scene-foot">
-            <button id="sceneAdd" class="ghost" type="button">加一场</button>
-            <button id="studioFill" class="ghost" type="button"
-              title="把每场的「画什么」翻译成 manim 代码，先不渲染">补全动画</button>
-            <span class="muted" id="sceneHint">每行都能改；「画什么」写清楚，动画才对得上。</span>
+        <!-- 二、高级：默认收起，只给想精细控制的人 -->
+        <section class="card studio-adv">
+          <button id="studioAdvToggle" class="studio-adv-toggle" type="button"
+            aria-expanded="false" aria-controls="studioAdvBody">高级 <span class="chev" aria-hidden="true"></span></button>
+          <div id="studioAdvBody" class="studio-adv-body hidden">
+            <p class="studio-adv-note">不改就是自动：人设决定音色+风格+语气</p>
+            <p class="studio-binding muted" id="studioBinding">正在读人设绑定…</p>
+            <div class="row studio-adv-row">
+              <label class="field small">
+                <span>风格</span>
+                <select id="studioStyle" class="studio-style"></select>
+              </label>
+              <label class="field small">
+                <span>音色</span>
+                <select id="studioVoice" class="studio-voice"></select>
+              </label>
+            </div>
+            <!-- AI 视频额度用完：写在高级区里，别让人选了才发现要降级 -->
+            <p class="studio-quota-note" id="studioQuotaNote">AI 视频额度已用完（12-03 16:00 UTC 重置）：选了「AI 视频」的场会降级成文字卡，建议用 manim 或文字卡。</p>
+            <!-- 分镜表格：保留改每一场的能力，但默认不展开 -->
+            <details id="studioScenesBox" class="studio-scenes-box">
+              <summary>分镜表格 · <span id="studioEditMeta" class="muted">还没有分镜</span></summary>
+              <div id="sceneList" class="scene-list"></div>
+              <div class="scene-foot">
+                <button id="sceneAdd" class="ghost" type="button">加一场</button>
+                <button id="studioFill" class="ghost" type="button"
+                  title="把每场的「画什么」翻译成动画代码，先不渲染">补全动画</button>
+                <span class="muted" id="sceneHint">每行都能改；改完回上面点「开始做」，就用你改过的分镜。</span>
+              </div>
+            </details>
           </div>
         </section>
 
-        <!-- 三、全自动：只给主题 -->
-        <section class="card studio-pane hidden" id="paneAuto">
-          <h2>全自动</h2>
-          <label class="field">
-            <span>想要什么样的</span>
-            <input id="studioPrompt" placeholder="比如：做一段 60 秒的短片，讲讲导数是什么" />
-          </label>
-          <div class="row">
-            <label class="field small">
-              <span>时长</span>
-              <select id="autoSeconds">
-                <option value="30">30 秒</option>
-                <option value="60" selected>60 秒</option>
-                <option value="90">90 秒</option>
-                <option value="120">120 秒</option>
-              </select>
-            </label>
-            <label class="field small">
-              <span>风格</span>
-              <select id="autoStyle" class="studio-style"></select>
-            </label>
-            <label class="field small">
-              <span>音色</span>
-              <select id="autoVoice" class="studio-voice"></select>
-            </label>
+        <!-- 三、任务：提交后立刻出现的卡片 + 可折叠的历史 -->
+        <section class="card studio-jobs-card">
+          <div class="studio-jobs-head">
+            <h2>任务</h2>
+            <button id="studioLibToggle" class="studio-lib-toggle" type="button"
+              aria-expanded="false" aria-controls="studioLibBody">历史 <span class="chev" aria-hidden="true"></span></button>
           </div>
-          <p class="muted" id="studioHint">给个主题，它自己写分镜并渲染。</p>
+          <div id="studioLibBody" class="studio-lib-body hidden">
+            <p class="studio-lib-note muted">点标题看分镜；「载入」把分镜放回高级区，改完再点「开始做」。</p>
+            <ul id="studioLibList" class="studio-lib-list"></ul>
+            <p class="studio-lib-empty muted hidden" id="studioLibEmpty">还没有存过的分镜。</p>
+          </div>
+          <div id="studioJobs" class="studio-jobs"></div>
+          <p class="studio-jobs-empty muted" id="studioJobsEmpty">还没有任务。上面写一句，点「开始做」，它就会出现在这里。</p>
         </section>
 
-        <!-- 结果与进度：三种方式共用 -->
-        <section class="card studio-result" id="studioResultCard">
-          <div id="studioProgress" class="studio-progress hidden">
-            <div class="studio-progress-bar"><i id="studioProgressFill"></i></div>
-            <span id="studioProgressText">渲染中…</span>
-          </div>
-          <div id="studioPlan" class="plan"></div>
-          <pre id="studioRaw" class="raw hidden"></pre>
-          <video id="studioVideo" class="studio-video hidden" controls preload="metadata"></video>
-          <p class="muted" id="studioResultHint"></p>
-          <a id="studioDownload" class="studio-download hidden" download>下载成片</a>
-        </section>
-
-        <!-- 三种模式共用底部一条操作栏 -->
-        <div class="studio-actionbar">
-          <button id="studioPreview" class="ghost" type="button">预览分镜</button>
-          <button id="studioRender" class="primary" type="button">渲染</button>
-          <span class="muted" id="studioEstimate">预计：0 场 / 0 秒</span>
-        </div>
+        <!-- 参考图：首屏和分镜行共用这一个文件选择框（data-target 决定挂给谁） -->
+        <input id="studioImageInput" type="file" accept="image/*" hidden />
       </div>
     </section>
 
@@ -216,6 +194,26 @@
       </div>
     </section>
   </main>
+
+  <!-- 分镜表情选择器：给"某一场"挑 GIF 表情（和聊天那个表情面板互不影响） -->
+  <div id="sceneStickerModal" class="sticker-modal hidden" role="dialog" aria-modal="true"
+    aria-labelledby="sceneStickerTitle" aria-hidden="true">
+    <div class="sticker-modal-card">
+      <div class="sticker-modal-head">
+        <span id="sceneStickerTitle">挑个表情</span>
+        <button id="sceneStickerClose" class="iconbtn" type="button" title="关掉">✕</button>
+      </div>
+      <div class="sticker-head">
+        <input id="sceneStickerSearch" placeholder="找个表情：笑 / 困 / 停止工作" spellcheck="false" />
+      </div>
+      <div class="sticker-tabs" role="tablist" aria-label="表情分类">
+        <button id="sceneStickerTabAll" class="sticker-tab active" type="button" role="tab" aria-selected="true">全部</button>
+        <button id="sceneStickerTabFav" class="sticker-tab" type="button" role="tab" aria-selected="false">收藏</button>
+      </div>
+      <div id="sceneStickerGrid" class="sticker-grid scene-sticker-grid"></div>
+      <p id="sceneStickerHint" class="muted"></p>
+    </div>
+  </div>
 
   <!-- 登录/注册浮层：未登录时盖住整个面板，不能跳过 -->
   <div id="authOverlay" class="auth-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="authTitle" aria-hidden="true">

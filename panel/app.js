@@ -842,7 +842,13 @@ function uploadFile(item, onProgress) {
       let data = null;
       try { data = JSON.parse(xhr.responseText); } catch { }
       if (!data) return reject(new Error('服务器返回不是 JSON'));
-      if (!data.ok) return reject(new Error(data.error || `HTTP ${xhr.status}`));
+      if (!data.ok) {
+        // 把状态码和错误码带回去：调用方要区分"没登录"和"文件太大"
+        const err = new Error(data.error || `HTTP ${xhr.status}`);
+        err.status = xhr.status;
+        err.code = String(data.code || '');
+        return reject(err);
+      }
       resolve(data);
     };
     xhr.onerror = () => reject(new Error('上传失败（网络中断或面板不可达）'));
@@ -1287,70 +1293,101 @@ async function loadMemoryView() {
 
 // ------------------------------------------------- 视频创作（studio）----
 /**
- * 三种创作入口共用一套分镜状态：
- *   写稿   POST /api/studio/script → 拆场（不渲染）
- *   分镜   POST /api/studio/scenes → 把「画什么」翻译成 manim 代码
- *   全自动 POST /api/studio/create → 写分镜并直接出片
+ * 默认只有三样：一个输入框、一个时长、一个「开始做」。其它能力都收进「高级」和「历史」。
  *
- * 底部那条操作栏对三者都有效：[预览分镜] [渲染] + 预估。
- * 渲染不是一次性黑箱：先建项目（拿到稳定 id），再发渲染请求，同时轮询
- * /api/studio/progress 显示「第 3/8 场 manim 渲染中…」。
+ * 输入框自动判断怎么走（不跟用户提"模式"两个字）：
+ *   短句（像题目）    → 交 prompt，它自己写分镜再出片
+ *   大段（像稿子）    → 交 script，先把稿子拆成场再出片
+ *   高级区里改过分镜  → 交 scenes，按改过的分镜做
+ *
+ * 提交后立刻出现一张任务卡（后台跑，不等接口返回）：
+ *   每 2 秒问一次 GET /api/studio/jobs/:id，卡片上更新「阶段 3/8」「已用 1 分 12 秒」。
+ *   studio 还没有这套接口（回 404）时，回退老流程「拆分镜 → 补动画 → 建项目 → 渲染」，不白屏。
+ *
+ * 刷新不丢：GET /api/studio/jobs 恢复任务卡，GET /api/studio/library 恢复历史（重做/载入/删除）。
  */
 
 const studioEls = {
+  input: document.getElementById('studioInput'),
+  seconds: document.getElementById('studioSeconds'),
+  go: document.getElementById('studioGo'),
+  hint: document.getElementById('studioHint'),
+  startError: document.getElementById('studioStartError'),
+  advToggle: document.getElementById('studioAdvToggle'),
+  advBody: document.getElementById('studioAdvBody'),
   binding: document.getElementById('studioBinding'),
-  tabs: Array.from(document.querySelectorAll('.studio-tab')),
-  panes: {
-    script: document.getElementById('paneScript'),
-    scenes: document.getElementById('paneScenes'),
-    auto: document.getElementById('paneAuto'),
-  },
-  script: document.getElementById('studioScript'),
-  scriptSeconds: document.getElementById('scriptSeconds'),
-  scriptStyle: document.getElementById('scriptStyle'),
-  scriptVoice: document.getElementById('scriptVoice'),
-  scriptGo: document.getElementById('studioScriptGo'),
-  scriptHint: document.getElementById('studioScriptHint'),
-  prompt: document.getElementById('studioPrompt'),
-  autoSeconds: document.getElementById('autoSeconds'),
-  autoStyle: document.getElementById('autoStyle'),
-  autoVoice: document.getElementById('autoVoice'),
+  style: document.getElementById('studioStyle'),
+  voice: document.getElementById('studioVoice'),
+  scenesBox: document.getElementById('studioScenesBox'),
   sceneList: document.getElementById('sceneList'),
   sceneAdd: document.getElementById('sceneAdd'),
   fill: document.getElementById('studioFill'),
   sceneHint: document.getElementById('sceneHint'),
   editMeta: document.getElementById('studioEditMeta'),
-  progress: document.getElementById('studioProgress'),
-  progressFill: document.getElementById('studioProgressFill'),
-  progressText: document.getElementById('studioProgressText'),
-  plan: document.getElementById('studioPlan'),
-  raw: document.getElementById('studioRaw'),
-  video: document.getElementById('studioVideo'),
-  resultHint: document.getElementById('studioResultHint'),
-  download: document.getElementById('studioDownload'),
-  preview: document.getElementById('studioPreview'),
-  render: document.getElementById('studioRender'),
-  estimate: document.getElementById('studioEstimate'),
-  resultCard: document.getElementById('studioResultCard'),
+  jobs: document.getElementById('studioJobs'),
+  jobsEmpty: document.getElementById('studioJobsEmpty'),
+  libToggle: document.getElementById('studioLibToggle'),
+  libBody: document.getElementById('studioLibBody'),
+  libList: document.getElementById('studioLibList'),
+  libEmpty: document.getElementById('studioLibEmpty'),
+  refBtn: document.getElementById('studioRefBtn'),
+  refThumb: document.getElementById('studioRefThumb'),
+  refImg: document.getElementById('studioRefImg'),
+  refClear: document.getElementById('studioRefClear'),
+  refHint: document.getElementById('studioRefHint'),
+  imageInput: document.getElementById('studioImageInput'),
 };
 
-let studioMode = 'script';
+// 分镜表情选择器（给"某一场"加 GIF 表情）：和聊天那个表情面板分开，
+// 那边是"发一张给模型看"，这边是"叠到这一场的画面上"。
+const sceneStickerEls = {
+  modal: document.getElementById('sceneStickerModal'),
+  title: document.getElementById('sceneStickerTitle'),
+  close: document.getElementById('sceneStickerClose'),
+  grid: document.getElementById('sceneStickerGrid'),
+  search: document.getElementById('sceneStickerSearch'),
+  hint: document.getElementById('sceneStickerHint'),
+  tabAll: document.getElementById('sceneStickerTabAll'),
+  tabFav: document.getElementById('sceneStickerTabFav'),
+};
+let sceneStickerTarget = -1;    // 正在给第几场挑表情（-1 = 没开）
+let sceneStickerList = [];      // 表情目录缓存（打开选择器才拉）
+let sceneStickerQuery = '';
+let sceneStickerFavOnly = false;
+let sceneStickerTimer = null;
+
 let studioTitle = '';
 // 每一场：{text, narration, seconds, visual_hint, tool, kind, manim, status, dirty}
-// tool 是用户的选择（manim / text / ''=自动），manim 是补全后拿到的代码。
+// tool 是用户的选择（manim / text / aivideo / ''=自动），manim 是补全后拿到的代码。
 let studioScenes = [];
-let studioProjectId = '';
-let studioBusy = false;
-// 本集配置：风格/音色为空串 = 跟人设，交给 studio 决定
-let studioConfig = { seconds: 60, style: '', voice: '' };
-let studioPollTimer = null;
-let studioPollInFlight = false;
+let studioProjectId = '';      // 老流程（studio 没有 job 接口）用的项目 id
 let studioBindingInfo = null;
 let studioOptionsLoaded = false;
+let studioBusy = false;
+// 用户动过分镜表格 → 「开始做」就用它，而不是把输入框重新解释一遍
+let studioScenesTouched = false;
+// 产出当前分镜时输入框里的字：没变过就还是用那份分镜
+let studioScenesFromText = '';
+let studioAdvOpen = false;
+
+const studioJobs = new Map();      // jobId -> 任务状态
+const studioJobCards = new Map();  // jobId -> {el, sig}：卡片按签名增量更新，别每 2 秒重建
+let studioPollTimer = null;
+let studioPollBusy = false;
+let legacyProgressTimer = null;
+
+let studioLibrary = [];
+let studioLibBusy = false;
+// 首屏那张可选参考图：{ uploadId, name } —— 有图就挂到第一场，也放一份在请求体顶层
+let studioRefImage = null;
 
 const SCENE_SECONDS_MIN = 2;
 const SCENE_SECONDS_MAX = 12;
 const SCENE_GAP_SECONDS = 0.4;
+
+// AI 视频额度用完了（网关 429 Throttling.AllocationQuota，12-03 16:00 UTC 重置）。
+// 选它不会报错，但那一场会降级成文字卡：先在界面上说清楚，别让人白等一百秒。
+const STUDIO_AI_QUOTA_NOTE = 'AI 视频额度已用完（12-03 16:00 UTC 重置）：这一场会降级成文字卡，改用 manim 或文字卡吧。';
 
 function studioSceneSeconds(scene) {
   const n = Number(scene && scene.seconds);
@@ -1365,40 +1402,137 @@ function studioSecondsTotal() {
   return Math.max(0, Math.round((sum - SCENE_GAP_SECONDS * (count - 1)) * 10) / 10);
 }
 
-/** 切子标签：三个面板只显示一个；场景表格在"分镜"标签里。 */
-function setStudioMode(mode) {
-  studioMode = ['script', 'scenes', 'auto'].includes(mode) ? mode : 'script';
-  for (const tab of studioEls.tabs) {
-    const on = tab.dataset.mode === studioMode;
-    tab.classList.toggle('active', on);
-    tab.setAttribute('aria-selected', on ? 'true' : 'false');
-  }
-  for (const [key, pane] of Object.entries(studioEls.panes)) {
-    if (pane) pane.classList.toggle('hidden', key !== studioMode);
-  }
-  updateStudioEstimate();
+// ---- 小数助手（卡片上的时间 / 体积 / 时间戳）-------------------------------
+
+/** 毫秒 → 人话：58 秒 / 1 分 12 秒 / 1 小时 3 分。 */
+function studioFmtSpan(ms) {
+  const total = Math.max(0, Math.round((Number(ms) || 0) / 1000));
+  if (total < 60) return `${total} 秒`;
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  if (minutes < 60) return seconds ? `${minutes} 分 ${seconds} 秒` : `${minutes} 分`;
+  return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
 }
 
-/** 当前标签页的秒数/风格/音色。分镜标签没有自己的选择器，沿用上一次的配置。 */
-function readStudioConfig() {
-  if (studioMode === 'script') {
-    return {
-      seconds: Number(studioEls.scriptSeconds && studioEls.scriptSeconds.value) || 60,
-      style: studioEls.scriptStyle ? studioEls.scriptStyle.value : '',
-      voice: studioEls.scriptVoice ? studioEls.scriptVoice.value : '',
-    };
-  }
-  if (studioMode === 'auto') {
-    return {
-      seconds: Number(studioEls.autoSeconds && studioEls.autoSeconds.value) || 60,
-      style: studioEls.autoStyle ? studioEls.autoStyle.value : '',
-      voice: studioEls.autoVoice ? studioEls.autoVoice.value : '',
-    };
-  }
-  return Object.assign({}, studioConfig);
+function studioFmtMB(bytes) {
+  const n = Number(bytes) || 0;
+  if (!n) return '';
+  return (n / 1048576).toFixed(1);
 }
 
-/** 选择器里的 "跟人设" 选项文案要带上人设实际会选什么，用户才知道空着意味着什么。 */
+/** 时间戳可能是毫秒数，也可能是 ISO 串：统一成毫秒。 */
+function studioTimeOf(value) {
+  if (!value) return 0;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+  const n = Date.parse(String(value));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function studioFmtWhen(ts) {
+  const when = studioTimeOf(ts);
+  if (!when) return '';
+  const d = new Date(when);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// ---- 三个提示位 ------------------------------------------------------------
+
+function setStudioHintText(text) {
+  if (studioEls.hint) studioEls.hint.textContent = text;
+}
+
+function setStudioSceneHint(text) {
+  if (studioEls.sceneHint) studioEls.sceneHint.textContent = text;
+}
+
+function setStudioStartError(text) {
+  if (!studioEls.startError) return;
+  studioEls.startError.textContent = text || '';
+  studioEls.startError.classList.toggle('hidden', !text);
+}
+
+// ---- 请求：面板自己的 JSON 转发（非 2xx 也把 body 读出来，原因都写在 body 里）--
+
+/**
+ * 返回 {status, data}。分不清 404 就分不清"要不要回退老流程"，所以状态码要留。
+ * 401 统一弹登录，返回 status=401 让调用方安静退出。
+ */
+async function studioRequest(url, payload, method) {
+  const options = { method: method || (payload ? 'POST' : 'GET') };
+  if (payload) {
+    options.headers = { 'content-type': 'application/json' };
+    options.body = JSON.stringify(payload);
+  }
+  const res = await apiFetch(url, options);
+  if (res.status === 401) {
+    handleUnauthorized('会话过期，请重新登录');
+    return { status: 401, data: { ok: false, error: '登录已过期，请重新登录' } };
+  }
+  const data = await res.json().catch(() => null);
+  return { status: res.status, data: data || { ok: false, error: `面板回了 HTTP ${res.status}` } };
+}
+
+/** 成功判定：studio 的新建任务回 202，别的口回 200 —— 只要 2xx 都算成。 */
+function studioOk(status) {
+  return Number(status) >= 200 && Number(status) < 300;
+}
+
+/** 失败要说人话：错误码翻成用户能行动的一句话，缺哪几句也点出来。 */
+function studioErrorText(r) {
+  const error = String((r && (r.error || r.code)) || '');
+  const speak = String((r && r.speakError) || '');
+  const attempts = Number(r && r.attempts) || 0;
+  if (error === 'VOICE_UNAVAILABLE') {
+    if (speak === 'QUEUE_TIMEOUT') return '配音排队超时了：另一个任务正占着音色队列，过一会儿再试。';
+    if (speak === 'BREEZEBLUE_UNAVAILABLE') {
+      return attempts > 0
+        ? `配音服务暂时不可用，已重试 ${attempts} 次，请稍后重试。`
+        : '配音服务暂时不可用，请稍后重试。';
+    }
+    if (speak) return `配音失败（${speak}），请稍后重试。`;
+    return '配音服务暂时不可用（连不上配音服务），检查服务后再试。';
+  }
+  if (error === 'QUEUE_TIMEOUT') return '配音排队超时了，过一会儿再试。';
+  if (error === 'NO_SCENES' || error === 'SCENES_REQUIRED') return '分镜是空的，先写几场。';
+  if (error === 'SCRIPT_REQUIRED' || error === 'PROMPT_REQUIRED') return '先把内容写进去。';
+  if (error === 'PLAN_NOT_JSON') return '模型没按格式写分镜，再试一次。';
+  if (error === 'IO_FAILED') return '核心没响应（写分镜要用它），稍后再试。';
+  if (error === 'UNREACHABLE') return '连不上服务，稍后再试。';
+  if (error === 'TIMEOUT') return '请求超时了，稍后再试。';
+  if (error === 'NOT_FOUND') return '这个任务找不到了，重新做一次。';
+  return error || '未知原因（返回里没有 error 字段）';
+}
+
+/** 任务卡上的失败原因：能认的错误码翻成人话，认不出就把原文摆出来。 */
+function studioJobErrorText(job) {
+  const raw = String((job && (job.error || job.reason)) || '').trim();
+  if (!raw) return '没做成，原因没写；过一会儿再点「重做」试一次。';
+  const key = raw.toUpperCase();
+  // studio 的失败码就这几种，认得出来的都翻成能行动的一句话
+  if (key.startsWith('SPEAK_')) return `配音出错了（${raw}），稍后再点「重做」。`;
+  const rules = [
+    [/BREEZEBLUE|SPEAK_UNAVAILABLE|VOICE_UNAVAILABLE/, '配音服务不可用，已重试过；稍后再点「重做」。'],
+    [/QUEUE_TIMEOUT|SPEAK_QUEUE/, '配音排队超时了：别的任务正占着音色，过一会儿再试。'],
+    [/NO_SCENES|SCENES_REQUIRED/, '分镜是空的：先在高级区写几场。'],
+    [/SCRIPT_REQUIRED|PROMPT_REQUIRED|INPUT_REQUIRED/, '先把要做什么写进输入框。'],
+    [/PLAN_NOT_JSON|PLAN_INVALID/, '模型没按格式写分镜，再点一次「重做」试试。'],
+    [/IO_FAILED|UNREACHABLE|ECONNREFUSED|ECONNRESET/, '连不上服务，稍后再试。'],
+    [/TIMEOUT/, '等太久了，超时；稍后再点「重做」。'],
+    [/NOT_FOUND/, '这条任务服务端已经没有了。'],
+    [/CANCEL/, '任务被取消了。'],
+    [/JOB_CRASHED|INTERNAL/, '任务崩了（服务端异常），点「重做」再试一次。'],
+    [/MANIM|PYPLOT/, '这一场的动画生成失败（manim 那边出错），换一场「画什么」再试。'],
+    [/WAN_|AIVIDEO|AI_VIDEO/, 'AI 画面生成失败（额度或服务问题）：改用 manim 或文字卡。'],
+    [/PERSONA_/, '读不到人设（音色/风格），稍后再试。'],
+    [/FFMPEG|RENDER_FAILED|RENDER_ERROR/, '渲染失败（ffmpeg 那边报错了）。'],
+  ];
+  for (const [re, text] of rules) if (re.test(key)) return text;
+  return raw;
+}
+
+// ---- 人设绑定 / 风格 / 音色（都在高级区里）--------------------------------
+
 function studioPersonaStyleLabel() {
   const name = studioBindingInfo && studioBindingInfo.style && studioBindingInfo.style.name;
   return name ? `跟人设（${name}）` : '跟人设';
@@ -1427,6 +1561,14 @@ function fillStudioSelect(select, items, personaLabel, current) {
   if (select.value !== want) select.value = '';
 }
 
+/** 历史里存的是具体风格/音色 id：有就选上，没有（服务端改过名）就退回"跟人设"。 */
+function setStudioSelectValue(select, value) {
+  if (!select || value == null) return;
+  const want = String(value);
+  select.value = want;
+  if (select.value !== want) select.value = '';
+}
+
 /** 风格/音色下拉：一次拉齐，之后不再重复请求。 */
 async function loadStudioOptions() {
   if (studioOptionsLoaded) return;
@@ -1440,26 +1582,18 @@ async function loadStudioOptions() {
   const voiceItems = (voices && voices.ok && Array.isArray(voices.voices))
     ? voices.voices.map((v) => ({ id: v.voiceId, name: v.name || v.voiceId }))
     : [];
-  const keep = {
-    scriptStyle: studioEls.scriptStyle ? studioEls.scriptStyle.value : '',
-    scriptVoice: studioEls.scriptVoice ? studioEls.scriptVoice.value : '',
-    autoStyle: studioEls.autoStyle ? studioEls.autoStyle.value : '',
-    autoVoice: studioEls.autoVoice ? studioEls.autoVoice.value : '',
-  };
-  fillStudioSelect(studioEls.scriptStyle, styleItems, studioPersonaStyleLabel(), keep.scriptStyle);
-  fillStudioSelect(studioEls.autoStyle, styleItems, studioPersonaStyleLabel(), keep.autoStyle);
-  fillStudioSelect(studioEls.scriptVoice, voiceItems, studioPersonaVoiceLabel(), keep.scriptVoice);
-  fillStudioSelect(studioEls.autoVoice, voiceItems, studioPersonaVoiceLabel(), keep.autoVoice);
+  const keepStyle = studioEls.style ? studioEls.style.value : '';
+  const keepVoice = studioEls.voice ? studioEls.voice.value : '';
+  fillStudioSelect(studioEls.style, styleItems, studioPersonaStyleLabel(), keepStyle);
+  fillStudioSelect(studioEls.voice, voiceItems, studioPersonaVoiceLabel(), keepVoice);
   studioOptionsLoaded = styleItems.length > 0 || voiceItems.length > 0;
 }
 
-/** 面板上那行"当前：大肥鱼（迷糊版）· 白板讲解 · 温柔口语"。 */
+/** 原「当前：大肥鱼（迷糊版）· 白板讲解 · 温柔口语」那行：现在只在高级区当只读说明。 */
 async function loadStudioBinding() {
   const data = await apiJson('/api/studio/binding');
   if (!data || !data.ok) {
-    if (studioEls.binding) {
-      studioEls.binding.textContent = '人设绑定暂时读不到：音色和风格会用默认值。';
-    }
+    if (studioEls.binding) studioEls.binding.textContent = '人设绑定暂时读不到：音色和风格会用默认值。';
     return;
   }
   studioBindingInfo = data;
@@ -1477,173 +1611,7 @@ async function loadStudioBinding() {
   await loadStudioOptions();
 }
 
-async function loadStudioView() {
-  if (!studioOptionsLoaded) {
-    await loadStudioBinding();
-  }
-  if (!studioScenes.length) updateStudioMeta();
-  updateStudioEstimate();
-}
-
-function studioSetHint(el, text) {
-  if (el) el.textContent = text;
-}
-
-/** 失败要说人话：错误码翻成用户能行动的一句话，缺哪几句也点出来。 */
-function studioErrorText(r) {
-  const error = String((r && (r.error || r.code)) || '');
-  const speak = String((r && r.speakError) || '');
-  const attempts = Number(r && r.attempts) || 0;
-  if (error === 'VOICE_UNAVAILABLE') {
-    if (speak === 'QUEUE_TIMEOUT') return '配音排队超时了：另一个任务正占着音色队列，过一会儿再渲染。';
-    if (speak === 'BREEZEBLUE_UNAVAILABLE') {
-      return attempts > 0
-        ? `配音服务暂时不可用，已重试 ${attempts} 次，请稍后重试。`
-        : '配音服务暂时不可用，请稍后重试。';
-    }
-    if (speak) return `配音失败（${speak}），请稍后重试。`;
-    return '配音服务暂时不可用（连不上配音服务），检查服务后再试。';
-  }
-  if (error === 'QUEUE_TIMEOUT') return '配音排队超时了，过一会儿再渲染。';
-  if (error === 'NO_SCENES' || error === 'SCENES_REQUIRED') return '分镜是空的，先写几场。';
-  if (error === 'SCRIPT_REQUIRED' || error === 'PROMPT_REQUIRED') return '先把内容写进去。';
-  if (error === 'PLAN_NOT_JSON') return '模型没按格式写分镜，再试一次。';
-  if (error === 'IO_FAILED') return '核心没响应（写分镜要用它），稍后再试。';
-  if (error === 'UNREACHABLE') return '连不上服务，稍后再试。';
-  if (error === 'TIMEOUT') return '请求超时了，稍后再试。';
-  if (error === 'NOT_FOUND') return '这个项目找不到了，重新生成一次分镜。';
-  return error || '未知原因';
-}
-
-/** 失败统一处理：一句话原因 + 缺了哪几句 + 原始输出（有的话）。 */
-function studioFailure(r, hintEl) {
-  let reason = studioErrorText(r);
-  if (r && Array.isArray(r.scenes) && r.scenes.length) {
-    const idx = r.scenes.map((s) => (Number(s.index) || 0) + 1).join('、');
-    reason += `（第 ${idx} 句旁白没合成出来）`;
-  }
-  studioSetHint(hintEl, '没做成：' + reason);
-  if (!studioEls.raw) return;
-  const raw = r && (r.raw || r.detail);
-  if (raw) {
-    studioEls.raw.textContent = '服务返回：' + String(raw).slice(0, 2000);
-    studioEls.raw.classList.remove('hidden');
-  } else {
-    studioEls.raw.textContent = '';
-    studioEls.raw.classList.add('hidden');
-  }
-}
-
-/** 面板自己的 JSON POST：非 2xx 也把 body 读出来（原因都写在 body 里）。 */
-async function studioPost(url, payload) {
-  const res = await apiFetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  if (res.status === 401) {
-    handleUnauthorized('会话过期，请重新登录');
-    return { ok: false, error: '登录已过期，请重新登录' };
-  }
-  const data = await res.json().catch(() => null);
-  return data || { ok: false, error: `面板回了 HTTP ${res.status}` };
-}
-
-/** 忙的时候所有入口一起锁：写分镜 / 补全 / 渲染 是互斥的。 */
-function setStudioBusy(on) {
-  studioBusy = Boolean(on);
-  const buttons = [studioEls.scriptGo, studioEls.fill, studioEls.preview, studioEls.render];
-  for (const el of buttons) {
-    if (el) el.disabled = studioBusy;
-  }
-  document.body.classList.toggle('studio-busy', studioBusy);
-}
-
-/** 分镜 → 交给 studio 的场景数组。tool=text 时把旧代码丢掉，别让文字卡带着动画。 */
-function studioPlanFromScenes() {
-  const scenes = studioScenes.map((s) => {
-    const useManim = s.tool !== 'text' && s.tool !== 'aivideo' && s.manim && s.manim.code;
-  if (s.tool === 'aivideo') {
-    // AI 生成场：把用户写的「画什么」当生成提示词；没写就用标题兜底
-    return {
-      kind: 'aivideo',
-      text: String(s.text || ''),
-      narration: String(s.narration || ''),
-      seconds: Number(s.seconds) || 5,
-      tool: 'aivideo',
-      video: { prompt: String(s.visual_hint || s.text || '').slice(0, 400), size: '1280*720' },
-    };
-  }
-    return {
-      text: String(s.text || '').trim(),
-      narration: String(s.narration || '').trim(),
-      seconds: studioSceneSeconds(s),
-      visual_hint: String(s.visual_hint || '').trim(),
-      tool: String(s.tool || ''),
-      kind: useManim ? 'manim' : 'text',
-      manim: useManim ? s.manim : null,
-    };
-  });
-  return { title: studioTitle, scenes };
-}
-
-/** 服务端返回的分镜 → 内存状态。三种入口拿到的东西形状略有不同，在这里收口。 */
-function adoptStudioScenes(data) {
-  if (!data) return;
-  // 写稿/分镜把场景放在顶层 scenes；全自动的 /v1/plan 与 /v1/create 放在 plan.scenes
-  const list = Array.isArray(data.scenes)
-    ? data.scenes
-    : (data.plan && Array.isArray(data.plan.scenes) ? data.plan.scenes : []);
-  const fallbackTitle = data.plan && data.plan.title ? data.plan.title : '';
-  studioTitle = String(data.title || fallbackTitle || studioTitle || '').slice(0, 60);
-  studioScenes = list.map((s) => {
-    const hasManim = Boolean(s && s.manim && s.manim.code);
-    const tool = s && s.tool === 'text'
-      ? 'text'
-      : (s && s.tool === 'manim' ? 'manim' : (s && s.kind === 'text' && !hasManim ? 'text' : (hasManim ? 'manim' : '')));
-    return {
-      text: String((s && s.text) || ''),
-      narration: String((s && s.narration) || ''),
-      seconds: studioSceneSeconds(s),
-      visual_hint: String((s && s.visual_hint) || ''),
-      tool,
-      kind: hasManim ? 'manim' : 'text',
-      manim: hasManim ? { code: s.manim.code, scene: s.manim.scene || null } : null,
-      status: (s && s.status) || (hasManim ? 'manim' : 'pending'),
-      note: String((s && s.note) || ''),
-      dirty: false,
-    };
-  });
-  if (data.project && data.project.id) studioProjectId = String(data.project.id);
-  renderStudioScenes();
-  updateStudioMeta();
-  updateStudioEstimate();
-  renderStudioPlan();
-}
-
-/** 这些场需要重新翻译成动画：选了 manim（或自动）但还没有代码，或「画什么」被改过。 */
-function scenesNeedFill() {
-  return studioScenes.some((s) => {
-    if (s.tool === 'text') return false;
-    if (!(s.manim && s.manim.code)) return true;
-    return Boolean(s.dirty);
-  });
-}
-
-function studioStatusText(scene) {
-  if (scene.status === 'fallback') return '降级文字卡（生成失败）';
-  if (scene.tool === 'text' || scene.status === 'text') return '文字卡';
-  if (scene.dirty) return '待重新生成';
-  if (scene.manim && scene.manim.code) return '已生成 manim 代码';
-  return '待补全';
-}
-
-function studioStatusClass(scene) {
-  if (scene.status === 'fallback') return 'bad';
-  if (scene.tool === 'text' || scene.status === 'text') return 'plain';
-  if (scene.manim && scene.manim.code && !scene.dirty) return 'good';
-  return 'wait';
-}
+// ---- 分镜表格（高级区里的老能力，默认折叠）--------------------------------
 
 /** 造一个 label + 控件（和旧分镜编辑区同一套写法，CSS 直接复用）。 */
 function studioField(labelText, control, className) {
@@ -1664,23 +1632,94 @@ function studioInput(type, field, value, className) {
   return el;
 }
 
+/** 工具下拉。AI 视频额度已经用完，选项上直接标出来，别让人选了才发现。 */
 function studioToolSelect(value) {
   const select = document.createElement('select');
   select.dataset.field = 'tool';
   const options = [
     ['', '自动'],
     ['manim', 'manim（公式/图表）'],
-    ['aivideo', 'AI 生成视频（人物/场景）'],
+    ['aivideo', 'AI 视频（额度用完）'],
     ['text', '文字卡'],
   ];
   for (const [val, label] of options) {
     const option = document.createElement('option');
     option.value = val;
     option.textContent = label;
+    if (val === 'aivideo') option.title = STUDIO_AI_QUOTA_NOTE;
     select.append(option);
   }
   select.value = value || '';
   return select;
+}
+
+/** 状态就一个字符：✓ 好 / ↓ 降级成文字卡 / ✗ 还没好。详细解释放 title 里。 */
+function studioStatusChar(scene) {
+  if (scene.status === 'fallback') return '↓';
+  if (scene.tool === 'text' || scene.status === 'text') return '✓';
+  if (scene.tool === 'aivideo') return (scene.video && scene.video.prompt) ? '✓' : '✗';
+  if (scene.manim && scene.manim.code && !scene.dirty) return '✓';
+  return '✗';
+}
+
+function studioStatusTitle(scene) {
+  const mark = studioStatusChar(scene);
+  if (mark === '↓') return '降级成文字卡（生成失败）';
+  if (mark === '✓') {
+    if (scene.tool === 'aivideo') return 'AI 画面提示词已就绪';
+    if (scene.tool === 'text' || scene.status === 'text') return '文字卡';
+    return '已生成动画代码';
+  }
+  return scene.dirty ? '改过了，要重新生成' : '还没生成：点「补全动画」，或直接「开始做」';
+}
+
+function studioStatusClass(scene) {
+  const mark = studioStatusChar(scene);
+  if (mark === '↓') return 'bad';
+  if (mark === '✓') return (scene.tool === 'text' || scene.status === 'text') ? 'plain' : 'good';
+  return 'wait';
+}
+
+/**
+ * 一场里的表情：只留渲染层认识的字段，id 统一小写（文件名是 sha1 的小写）。
+ * 上限 4 个和 studio/lib/project.js 的 normalizeScene 对齐，超了后端也会截掉。
+ */
+function studioStickersOf(raw) {
+  const out = [];
+  for (const s of (Array.isArray(raw) ? raw : [])) {
+    const id = String((s && s.id) || '').toLowerCase();
+    if (!/^[0-9a-f]{6,40}$/.test(id)) continue;
+    out.push({
+      id,
+      at: Math.max(0, Number(s.at) || 0),
+      duration: Math.min(10, Math.max(0.4, Number(s.duration) || 1.6)),
+      x: Math.min(1, Math.max(0, s.x == null ? 0.82 : Number(s.x))),
+      y: Math.min(1, Math.max(0, s.y == null ? 0.18 : Number(s.y))),
+      scale: Math.min(0.6, Math.max(0.08, s.scale == null ? 0.2 : Number(s.scale))),
+    });
+    if (out.length >= 4) break;
+  }
+  return out;
+}
+
+/**
+ * 新加一个表情时的默认落点：中后段起、右上/左下交替、1.6 秒、0.2 屏高。
+ * 手动加的表情不需要用户填时间 —— 先给一个"不挡主体、能看清"的位置，
+ * 真想改再改 scenes JSON（面板不把这件事做成表单）。
+ */
+function studioStickerPlacement(scene, ordinal) {
+  const seconds = studioSceneSeconds(scene);
+  const baseAt = Math.min(Math.max(0.5, seconds * 0.5), Math.max(0.5, seconds - 1.1));
+  const at = Math.min(Math.max(0.5, baseAt + (ordinal % 2) * 0.6), Math.max(0.5, seconds - 0.8));
+  const duration = Math.max(0.8, Math.min(1.6, seconds - at - 0.1));
+  const corner = ordinal % 2 === 0 ? { x: 0.82, y: 0.18 } : { x: 0.16, y: 0.80 };
+  return {
+    at: Math.round(at * 10) / 10,
+    duration: Math.round(duration * 10) / 10,
+    x: corner.x,
+    y: corner.y,
+    scale: 0.2,
+  };
 }
 
 /** 整块重建。只在增删场次 / 换新分镜时调用，输入过程中绝不重排 DOM。 */
@@ -1690,7 +1729,7 @@ function renderStudioScenes() {
   if (!studioScenes.length) {
     const tip = document.createElement('p');
     tip.className = 'muted';
-    tip.textContent = '还没有分镜：先在「写稿」贴一段稿子，或者点「加一场」自己写。';
+    tip.textContent = '还没有分镜：在上面写一句点「开始做」，它自己会写；也可以点「加一场」自己写。';
     studioEls.sceneList.append(tip);
     return;
   }
@@ -1707,7 +1746,8 @@ function renderStudioScenes() {
     no.textContent = `第 ${index + 1} 场`;
     const badge = document.createElement('span');
     badge.className = `scene-badge ${studioStatusClass(scene)}`;
-    badge.textContent = studioStatusText(scene);
+    badge.textContent = studioStatusChar(scene);
+    badge.title = studioStatusTitle(scene);
     const del = document.createElement('button');
     del.type = 'button';
     del.className = 'scene-del';
@@ -1732,9 +1772,25 @@ function renderStudioScenes() {
     hint.dataset.field = 'visual_hint';
     hint.className = 'scene-visual-hint';
     hint.rows = 2;
-    hint.placeholder = '自然语言描述要画什么，比如：画坐标轴、曲线上两个点，连线，然后让点靠近变成切线';
+    hint.placeholder = scene.tool === 'aivideo'
+      ? 'AI 生成画面的提示词：主体+动作+风格+镜头，比如 anime style, two girls facing off in snow, wide shot'
+      : '自然语言描述要画什么，比如：画坐标轴、曲线上两个点，连线，然后让点靠近变成切线';
     hint.value = scene.visual_hint || '';
-    row.append(studioField('画什么（会翻译成 manim 代码）', hint));
+    row.append(studioField(scene.tool === 'aivideo' ? '画什么（AI 生成画面的提示词）' : '画什么（会翻译成 manim 代码）', hint));
+
+    // 这一场的参考图（可选）：按钮 + 缩略图 + 去掉
+    const imageBox = document.createElement('div');
+    imageBox.className = 'scene-image';
+    imageBox.dataset.imageFor = String(index);
+    row.append(imageBox);
+    renderSceneImageBox(imageBox, scene, index);
+
+    // 这一场的 GIF 表情（可选）：手动加，和自动分镜用的是同一套 stickers 字段
+    const stickerBox = document.createElement('div');
+    stickerBox.className = 'scene-stickers';
+    stickerBox.dataset.stickerFor = String(index);
+    row.append(stickerBox);
+    renderSceneStickerBox(stickerBox, scene, index);
 
     if (scene.note) {
       const note = document.createElement('p');
@@ -1746,7 +1802,7 @@ function renderStudioScenes() {
   });
 }
 
-/** 顶部那行：标题 + 场数 + 总时长 + manim 占比。编辑时只动这行字。 */
+/** 分镜框那一行的标题：标题 + 场数 + 总时长。编辑时只动这行字。 */
 function updateStudioMeta() {
   if (!studioEls.editMeta) return;
   const count = studioScenes.length;
@@ -1755,47 +1811,26 @@ function updateStudioMeta() {
     return;
   }
   const manim = studioScenes.filter((s) => s.manim && s.manim.code).length;
+  const ai = studioScenes.filter((s) => s.tool === 'aivideo').length;
   const title = studioTitle ? `《${studioTitle}》` : '未命名';
-  studioEls.editMeta.textContent = `${title} · ${count} 场 · 总时长 ${studioSecondsTotal().toFixed(1)} 秒 · manim ${manim} 场`;
+  studioEls.editMeta.textContent = `${title} · ${count} 场 · 总时长 ${studioSecondsTotal().toFixed(1)} 秒 · 动画 ${manim} 场`
+    + (ai ? ` · AI 画面 ${ai} 场` : '');
 }
 
-/** 底部预估：场数 / 秒数 / 渲染分钟 / credits。系数和 studio 的 estimateRender 一致。 */
-function updateStudioEstimate() {
-  if (!studioEls.estimate) return;
-  if (!studioScenes.length) {
-    studioEls.estimate.textContent = '预计：先写分镜';
+/** 只更新这一行的警告行，不重建整行（光标不跳）。 */
+function applySceneNote(row, scene) {
+  if (!row) return;
+  let note = row.querySelector('.scene-warning');
+  if (!scene.note) {
+    if (note) note.remove();
     return;
   }
-  let manim = 0;
-  let text = 0;
-  let chars = 0;
-  for (const s of studioScenes) {
-    // 还没补代码的场也要按 tool 预估，否则"写稿刚拆完"会显示成 0 场 manim。
-    if (s.tool !== 'text' && (s.tool === 'manim' || (s.manim && s.manim.code))) manim += 1; else text += 1;
-    chars += String(s.narration || '').length;
+  if (!note) {
+    note = document.createElement('p');
+    note.className = 'scene-warning muted';
+    row.append(note);
   }
-  const seconds = studioSecondsTotal();
-  const renderSeconds = Math.round(manim * 20 + text * 3 + chars * 0.22);
-  const minutes = Math.max(0.1, Math.round((renderSeconds / 60) * 10) / 10);
-  const credits = Math.round(chars * 0.185 * 10) / 10;
-  studioEls.estimate.textContent = `预计：${studioScenes.length} 场 / ${seconds.toFixed(0)} 秒 / 约 ${minutes} 分钟 / 约 ${credits} credits`;
-}
-
-/** 分镜的纯文本预览（旧的 .plan 区，保留，方便一次看全）。 */
-function renderStudioPlan() {
-  if (!studioEls.plan) return;
-  if (!studioScenes.length) {
-    studioEls.plan.textContent = '';
-    return;
-  }
-  const lines = [];
-  lines.push(`${studioTitle ? '《' + studioTitle + '》' : '未命名'} ${studioSecondsTotal().toFixed(1)} 秒`);
-  studioScenes.forEach((s, i) => {
-    const tool = s.manim && s.manim.code ? 'manim' : (s.tool === 'text' ? '文字卡' : '待补全');
-    lines.push(`  ${i + 1}. ${s.seconds}s [${tool}] ${s.text}${s.narration ? '  旁白：' + s.narration : ''}`);
-    if (s.visual_hint) lines.push(`     画什么：${s.visual_hint}`);
-  });
-  studioEls.plan.textContent = lines.join('\n');
+  note.textContent = scene.note;
 }
 
 /** 输入事件：用 target 找到那一行，直接改数组元素；不重排 DOM，光标不跳。 */
@@ -1818,20 +1853,418 @@ function onStudioSceneEdit(event) {
   } else {
     scene[field] = control.value;
     if (field === 'visual_hint' || field === 'tool') {
-      // 「画什么」或工具变了，旧代码就过时了：下次渲染会重新补全。
+      // 「画什么」或工具变了，旧代码就过时了：下次会用新的重新生成。
       scene.dirty = true;
       scene.status = field === 'tool' && control.value === 'text' ? 'text' : 'pending';
+      // AI 生成场的旧英文 prompt 也不再对应用户新写的描述，清掉才会重新翻译
+      if (field === 'visual_hint' && scene.tool === 'aivideo') scene.video = null;
+    }
+    if (field === 'tool') {
+      // 额度已用完：选了就先说清楚，别等渲染时才降级
+      if (control.value === 'aivideo' && !scene.note) scene.note = STUDIO_AI_QUOTA_NOTE;
+      if (control.value !== 'aivideo' && scene.note === STUDIO_AI_QUOTA_NOTE) scene.note = '';
+      applySceneNote(row, scene);
     }
   }
-  if (studioEls.plan && studioEls.plan.textContent) studioEls.plan.textContent = '';
+  // 用户动过表格 → 以后「开始做」优先用这份分镜
+  studioScenesTouched = true;
   updateStudioMeta();
-  updateStudioEstimate();
-  // 状态徽标跟着变（只更新这一行的字，不重建行）
+  updateStudioHint();
+  // 状态标记跟着变（只更新这一行那个字符，不重建行）
   const badge = row.querySelector('.scene-badge');
   if (badge) {
-    badge.textContent = studioStatusText(scene);
+    badge.textContent = studioStatusChar(scene);
+    badge.title = studioStatusTitle(scene);
     badge.className = `scene-badge ${studioStatusClass(scene)}`;
   }
+}
+
+// ---- 参考图（复用聊天那套 PUT /api/upload，不新造上传口）------------------
+
+function studioImageUrl(uploadId) {
+  return `/api/upload/${encodeURIComponent(uploadId)}`;
+}
+
+/** 一场的参考图那一行：选图按钮 + 缩略图 + 去掉。 */
+function renderSceneImageBox(box, scene, index) {
+  if (!box) return;
+  box.textContent = '';
+  const pick = document.createElement('button');
+  pick.type = 'button';
+  pick.className = 'scene-image-pick';
+  pick.dataset.act = 'pick-image';
+  pick.dataset.index = String(index);
+  pick.textContent = scene.image ? '换参考图' : '参考图';
+  pick.title = '给这一场挂一张参考图（可选）';
+  box.append(pick);
+  if (scene.image) {
+    const thumb = document.createElement('span');
+    thumb.className = 'scene-image-thumb';
+    const img = document.createElement('img');
+    img.src = studioImageUrl(scene.image);
+    img.alt = `第 ${index + 1} 场参考图`;
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'scene-image-x';
+    del.dataset.act = 'clear-image';
+    del.dataset.index = String(index);
+    del.textContent = '×';
+    del.title = '去掉这张图';
+    thumb.append(img, del);
+    box.append(thumb);
+  } else {
+    const hint = document.createElement('span');
+    hint.className = 'scene-image-hint muted';
+    hint.textContent = '可选：让这一场照着这张图画';
+    box.append(hint);
+  }
+}
+
+/** 这一场的表情那一行：按钮 + 已选数量 + 小缩略图（点 × 删）。 */
+function renderSceneStickerBox(box, scene, index) {
+  if (!box) return;
+  box.textContent = '';
+  const stickers = studioStickersOf(scene.stickers);
+  scene.stickers = stickers; // 顺手规范一份，提交时用的就是它
+  const pick = document.createElement('button');
+  pick.type = 'button';
+  pick.className = 'scene-sticker-pick';
+  pick.dataset.act = 'pick-sticker';
+  pick.dataset.index = String(index);
+  pick.textContent = stickers.length ? '加表情' : '表情';
+  pick.title = '给这一场加 GIF 表情（最多 4 个，渲染时叠在画面上）';
+  box.append(pick);
+
+  if (!stickers.length) {
+    const hint = document.createElement('span');
+    hint.className = 'scene-sticker-hint muted';
+    hint.textContent = '可选：只加在情绪点上，别每场都放';
+    box.append(hint);
+    return;
+  }
+
+  const count = document.createElement('span');
+  count.className = 'scene-sticker-count muted';
+  count.textContent = `已选 ${stickers.length}/4`;
+  box.append(count);
+
+  stickers.forEach((st, si) => {
+    const thumb = document.createElement('span');
+    thumb.className = 'scene-sticker-thumb';
+    thumb.title = `第 ${si + 1} 个 · ${st.at}s 起，持续 ${st.duration}s`;
+    const img = document.createElement('img');
+    img.src = `/api/stickers/gif?id=${encodeURIComponent(st.id)}`;
+    img.alt = `第 ${index + 1} 场的表情`;
+    img.loading = 'lazy';
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'scene-sticker-x';
+    del.dataset.act = 'clear-sticker';
+    del.dataset.index = String(index);
+    del.dataset.sticker = String(si);
+    del.textContent = '×';
+    del.title = '去掉这个表情';
+    thumb.append(img, del);
+    box.append(thumb);
+  });
+}
+
+// ---- 分镜表情选择器（浮层）------------------------------------------------
+
+function openSceneStickerPicker(index) {
+  if (!studioScenes[index]) return;
+  sceneStickerTarget = index;
+  if (sceneStickerEls.title) {
+    sceneStickerEls.title.textContent = `给第 ${index + 1} 场挑个表情`;
+  }
+  if (sceneStickerEls.modal) {
+    sceneStickerEls.modal.classList.remove('hidden');
+    sceneStickerEls.modal.setAttribute('aria-hidden', 'false');
+  }
+  if (sceneStickerEls.search) sceneStickerEls.search.value = sceneStickerQuery;
+  // 目录已经拉过就直接画，没拉过才请求：来回给多场加表情时不再等一次网络
+  if (sceneStickerList.length) renderSceneStickerModal();
+  else loadSceneStickers('');
+}
+
+function closeSceneStickerPicker() {
+  if (sceneStickerEls.modal) {
+    sceneStickerEls.modal.classList.add('hidden');
+    sceneStickerEls.modal.setAttribute('aria-hidden', 'true');
+  }
+  sceneStickerTarget = -1;
+}
+
+async function loadSceneStickers(q) {
+  sceneStickerQuery = q || '';
+  if (sceneStickerEls.hint) {
+    sceneStickerEls.hint.textContent = sceneStickerFavOnly ? '正在找收藏…' : '正在找…';
+  }
+  try {
+    // 复用聊天那套表情代理：/api/stickers 已经带 favorite 字段，图走 /api/stickers/gif
+    const fav = sceneStickerFavOnly ? '&favorite=1' : '';
+    const data = await apiJson(`/api/stickers?q=${encodeURIComponent(sceneStickerQuery)}&limit=120${fav}`);
+    if (!data || !data.ok) {
+      if (sceneStickerEls.hint) sceneStickerEls.hint.textContent = '表情包服务没响应（模块可能没起）';
+      return;
+    }
+    sceneStickerList = Array.isArray(data.items) ? data.items : [];
+    renderSceneStickerModal();
+  } catch (err) {
+    if (sceneStickerEls.hint) sceneStickerEls.hint.textContent = '加载失败：' + ((err && err.message) || err);
+  }
+}
+
+/** 画选择器网格：点一张加到目标场；右上角 ★ 只切收藏。 */
+function renderSceneStickerModal() {
+  const grid = sceneStickerEls.grid;
+  if (!grid) return;
+  grid.textContent = '';
+  const scene = studioScenes[sceneStickerTarget];
+  if (!scene) return;
+  const picked = studioStickersOf(scene.stickers);
+  const items = sceneStickerFavOnly
+    ? sceneStickerList.filter((it) => it && it.favorite)
+    : sceneStickerList;
+  if (!items.length) {
+    if (sceneStickerEls.hint) {
+      sceneStickerEls.hint.textContent = sceneStickerFavOnly
+        ? '还没有收藏，点右上角 ★ 收一张'
+        : '没找到，换个词试试';
+    }
+    return;
+  }
+  if (sceneStickerEls.hint) {
+    sceneStickerEls.hint.textContent = `共 ${items.length} 张 · 点一张加到第 ${sceneStickerTarget + 1} 场（这一场 ${picked.length}/4）`;
+  }
+  for (const it of items) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'sticker-cell';
+    const label = it.mood || it.name || it.id;
+    const already = picked.some((st) => st.id === String(it.id || '').toLowerCase());
+    if (already) btn.classList.add('picked');
+    btn.title = already ? `${label}（这一场已经加过）` : label;
+    const img = document.createElement('img');
+    img.loading = 'lazy';
+    img.src = `/api/stickers/gif?id=${encodeURIComponent(it.id)}`;
+    img.alt = label;
+    btn.appendChild(img);
+
+    // 和聊天那个面板同一种星星：只切收藏，不触发"选中"
+    const star = document.createElement('span');
+    star.className = 'sticker-star';
+    star.setAttribute('role', 'button');
+    star.tabIndex = 0;
+    paintStickerStar(star, it.favorite);
+    const toggle = (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      toggleSceneStickerFavorite(it);
+    };
+    star.addEventListener('click', toggle);
+    star.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') toggle(ev);
+    });
+    btn.appendChild(star);
+
+    btn.addEventListener('click', () => addSceneSticker(it));
+    grid.appendChild(btn);
+  }
+}
+
+/** 选中一张：给目标场追加一个表情（默认落点见 studioStickerPlacement）。 */
+function addSceneSticker(item) {
+  const scene = studioScenes[sceneStickerTarget];
+  if (!scene || !item || !item.id) return;
+  const stickers = studioStickersOf(scene.stickers);
+  if (stickers.length >= 4) {
+    if (sceneStickerEls.hint) sceneStickerEls.hint.textContent = '这一场已经 4 个了（渲染层上限 4 个）';
+    return;
+  }
+  const id = String(item.id).toLowerCase();
+  stickers.push(Object.assign({ id }, studioStickerPlacement(scene, stickers.length)));
+  scene.stickers = stickers;
+  studioScenesTouched = true;
+
+  // 只重画这一行的表情条，不重建整张表（输入框光标不跳）
+  const row = studioEls.sceneList
+    ? studioEls.sceneList.querySelector(`.scene[data-index="${sceneStickerTarget}"]`)
+    : null;
+  const box = row ? row.querySelector('.scene-stickers') : null;
+  if (box) renderSceneStickerBox(box, scene, sceneStickerTarget);
+  renderSceneStickerModal();
+  if (sceneStickerEls.hint) {
+    sceneStickerEls.hint.textContent = `已加「${item.mood || item.name || id}」，这一场 ${stickers.length}/4`;
+  }
+  setStudioSceneHint(`第 ${sceneStickerTarget + 1} 场加了表情：${stickers.length} 个。改完回上面点「开始做」。`);
+  updateStudioMeta();
+  updateStudioHint();
+}
+
+/** 选择器里的 ★：收藏 / 取消收藏（失败只提示，不影响已选表情）。 */
+async function toggleSceneStickerFavorite(item) {
+  if (!item || !item.id) return;
+  const want = !item.favorite;
+  const label = item.mood || item.name || item.id;
+  try {
+    const r = want
+      ? await apiJson('/api/stickers/favorite', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: item.id, name: label }),
+      })
+      : await apiJson(`/api/stickers/favorite?id=${encodeURIComponent(item.id)}`, { method: 'DELETE' });
+    if (!r || !r.ok) {
+      if (sceneStickerEls.hint) {
+        sceneStickerEls.hint.textContent = (want ? '收藏失败：' : '取消收藏失败：') + ((r && r.error) || '未知原因');
+      }
+      return;
+    }
+    item.favorite = want;
+    const row = sceneStickerList.find((x) => x && x.id === item.id);
+    if (row) row.favorite = want;
+    renderSceneStickerModal();
+    if (sceneStickerEls.hint) {
+      sceneStickerEls.hint.textContent = want ? `已收藏「${label}」★` : `已取消收藏「${label}」`;
+    }
+  } catch (err) {
+    if (sceneStickerEls.hint) sceneStickerEls.hint.textContent = '收藏失败：' + ((err && err.message) || err);
+  }
+}
+
+/** 全部 / 收藏 两个标签页。 */
+function setSceneStickerTab(fav) {
+  sceneStickerFavOnly = Boolean(fav);
+  if (sceneStickerEls.tabAll) sceneStickerEls.tabAll.classList.toggle('active', !sceneStickerFavOnly);
+  if (sceneStickerEls.tabFav) sceneStickerEls.tabFav.classList.toggle('active', sceneStickerFavOnly);
+  loadSceneStickers(sceneStickerQuery);
+}
+
+/** 首屏那张参考图：没图就只显示一行小字，有图才出缩略图。 */
+function renderStudioRefBox() {
+  const has = Boolean(studioRefImage && studioRefImage.uploadId);
+  if (studioEls.refThumb) studioEls.refThumb.classList.toggle('hidden', !has);
+  if (studioEls.refImg) {
+    if (has) studioEls.refImg.src = studioImageUrl(studioRefImage.uploadId);
+    else studioEls.refImg.removeAttribute('src');
+  }
+  if (studioEls.refHint) {
+    studioEls.refHint.textContent = has
+      ? `已挂：${studioRefImage.name || '参考图'}`
+      : '画面会参考这张图';
+  }
+  if (studioEls.refBtn) studioEls.refBtn.textContent = has ? '换一张图' : '+ 参考图（可选）';
+}
+
+/** 挑图：只打开那个共用的 file input，把"挂给谁"记在 data-target 上。 */
+function pickStudioImage(target) {
+  const input = studioEls.imageInput;
+  if (!input) return;
+  input.dataset.target = String(target || 'ref');
+  input.value = '';
+  input.click();
+}
+
+/** 选好图就传：成功把 uploadId 记进那一场（或首屏那张）。 */
+async function onStudioImagePicked(event) {
+  const input = event.target;
+  const file = input.files && input.files[0];
+  const target = String(input.dataset.target || 'ref');
+  input.value = '';
+  if (!file) return;
+  if (!/^image\//i.test(String(file.type || '')) && !/\.(png|jpe?g|gif|webp|bmp)$/i.test(file.name || '')) {
+    setStudioStartError('这不是图片：选 png / jpg / webp 这类文件。');
+    return;
+  }
+  setStudioStartError('');
+  const index = target.startsWith('scene:') ? Number(target.slice('scene:'.length)) : -1;
+  if (index >= 0) setStudioSceneHint('正在上传参考图…');
+  else setStudioHintText('正在上传参考图…');
+  try {
+    // 和聊天同一个上传口：PUT /api/upload（XHR 直传，带上 Bearer）
+    const data = await uploadFile({ file, name: file.name || 'image.png', size: Number(file.size) || 0, kindHint: 'image' });
+    if (!data || !data.ok || !data.uploadId) throw new Error((data && (data.error || data.message)) || '上传没成功');
+    if (index >= 0) {
+      const scene = studioScenes[index];
+      if (scene) {
+        scene.image = String(data.uploadId);
+        studioScenesTouched = true;
+        const row = studioEls.sceneList ? studioEls.sceneList.querySelector(`.scene[data-index="${index}"]`) : null;
+        const box = row ? row.querySelector('.scene-image') : null;
+        if (box) renderSceneImageBox(box, scene, index);
+      }
+      setStudioSceneHint('图片挂上了：这一场会参考它。改完回上面点「开始做」。');
+    } else {
+      studioRefImage = { uploadId: String(data.uploadId), name: String(data.name || file.name || '') };
+      renderStudioRefBox();
+      updateStudioHint();
+    }
+  } catch (err) {
+    // 上传口也要认登录态：401 说明会话没了，直接把登录层拉起来，别只说"上传失败"
+    if (err && (err.status === 401 || err.code === 'E_UNAUTHORIZED')) {
+      handleUnauthorized('会话过期，请重新登录');
+      setStudioStartError('登录已过期：重新登录后就能传图了。');
+      if (index >= 0) setStudioSceneHint('登录已过期：重新登录后就能传图了。');
+      return;
+    }
+    const reason = (err && err.message) || String(err);
+    setStudioStartError('参考图上传失败：' + reason);
+    if (index >= 0) setStudioSceneHint('参考图上传失败：' + reason);
+  }
+}
+
+/** 分镜行里的「参考图 / 去掉」（事件委托）。 */
+function onStudioSceneImageClick(event) {
+  const pick = event.target.closest('[data-act="pick-image"]');
+  if (pick) {
+    const index = Number(pick.dataset.index);
+    if (Number.isFinite(index)) pickStudioImage(`scene:${index}`);
+    return;
+  }
+  const clear = event.target.closest('[data-act="clear-image"]');
+  if (!clear) return;
+  const index = Number(clear.dataset.index);
+  const scene = studioScenes[index];
+  if (!scene) return;
+  scene.image = '';
+  studioScenesTouched = true;
+  const row = clear.closest('.scene');
+  const box = row ? row.querySelector('.scene-image') : null;
+  if (box) renderSceneImageBox(box, scene, index);
+}
+
+/** 分镜行里的「表情 / 删掉某个表情」（事件委托）。 */
+function onStudioSceneStickerClick(event) {
+  const pick = event.target.closest('[data-act="pick-sticker"]');
+  if (pick) {
+    const index = Number(pick.dataset.index);
+    if (Number.isFinite(index)) openSceneStickerPicker(index);
+    return;
+  }
+  const clear = event.target.closest('[data-act="clear-sticker"]');
+  if (!clear) return;
+  const index = Number(clear.dataset.index);
+  const si = Number(clear.dataset.sticker);
+  const scene = studioScenes[index];
+  if (!scene || !Array.isArray(scene.stickers) || !Number.isInteger(si)) return;
+  scene.stickers.splice(si, 1);
+  studioScenesTouched = true;
+  const row = clear.closest('.scene');
+  const box = row ? row.querySelector('.scene-stickers') : null;
+  if (box) renderSceneStickerBox(box, scene, index);
+  setStudioSceneHint(scene.stickers.length
+    ? `第 ${index + 1} 场还有 ${scene.stickers.length} 个表情。`
+    : `第 ${index + 1} 场的表情已经全部去掉了。`);
+  updateStudioMeta();
+  updateStudioHint();
+}
+
+/** 去掉首屏那张参考图。 */
+function clearStudioRefImage() {
+  studioRefImage = null;
+  renderStudioRefBox();
+  updateStudioHint();
 }
 
 function studioDeleteScene(event) {
@@ -1842,10 +2275,10 @@ function studioDeleteScene(event) {
   const index = Number(row.dataset.index);
   if (!Number.isFinite(index)) return;
   studioScenes.splice(index, 1);
+  studioScenesTouched = true;
   renderStudioScenes();
   updateStudioMeta();
-  updateStudioEstimate();
-  renderStudioPlan();
+  updateStudioHint();
 }
 
 function studioAddScene() {
@@ -1859,27 +2292,435 @@ function studioAddScene() {
     manim: null,
     status: 'pending',
     note: '',
+    image: '',
+    stickers: [],
     dirty: true,
   });
+  studioScenesTouched = true;
   renderStudioScenes();
   updateStudioMeta();
-  updateStudioEstimate();
+  updateStudioHint();
   const texts = studioEls.sceneList ? studioEls.sceneList.querySelectorAll('.scene-text') : [];
   if (texts.length) texts[texts.length - 1].focus();
 }
 
-// ---------------------------------------------------------------- 进度 --
-
-function studioProgressShow(on) {
-  if (studioEls.progress) studioEls.progress.classList.toggle('hidden', !on);
+/** 分镜 → 交给 studio 的场景数组。tool=text 时把旧代码丢掉，别让文字卡带着动画。 */
+function studioPlanFromScenes() {
+  const scenes = studioScenes.map((s) => {
+    const useManim = s.tool !== 'text' && s.tool !== 'aivideo' && s.manim && s.manim.code;
+    if (s.tool === 'aivideo') {
+      // AI 生成场：已经翻好的 video.prompt 原样带回；只有中文「画什么」时只传 visual_hint，
+      // 让 studio 负责翻英文（它才有模型），别把中文当英文 prompt 直接塞给生成接口。
+      const out = {
+        kind: 'aivideo',
+        text: String(s.text || ''),
+        narration: String(s.narration || ''),
+        seconds: Number(s.seconds) || 5,
+        tool: 'aivideo',
+        visual_hint: String(s.visual_hint || '').trim(),
+      };
+      const videoPrompt = String((s.video && s.video.prompt) || '').trim();
+      if (videoPrompt) out.video = { prompt: videoPrompt, size: (s.video && s.video.size) || '1280*720' };
+      if (s.image) out.image = String(s.image);
+      // 表情跟着场景走：选了就要渲进画面，不能在上交这一步悄悄丢掉
+      const aiStickers = studioStickersOf(s.stickers);
+      if (aiStickers.length) out.stickers = aiStickers;
+      return out;
+    }
+    const out = {
+      text: String(s.text || '').trim(),
+      narration: String(s.narration || '').trim(),
+      seconds: studioSceneSeconds(s),
+      visual_hint: String(s.visual_hint || '').trim(),
+      tool: String(s.tool || ''),
+      kind: useManim ? 'manim' : 'text',
+      manim: useManim ? s.manim : null,
+    };
+    // 参考图只在真有的时候才带：删掉图，请求体里就不该再有这个字段
+    if (s.image) out.image = String(s.image);
+    const stickers = studioStickersOf(s.stickers);
+    if (stickers.length) out.stickers = stickers;
+    return out;
+  });
+  return { title: studioTitle, scenes };
 }
 
-function studioProgressSet(text, ratio) {
-  if (studioEls.progressText) studioEls.progressText.textContent = text;
-  if (studioEls.progressFill) {
-    const pct = Math.max(0, Math.min(100, Math.round((Number(ratio) || 0) * 100)));
-    studioEls.progressFill.style.width = pct + '%';
+/** 服务端返回的分镜 → 内存状态。不同接口拿到的形状略有不同，在这里收口。 */
+function adoptStudioScenes(data) {
+  if (!data) return;
+  // 写稿/分镜把场景放在顶层 scenes；全自动的 plan 放在 plan.scenes
+  const list = Array.isArray(data.scenes)
+    ? data.scenes
+    : (data.plan && Array.isArray(data.plan.scenes) ? data.plan.scenes : []);
+  const fallbackTitle = data.plan && data.plan.title ? data.plan.title : '';
+  studioTitle = String(data.title || fallbackTitle || studioTitle || '').slice(0, 60) || studioTitle;
+  studioScenes = list.map((s) => {
+    const hasManim = Boolean(s && s.manim && s.manim.code);
+    // aivideo 必须整块带回来：kind/tool 丢了，下一次 studioPlanFromScenes 就会把它当文字卡。
+    const wantsAi = Boolean(s && (s.kind === 'aivideo' || s.tool === 'aivideo'));
+    const videoPrompt = String((s && s.video && s.video.prompt) || '').trim();
+    const hasVideo = wantsAi && Boolean(videoPrompt);
+    const tool = wantsAi
+      ? 'aivideo'
+      : (s && s.tool === 'text'
+        ? 'text'
+        : (s && s.tool === 'manim' ? 'manim' : (s && s.kind === 'text' && !hasManim ? 'text' : (hasManim ? 'manim' : ''))));
+    return {
+      text: String((s && s.text) || ''),
+      narration: String((s && s.narration) || ''),
+      seconds: studioSceneSeconds(s),
+      // 只有 video.prompt 没有「画什么」时，把英文 prompt 显示在输入框里，
+      // 让用户看得见真正会送去生成的那句话（改它就会重新翻译）。
+      visual_hint: String((s && s.visual_hint) || (hasVideo ? videoPrompt : '')),
+      tool,
+      kind: hasManim ? 'manim' : (wantsAi ? 'aivideo' : 'text'),
+      manim: hasManim ? { code: s.manim.code, scene: s.manim.scene || null } : null,
+      video: hasVideo ? { prompt: videoPrompt, size: (s.video && s.video.size) || '1280*720' } : null,
+      status: (s && s.status) || (hasManim ? 'manim' : (hasVideo ? 'aivideo' : 'pending')),
+      note: String((s && s.note) || ''),
+      image: String((s && s.image) || ''),
+      // 自动分镜挑的表情要带回表格里：用户看得见、能删，重渲时也还在
+      stickers: studioStickersOf(s && s.stickers),
+      dirty: false,
+    };
+  });
+  if (data.project && data.project.id) studioProjectId = String(data.project.id);
+  renderStudioScenes();
+  updateStudioMeta();
+}
+
+/** 这些场需要重新翻译成动画：选了 manim（或自动）但还没有代码，或「画什么」被改过。 */
+function scenesNeedFill() {
+  return studioScenes.some((s) => {
+    if (s.tool === 'text') return false;
+    // AI 生成场：改过「画什么」(dirty) 或还没有英文 prompt，都要回 studio 重翻一次
+    if (s.tool === 'aivideo') return Boolean(s.dirty) || !(s.video && String(s.video.prompt || '').trim());
+    if (!(s.manim && s.manim.code)) return true;
+    return Boolean(s.dirty);
+  });
+}
+
+// ---- 输入框自动判断（三件事，用户不用选）----------------------------------
+
+/**
+ * 字数 + 换行 + 句号数量决定"这像什么"：
+ *   超过 80 字，或者 3 行以上，或者又长又有好几个句号 → 稿子：先拆场
+ *   其余（≤30 字的短句、一句话的题目）              → 题目：直接写分镜出片
+ * 只用来决定请求体里放 prompt 还是 script，界面上不提"模式"。
+ */
+function classifyStudioInput(text) {
+  const t = String(text || '').trim();
+  const len = Array.from(t).length;
+  if (!len) return '';
+  const lines = t.split(/\r?\n/).filter((line) => line.trim()).length;
+  const sentences = (t.match(/[。！？?!；;]/g) || []).length;
+  if (len > 80) return 'script';
+  if (lines >= 3) return 'script';
+  if (len > 40 && sentences >= 2) return 'script';
+  return 'prompt';
+}
+
+/** 卡片上那行标题：短句直接用，长稿子取第一句（最多 24 字）。 */
+function studioTitleOfText(text, kind) {
+  const t = String(text || '').trim().replace(/\s+/g, ' ');
+  if (kind !== 'script') return t.slice(0, 40);
+  const first = t.split(/[。！？!?\n]/).map((s) => s.trim()).find(Boolean) || t;
+  return first.slice(0, 24);
+}
+
+/** 输入框下面那行解释：只说"它打算怎么干"，不出现"模式"两个字。 */
+function updateStudioHint() {
+  if (!studioEls.hint) return;
+  const text = studioEls.input ? studioEls.input.value.trim() : '';
+  const usesScenes = studioScenes.length > 0 && (studioScenesTouched || (text && text === studioScenesFromText));
+  const withRef = studioRefImage ? '（会带上参考图）' : '';
+  if (usesScenes) {
+    setStudioHintText(`会用高级区里的分镜（${studioScenes.length} 场）${withRef}；想重新写就把输入框改一句再点。`);
+    return;
   }
+  if (!text) {
+    setStudioHintText('一句话说题目就行；贴整段稿子也行，它自己看得出来。' + withRef);
+    return;
+  }
+  setStudioHintText((classifyStudioInput(text) === 'script'
+    ? '看着像一段稿子：先拆成分镜，再出片。'
+    : '看着像个题目：它自己写分镜，然后出片。') + withRef);
+}
+
+// ---- 高级 / 历史 两个折叠区 -------------------------------------------------
+
+function setStudioAdvanced(open) {
+  studioAdvOpen = Boolean(open);
+  if (studioEls.advBody) studioEls.advBody.classList.toggle('hidden', !studioAdvOpen);
+  if (studioEls.advToggle) {
+    studioEls.advToggle.setAttribute('aria-expanded', studioAdvOpen ? 'true' : 'false');
+  }
+}
+
+function setStudioLibrary(open) {
+  if (studioEls.libBody) studioEls.libBody.classList.toggle('hidden', !open);
+  if (studioEls.libToggle) {
+    studioEls.libToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+}
+
+function setStudioBusy(on) {
+  studioBusy = Boolean(on);
+  const buttons = [studioEls.go, studioEls.fill, studioEls.sceneAdd];
+  for (const el of buttons) if (el) el.disabled = studioBusy;
+  document.body.classList.toggle('studio-busy', studioBusy);
+}
+
+// ---- 任务卡：排队 / 进行 / 完成 / 失败 -------------------------------------
+
+function studioJobsRunning() {
+  return [...studioJobs.values()].filter((job) => job.status !== 'done' && job.status !== 'failed');
+}
+
+/** 任务卡右上角那句话。 */
+function studioJobStateText(job) {
+  const status = String(job.status || '');
+  if (status === 'done') return '✓ 完成';
+  if (status === 'failed') return '✗ 失败';
+  if (status === 'queued') {
+    const pos = Number(job.queuePosition) || 0;
+    return pos > 0 ? `排队中（前面 ${pos} 个）` : '排队中';
+  }
+  const total = Number(job.total) || 0;
+  const done = Number(job.done) || 0;
+  const label = String(job.label || job.phase || '渲染中');
+  return total > 0 ? `${label} ${done}/${total}` : label;
+}
+
+/** 成片地址：走面板转发（<video>/下载都带不了 Bearer，job id 就是凭据）。
+ *  老流程自己知道成片 id，所以用 videoPath 直接指过去。 */
+function studioJobVideoUrl(job) {
+  if (job && job.videoPath) return job.videoPath;
+  return `/api/studio/jobs/${encodeURIComponent(job.id)}/video`;
+}
+
+/** 卡片要不要重建：只认会影响显示的那几个字段，免得每 2 秒把 <video> 重建一次。 */
+function studioJobSignature(job) {
+  const terminal = job.status === 'done' || job.status === 'failed';
+  return [
+    String(job.status || ''),
+    String(job.label || ''),
+    Number(job.done) || 0,
+    Number(job.total) || 0,
+    Number(terminal ? (job.ms || job.elapsedMs) : job.elapsedMs) || 0,
+    Number(job.bytes) || 0,
+    Number(job.queuePosition) || 0,
+    String(job.error || ''),
+    (job.warnings || []).join('|'),
+    String(job.title || ''),
+    String(job.seconds || ''),
+    job.hasVideo ? '1' : '0',
+    // 历史拉回来之后「重做」才可能出现：这个也要进签名，否则卡片不会重建
+    job.canRerun ? '1' : '0',
+  ].join('\u0001');
+}
+
+function studioActionButton(act, text, extraClass) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = extraClass ? `job-btn ${extraClass}` : 'job-btn';
+  btn.dataset.act = act;
+  btn.textContent = text;
+  return btn;
+}
+
+/** 造一张任务卡：四种状态共用一套结构，只是显示的东西不同。 */
+function buildStudioJobCard(job) {
+  const status = String(job.status || 'queued');
+  const card = document.createElement('article');
+  card.className = `job job-${status}`;
+  card.dataset.jobId = job.id;
+
+  const head = document.createElement('div');
+  head.className = 'job-head';
+  const dot = document.createElement('span');
+  dot.className = 'job-dot';
+  dot.textContent = status === 'done' ? '✓' : (status === 'failed' ? '✗' : '●');
+  const title = document.createElement('span');
+  title.className = 'job-title';
+  title.textContent = job.title || '（没写标题）';
+  const state = document.createElement('span');
+  state.className = 'job-state';
+  state.textContent = studioJobStateText(job);
+  head.append(dot, title);
+  if (status === 'done' && job.seconds) {
+    const dur = document.createElement('span');
+    dur.className = 'job-dur';
+    dur.textContent = `${Math.round(Number(job.seconds))} 秒`;
+    head.append(dur);
+  }
+  head.append(state);
+  card.append(head);
+
+  // 进行中：已用 X 分 Y 秒（用服务端给的 elapsedMs，不自己数秒）
+  if (status !== 'done' && status !== 'failed') {
+    const sub = document.createElement('p');
+    sub.className = 'job-sub';
+    sub.textContent = job.elapsedMs ? `已用 ${studioFmtSpan(job.elapsedMs)}` : '已经开工，等它回话…';
+    card.append(sub);
+  }
+
+  // 失败：一句能行动的失败原因
+  if (status === 'failed') {
+    const why = document.createElement('p');
+    why.className = 'job-error';
+    why.textContent = '原因：' + studioJobErrorText(job);
+    card.append(why);
+  }
+
+  // 完成：播放 / 下载 / 耗时 / 体积 / 警告
+  if (status === 'done') {
+    const actions = document.createElement('div');
+    actions.className = 'job-actions';
+    const play = studioActionButton('play', '播放');
+    const download = document.createElement('a');
+    download.className = 'job-btn';
+    download.dataset.act = 'download';
+    const url = studioJobVideoUrl(job);
+    download.href = url;
+    download.setAttribute('download', `studio-${job.id}.mp4`);
+    download.textContent = '下载';
+    actions.append(play, download);
+
+    const meta = document.createElement('span');
+    meta.className = 'job-meta';
+    const bits = [];
+    if (job.ms) bits.push(`耗时 ${studioFmtSpan(job.ms)}`);
+    const mb = studioFmtMB(job.bytes);
+    if (mb) bits.push(`${mb} MB`);
+    meta.textContent = bits.join(' · ');
+    actions.append(meta);
+
+    if (job.canRerun) actions.append(studioActionButton('rerun', '重做'));
+    card.append(actions);
+
+    if (Array.isArray(job.warnings) && job.warnings.length) {
+      const warn = document.createElement('p');
+      warn.className = 'job-warn';
+      warn.textContent = job.warnings.join('；');
+      card.append(warn);
+    }
+  }
+
+  if (status === 'failed' && job.canRerun) {
+    const actions = document.createElement('div');
+    actions.className = 'job-actions';
+    actions.append(studioActionButton('rerun', '重做'));
+    card.append(actions);
+  }
+
+  return card;
+}
+
+/** 增量更新任务列表：签名没变就只挪位置，已经展开的 <video> 不会被重建。 */
+function renderStudioJobs() {
+  const box = studioEls.jobs;
+  if (!box) return;
+  const ids = [...studioJobs.keys()].sort((a, b) => {
+    const ja = studioJobs.get(a);
+    const jb = studioJobs.get(b);
+    return (Number(jb.createdAt) || 0) - (Number(ja.createdAt) || 0);
+  });
+  for (const [id, card] of studioJobCards) {
+    if (!studioJobs.has(id)) {
+      card.el.remove();
+      studioJobCards.delete(id);
+    }
+  }
+  for (const id of ids) {
+    const job = studioJobs.get(id);
+    job.canRerun = Boolean(studioLibraryIdForJob(job) || studioRecipe(id));
+    const sig = studioJobSignature(job);
+    const had = studioJobCards.get(id);
+    if (had && had.sig === sig) continue;
+    const el = buildStudioJobCard(job);
+    if (had) had.el.replaceWith(el);
+    studioJobCards.set(id, { el, sig });
+  }
+  // 新的排在最上面：append 已有节点等于"挪过去"，不会重载视频
+  for (const id of ids) {
+    const card = studioJobCards.get(id);
+    if (card) box.append(card.el);
+  }
+  if (studioEls.jobsEmpty) studioEls.jobsEmpty.classList.toggle('hidden', ids.length > 0);
+}
+
+/** 把详情合进卡片状态。看到终态就顺手刷新历史，让「重做」有配方可用。 */
+function applyStudioJobDetail(jobId, detail) {
+  const job = studioJobs.get(jobId);
+  if (!job || !detail || typeof detail !== 'object') return false;
+  const before = studioJobSignature(job);
+  const status = String(detail.status || '').toLowerCase();
+  if (status) job.status = status;
+  if (detail.label != null) job.label = String(detail.label);
+  if (detail.phase != null) job.phase = String(detail.phase);
+  if (Number.isFinite(Number(detail.done))) job.done = Number(detail.done);
+  if (Number.isFinite(Number(detail.total))) job.total = Number(detail.total);
+  if (Number.isFinite(Number(detail.elapsedMs))) {
+    job.elapsedMs = Number(detail.elapsedMs);
+  } else if (job.status !== 'done' && job.status !== 'failed') {
+    // 服务端没给已用时间就自己按提交时刻算：卡片上的「已用 1 分 12 秒」不能一直空着
+    const since = Number(job.startedAt) || Number(job.createdAt) || Date.now();
+    job.elapsedMs = Math.max(job.elapsedMs, Date.now() - since);
+  }
+  if (Number.isFinite(Number(detail.ms)) && Number(detail.ms) > 0) job.ms = Number(detail.ms);
+  if (Number.isFinite(Number(detail.bytes))) job.bytes = Number(detail.bytes);
+  if (Number.isFinite(Number(detail.queuePosition))) job.queuePosition = Number(detail.queuePosition);
+  if (detail.videoUrl) job.videoUrl = String(detail.videoUrl);
+  if (detail.error) job.error = String(detail.error);
+  if (Array.isArray(detail.warnings)) job.warnings = detail.warnings.map(String);
+  if (detail.title && !job.title) job.title = String(detail.title);
+  if (Number(detail.seconds) > 0) job.seconds = Number(detail.seconds);
+  if (job.status === 'done') {
+    job.hasVideo = Boolean(job.videoUrl || job.ms || job.bytes) || job.hasVideo;
+    if (!job.elapsedMs) job.elapsedMs = job.ms;
+  }
+  if ((job.status === 'done' || job.status === 'failed') && !job._libraryRefreshed) {
+    job._libraryRefreshed = true;
+    loadStudioLibrary();
+  }
+  return studioJobSignature(job) !== before;
+}
+
+/** 新建或更新一条任务卡。返回任务对象。 */
+function adoptStudioJob(jobId, meta) {
+  const id = String(jobId || '').trim();
+  if (!id) return null;
+  const prev = studioJobs.get(id) || {};
+  const job = Object.assign({
+    id,
+    title: '',
+    status: 'queued',
+    phase: '',
+    label: '排队中',
+    done: 0,
+    total: 0,
+    elapsedMs: 0,
+    ms: 0,
+    bytes: 0,
+    videoUrl: '',
+    warnings: [],
+    error: '',
+    queuePosition: 0,
+    createdAt: Date.now(),
+    seconds: 0,
+  }, prev, meta || {});
+  job.title = String(job.title || '').trim();
+  studioJobs.set(id, job);
+  renderStudioJobs();
+  if (job.status !== 'done' && job.status !== 'failed') startStudioPoll();
+  return job;
+}
+
+/** 只轮询还在跑的任务，2 秒一次；都结束了就停表。 */
+function startStudioPoll() {
+  if (studioPollTimer) return;
+  studioPollTimer = setInterval(pollStudioJobs, 2000);
 }
 
 function stopStudioPoll() {
@@ -1887,309 +2728,749 @@ function stopStudioPoll() {
     clearInterval(studioPollTimer);
     studioPollTimer = null;
   }
-  studioPollInFlight = false;
 }
 
-/** 每 1.5 秒问一次进度。渲染请求本身还在飞，所以这里只读旁路信息。 */
-function startStudioPoll(projectId) {
-  stopStudioPoll();
-  const tick = async () => {
-    if (studioPollInFlight || !projectId) return;
-    studioPollInFlight = true;
-    try {
-      const res = await apiFetch(`/api/studio/progress?id=${encodeURIComponent(projectId)}`);
-      if (res.ok) {
-        const p = await res.json().catch(() => null);
-        if (p && p.ok && p.status !== 'idle') {
-          const total = Number(p.total) || studioScenes.length || 0;
-          const done = Number(p.done) || 0;
-          const elapsed = Math.round((Number(p.elapsedMs) || 0) / 1000);
-          if (p.status === 'running') {
-            const label = p.label || '渲染中';
-            const suffix = total ? `（${done}/${total}）` : '';
-            studioProgressSet(`${label}${suffix} · 已用 ${elapsed} 秒`, total ? done / total : 0.05);
-          } else if (p.status === 'done') {
-            studioProgressSet(`渲染完成 · 用时 ${Math.round((Number(p.ms) || 0) / 1000)} 秒`, 1);
-          } else if (p.status === 'failed') {
-            studioProgressSet(`失败：${p.error || '渲染失败'}`, 1);
-          }
-        }
-      }
-    } catch {
-      /* 进度是旁路信息，失败不影响正在跑的渲染 */
-    } finally {
-      studioPollInFlight = false;
-    }
-  };
-  tick();
-  studioPollTimer = setInterval(tick, 1500);
-}
-
-// ------------------------------------------------------------ 三个入口 --
-
-/** 写稿：稿子 → 分镜表。只拆场，不渲染。 */
-async function studioGenerateScript() {
-  if (studioBusy) return;
-  const script = studioEls.script ? studioEls.script.value.trim() : '';
-  if (!script) {
-    studioSetHint(studioEls.scriptHint, '先把稿子贴进来。');
+async function pollStudioJobs() {
+  const running = studioJobsRunning().filter((job) => !String(job.id).startsWith('local-'));
+  if (!running.length) {
+    stopStudioPoll();
     return;
   }
-  const config = readStudioConfig();
-  studioConfig = Object.assign({}, config);
-  setStudioBusy(true);
-  studioProgressShow(false);
-  studioSetHint(studioEls.scriptHint, '正在拆场…（只写分镜，不渲染）');
+  if (studioPollBusy) return;
+  studioPollBusy = true;
+  let changed = false;
   try {
-    const r = await studioPost('/api/studio/script', {
-      script,
-      seconds: config.seconds,
-      style: config.style,
-      voice: config.voice,
-      projectId: studioProjectId,
-    });
-    if (!r || !r.ok) return studioFailure(r, studioEls.scriptHint);
-    adoptStudioScenes(r);
-    setStudioMode('scenes');
-    const stats = r.estimate || {};
-    studioSetHint(studioEls.scriptHint, `拆好了：${studioScenes.length} 场 / 约 ${stats.seconds || studioSecondsTotal()} 秒。下面每一场都能改。`);
-    if (Array.isArray(r.warnings) && r.warnings.length) {
-      studioSetHint(studioEls.sceneHint, r.warnings.join(' '));
-    } else {
-      studioSetHint(studioEls.sceneHint, '接下来点「补全动画」，把「画什么」翻译成 manim 代码。');
-    }
+    await Promise.all(running.map(async (job) => {
+      const r = await studioRequest(`/api/studio/jobs/${encodeURIComponent(job.id)}`, null, 'GET');
+      if (!studioOk(r.status) || !r.data) return;
+      if (applyStudioJobDetail(job.id, r.data.job || r.data)) changed = true;
+    }));
   } catch (err) {
-    studioSetHint(studioEls.scriptHint, '出错：' + ((err && err.message) || err));
+    /* 轮询是旁路：抖一下就跳过这一轮，别打断已经在跑的任务 */
+  } finally {
+    studioPollBusy = false;
+  }
+  if (changed) renderStudioJobs();
+  if (!studioJobsRunning().filter((job) => !String(job.id).startsWith('local-')).length) stopStudioPoll();
+}
+
+// ---- 浏览器本地记住"任务是怎么做出来的"（刷新后重做要用）------------------
+
+const STUDIO_RECIPES_KEY = 'dsh-studio-recipes';
+const STUDIO_RECIPES_MAX = 20;
+
+function readStudioRecipes() {
+  try {
+    const list = JSON.parse(window.localStorage.getItem(STUDIO_RECIPES_KEY) || '[]');
+    return Array.isArray(list) ? list : [];
+  } catch (err) {
+    return [];
+  }
+}
+
+function writeStudioRecipes(list) {
+  try {
+    window.localStorage.setItem(STUDIO_RECIPES_KEY, JSON.stringify(list.slice(0, STUDIO_RECIPES_MAX)));
+  } catch (err) {
+    /* 存不下就算了：任务本身在服务端，重做还有历史那条路 */
+  }
+}
+
+function rememberStudioRecipe(jobId, recipe) {
+  if (!jobId) return;
+  const list = readStudioRecipes().filter((it) => it && it.id !== jobId);
+  list.unshift(Object.assign({ id: jobId, at: Date.now() }, recipe || {}));
+  writeStudioRecipes(list);
+}
+
+function studioRecipe(jobId) {
+  return readStudioRecipes().find((it) => it && it.id === jobId) || null;
+}
+
+/** 存起来的配方只要重做要用的字段，不带 manim 代码（重做本来就会重新生成）。 */
+function slimStudioPayload(payload) {
+  const out = {
+    seconds: Number(payload && payload.seconds) || 60,
+    style: (payload && payload.style) || '',
+    voice: (payload && payload.voice) || '',
+  };
+  if (payload && payload.prompt) out.prompt = String(payload.prompt).slice(0, 4000);
+  if (payload && payload.script) out.script = String(payload.script).slice(0, 20000);
+  if (payload && payload.image) out.image = String(payload.image);
+  if (payload && Array.isArray(payload.scenes)) {
+    out.scenes = payload.scenes.map((s) => {
+      const one = {
+        text: String((s && s.text) || ''),
+        narration: String((s && s.narration) || ''),
+        seconds: Number(s && s.seconds) || 5,
+        visual_hint: String((s && s.visual_hint) || ''),
+        tool: String((s && s.tool) || ''),
+      };
+      if (s && s.image) one.image = String(s.image);
+      return one;
+    });
+  }
+  return out;
+}
+
+// ---- 历史（library）：重做 / 载入到分镜表格 / 删除 -------------------------
+
+/** 任务卡和历史条目怎么对上：有 id 用 id，没有就按标题 + 时间就近认一条。 */
+function studioLibraryIdForJob(job) {
+  if (!job || !studioLibrary.length) return '';
+  const wanted = String(job.libraryId || job.itemId || job.id || '');
+  const byId = studioLibrary.find((it) => it && String(it.id) === wanted);
+  if (byId) return String(byId.id);
+  const title = String(job.title || '').trim();
+  if (!title) return '';
+  const at = Number(job.createdAt) || 0;
+  let best = null;
+  let bestGap = Infinity;
+  for (const it of studioLibrary) {
+    if (!it || String(it.title || '').trim() !== title) continue;
+    const gap = at ? Math.abs((studioTimeOf(it.createdAt) || 0) - at) : 0;
+    if (at && gap > 30 * 60 * 1000) continue;
+    if (gap < bestGap) {
+      best = it;
+      bestGap = gap;
+    }
+  }
+  return best ? String(best.id) : '';
+}
+
+async function loadStudioLibrary() {
+  const r = await studioRequest('/api/studio/library', null, 'GET');
+  if (r.status === 404) {
+    // 老 studio 没有历史接口：不报错，安静地空着（重做还有本地配方那条路）
+    studioLibrary = [];
+    renderStudioLibrary();
+    return;
+  }
+  if (!studioOk(r.status) || !r.data || !r.data.ok) {
+    studioLibrary = [];
+    renderStudioLibrary('历史暂时读不到（studio 没回话）。');
+    return;
+  }
+  const items = Array.isArray(r.data.items) ? r.data.items : (Array.isArray(r.data.jobs) ? r.data.jobs : []);
+  studioLibrary = items.slice(0, 50);
+  renderStudioLibrary();
+  renderStudioJobs();
+}
+
+function libActionButton(act, text, extraClass) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = extraClass ? `lib-btn ${extraClass}` : 'lib-btn';
+  btn.dataset.act = act;
+  btn.textContent = text;
+  return btn;
+}
+
+function renderStudioLibrary(note) {
+  const list = studioEls.libList;
+  if (!list) return;
+  list.textContent = '';
+  if (studioEls.libEmpty) {
+    studioEls.libEmpty.textContent = note || '还没有存过的分镜。';
+    studioEls.libEmpty.classList.toggle('hidden', studioLibrary.length > 0);
+  }
+  for (const item of studioLibrary.slice(0, 50)) {
+    const li = document.createElement('li');
+    li.className = 'lib-item';
+    li.dataset.libId = String(item && item.id ? item.id : '');
+
+    const row = document.createElement('div');
+    row.className = 'lib-row';
+
+    const title = document.createElement('button');
+    title.type = 'button';
+    title.className = 'lib-title';
+    title.dataset.act = 'open';
+    title.title = '点一下看分镜（只读）';
+    title.textContent = String((item && item.title) || '未命名');
+
+    const meta = document.createElement('span');
+    meta.className = 'lib-meta';
+    const bits = [];
+    if (Number(item && item.sceneCount) > 0) bits.push(`${Number(item.sceneCount)} 场`);
+    if (Number(item && item.seconds) > 0) bits.push(`${Math.round(Number(item.seconds))} 秒`);
+    const when = studioFmtWhen(item && item.createdAt);
+    if (when) bits.push(when);
+    if (item && item.status === 'failed') bits.push('上次没做成');
+    meta.textContent = bits.join(' · ');
+
+    const ops = document.createElement('span');
+    ops.className = 'lib-ops';
+    ops.append(libActionButton('rerun', '重做'), libActionButton('load', '载入'), libActionButton('del', '删除', 'danger'));
+    row.append(title, meta, ops);
+    li.append(row);
+
+    const detail = document.createElement('div');
+    detail.className = 'lib-detail hidden';
+    li.append(detail);
+    list.append(li);
+  }
+}
+
+/** 点标题：展开/收起这一条的分镜（只读）。 */
+async function toggleStudioLibItem(li, id) {
+  const detail = li.querySelector('.lib-detail');
+  if (!detail) return;
+  if (!detail.classList.contains('hidden')) {
+    detail.classList.add('hidden');
+    detail.textContent = '';
+    return;
+  }
+  detail.classList.remove('hidden');
+  detail.textContent = '读取中…';
+  const r = await studioRequest(`/api/studio/library/${encodeURIComponent(id)}`, null, 'GET');
+  if (!studioOk(r.status) || !r.data || !r.data.ok || !r.data.item) {
+    detail.textContent = '读不到这条（可能已经删了）。';
+    return;
+  }
+  const item = r.data.item;
+  const scenes = Array.isArray(item.scenes) ? item.scenes : [];
+  detail.textContent = '';
+  if (!scenes.length) {
+    detail.textContent = '这一条没有分镜。';
+    return;
+  }
+  scenes.forEach((scene, index) => {
+    const p = document.createElement('p');
+    p.className = 'lib-scene';
+    const head = document.createElement('b');
+    head.textContent = `${index + 1}. `;
+    p.append(head, document.createTextNode(
+      `${String((scene && scene.text) || '（没标题）')} · ${studioSceneSeconds(scene)} 秒`,
+    ));
+    if (scene && scene.narration) {
+      const line = document.createElement('span');
+      line.className = 'lib-scene-line';
+      line.textContent = `旁白：${scene.narration}`;
+      p.append(line);
+    }
+    if (scene && scene.visual_hint) {
+      const line = document.createElement('span');
+      line.className = 'lib-scene-line';
+      line.textContent = `画什么：${scene.visual_hint}`;
+      p.append(line);
+    }
+    detail.append(p);
+  });
+}
+
+/** 「重做」历史里的一条：让 studio 用它保存的配方再跑一遍，生成一张新任务卡。 */
+async function rerunStudioLibrary(id) {
+  if (studioBusy) return;
+  setStudioBusy(true);
+  setStudioStartError('');
+  try {
+    const r = await studioRequest(`/api/studio/library/${encodeURIComponent(id)}/rerun`, {}, 'POST');
+    if (studioOk(r.status) && r.data && r.data.ok && r.data.jobId) {
+      const found = studioLibrary.find((it) => String(it.id) === String(id));
+      adoptStudioJob(r.data.jobId, {
+        title: (found && found.title) || '重做',
+        seconds: Number(found && found.seconds) || 0,
+        status: 'queued',
+        createdAt: Date.now(),
+      });
+      setStudioHintText('已经按这条历史重做了一份，新任务在最上面。');
+      return;
+    }
+    setStudioStartError('重做没成功：' + ((r.data && (r.data.error || r.data.message)) || `HTTP ${r.status}`));
+  } catch (err) {
+    setStudioStartError('重做失败：' + ((err && err.message) || err));
   } finally {
     setStudioBusy(false);
   }
 }
 
-/** 分镜：把每一场的「画什么」补成 manim 代码（同样不渲染）。 */
+/** 「载入」：把历史里的分镜放回高级区表格，改完再点「开始做」。 */
+async function loadStudioLibraryItem(id) {
+  if (studioLibBusy) return;
+  studioLibBusy = true;
+  setStudioStartError('');
+  try {
+    const r = await studioRequest(`/api/studio/library/${encodeURIComponent(id)}`, null, 'GET');
+    if (!studioOk(r.status) || !r.data || !r.data.ok || !r.data.item) {
+      setStudioStartError('这条历史读不到（可能已经删了）。');
+      return;
+    }
+    const item = r.data.item;
+    const request = item.request || {};
+    const scenes = Array.isArray(item.scenes) ? item.scenes : [];
+    if (!scenes.length) {
+      setStudioStartError('这条历史没有分镜，没法载入。');
+      return;
+    }
+    studioTitle = String(item.title || request.title || '').slice(0, 60);
+    adoptStudioScenes({ title: studioTitle, scenes });
+    studioScenesTouched = true;
+    studioScenesFromText = studioEls.input ? studioEls.input.value.trim() : '';
+    if (studioEls.input && !studioEls.input.value.trim()) studioEls.input.value = studioTitle;
+    const seconds = Number(request.seconds || item.seconds);
+    if (studioEls.seconds && seconds > 0) studioEls.seconds.value = String(seconds);
+    if (request.style) setStudioSelectValue(studioEls.style, request.style);
+    if (request.voice) setStudioSelectValue(studioEls.voice, request.voice);
+    setStudioAdvanced(true);
+    if (studioEls.scenesBox) studioEls.scenesBox.open = true;
+    setStudioSceneHint(`已载入《${studioTitle || '未命名'}》的 ${scenes.length} 场：改完回上面点「开始做」，就用这份分镜。`);
+    updateStudioHint();
+  } catch (err) {
+    setStudioStartError('载入失败：' + ((err && err.message) || err));
+  } finally {
+    studioLibBusy = false;
+  }
+}
+
+/** 删除历史里的这一条（成片不动，生成的 mp4 照样能下载）。 */
+async function deleteStudioLibraryItem(id) {
+  setStudioStartError('');
+  try {
+    const r = await studioRequest(`/api/studio/library/${encodeURIComponent(id)}`, null, 'DELETE');
+    if (studioOk(r.status) && r.data && r.data.ok) {
+      studioLibrary = studioLibrary.filter((it) => String(it.id) !== String(id));
+      renderStudioLibrary();
+      renderStudioJobs();
+      return;
+    }
+    setStudioStartError('删除没成功：' + ((r.data && (r.data.error || r.data.message)) || `HTTP ${r.status}`));
+  } catch (err) {
+    setStudioStartError('删除失败：' + ((err && err.message) || err));
+  }
+}
+
+/** 历史区的点击：展开 / 重做 / 载入 / 删除（删除要点两下，免得误删）。 */
+async function onStudioLibClick(event) {
+  const btn = event.target.closest('[data-act]');
+  if (!btn) return;
+  const li = btn.closest('.lib-item');
+  const id = li ? li.dataset.libId : '';
+  if (!id) return;
+  const act = btn.dataset.act;
+  if (act === 'open') return toggleStudioLibItem(li, id);
+  if (act === 'rerun') return rerunStudioLibrary(id);
+  if (act === 'load') return loadStudioLibraryItem(id);
+  if (act === 'del') {
+    if (btn.dataset.confirm !== '1') {
+      btn.dataset.confirm = '1';
+      btn.textContent = '确认删?';
+      window.setTimeout(() => {
+        btn.dataset.confirm = '';
+        btn.textContent = '删除';
+      }, 4000);
+      return;
+    }
+    return deleteStudioLibraryItem(id);
+  }
+}
+
+// ---- 提交：一个入口干三种事 ------------------------------------------------
+
+/** 「开始做」的请求体：分镜改过就用分镜，否则按字数判断是题目还是稿子。 */
+function studioBuildPayload() {
+  const text = studioEls.input ? studioEls.input.value.trim() : '';
+  const seconds = Number(studioEls.seconds && studioEls.seconds.value) || 60;
+  const style = studioEls.style ? studioEls.style.value : '';
+  const voice = studioEls.voice ? studioEls.voice.value : '';
+  // 首屏那张参考图：有分镜就挂到第一场（那一场自己已经有图就不动），
+  // 同时留一份在请求体顶层 —— 题目/稿子没有 scenes 可挂，后端认哪个都能用上。
+  const refImage = studioRefImage && studioRefImage.uploadId ? String(studioRefImage.uploadId) : '';
+  const usesScenes = studioScenes.length > 0 && (studioScenesTouched || (text && text === studioScenesFromText));
+  if (usesScenes) {
+    const scenes = studioPlanFromScenes().scenes;
+    if (refImage && scenes.length && !scenes[0].image) scenes[0].image = refImage;
+    const payload = { scenes, seconds, style, voice };
+    if (refImage) payload.image = refImage;
+    return { payload, title: studioTitle || text, kind: 'scenes' };
+  }
+  if (!text && !refImage) return { payload: null, title: '', kind: '' };
+  const kind = classifyStudioInput(text);
+  const title = studioTitleOfText(text, kind);
+  const payload = kind === 'script'
+    ? { script: text, seconds, style, voice }
+    : { prompt: text, seconds, style, voice };
+  if (refImage) payload.image = refImage;
+  return { payload, title, kind };
+}
+
+async function studioStart() {
+  if (studioBusy) return;
+  const built = studioBuildPayload();
+  if (!built.payload) {
+    setStudioStartError('先写一句要做什么，再点「开始做」。');
+    if (studioEls.input) studioEls.input.focus();
+    return;
+  }
+  await submitStudioJob(built.payload, built.title);
+}
+
+/** 这次提交里有没有「AI 视频」场：有就先提醒额度用完了（会降级成文字卡）。 */
+function studioPayloadHasAiVideo(payload) {
+  if (!payload || !Array.isArray(payload.scenes)) return false;
+  return payload.scenes.some((s) => s && (s.tool === 'aivideo' || s.kind === 'aivideo'));
+}
+
+/** 提交：先把任务卡放上去（看着有反应），再等接口回 jobId。 */
+async function submitStudioJob(payload, title) {
+  if (studioBusy) return null;
+  setStudioBusy(true);
+  setStudioStartError('');
+  try {
+    const r = await studioRequest('/api/studio/jobs', payload, 'POST');
+    if (studioOk(r.status) && r.data && r.data.ok && r.data.jobId) {
+      const job = adoptStudioJob(r.data.jobId, {
+        title: title || '未命名',
+        seconds: Number(payload.seconds) || 0,
+        status: 'queued',
+        createdAt: Date.now(),
+      });
+      rememberStudioRecipe(r.data.jobId, {
+        title: title || '未命名',
+        seconds: Number(payload.seconds) || 0,
+        payload: slimStudioPayload(payload),
+      });
+      setStudioHintText('开工了。下面那张卡会自己更新，不用守在这儿。'
+        + (studioPayloadHasAiVideo(payload) ? ' 注意：AI 视频额度已用完，标了 AI 画面的场会降级成文字卡。' : ''));
+      if (studioEls.startError) studioEls.startError.classList.add('hidden');
+      return job;
+    }
+    // studio 还没这套接口 → 回退老流程（拆分镜 → 补动画 → 建项目 → 渲染），不白屏
+    if (r.status === 404 || r.status === 501
+      || (r.data && (r.data.error === 'JOBS_UNAVAILABLE' || r.data.code === 'JOBS_UNAVAILABLE'))) {
+      return legacyStudioRun(payload, title);
+    }
+    // 其它失败：也放一张失败卡，让人看得见原因，而不是什么都没发生
+    return adoptStudioJob(`local-${Date.now().toString(36)}`, {
+      title: title || '未命名',
+      seconds: Number(payload.seconds) || 0,
+      status: 'failed',
+      createdAt: Date.now(),
+      error: (r.data && (r.data.error || r.data.message)) || `面板回了 HTTP ${r.status}`,
+    });
+  } catch (err) {
+    setStudioStartError('提交失败：' + ((err && err.message) || err));
+    return null;
+  } finally {
+    setStudioBusy(false);
+  }
+}
+
+/** 「重做」任务卡：优先用 studio 记住的配方（历史那条 rerun），其次浏览器存的请求。 */
+async function rerunStudioJob(job) {
+  if (!job || studioBusy) return;
+  const libId = studioLibraryIdForJob(job);
+  if (libId) {
+    await rerunStudioLibrary(libId);
+    return;
+  }
+  const recipe = studioRecipe(job.id);
+  if (recipe && recipe.payload) {
+    await submitStudioJob(recipe.payload, recipe.title || job.title);
+    return;
+  }
+  setStudioStartError('这条任务没留下做法：用上面的输入框再写一次。');
+}
+
+/** 卡片的点击：播放 / 下载 / 重做。 */
+async function onStudioJobClick(event) {
+  const btn = event.target.closest('[data-act]');
+  if (!btn) return;
+  const card = btn.closest('.job');
+  const job = card ? studioJobs.get(card.dataset.jobId) : null;
+  if (!job) return;
+  const act = btn.dataset.act;
+  if (act === 'rerun') return rerunStudioJob(job);
+  if (act === 'play') {
+    let video = card.querySelector('.job-video');
+    if (!video) {
+      video = document.createElement('video');
+      video.className = 'job-video';
+      video.controls = true;
+      video.preload = 'metadata';
+      card.append(video);
+    }
+    const url = studioJobVideoUrl(job);
+    if (video.getAttribute('src') !== url) video.src = url;
+    video.classList.remove('hidden');
+    const played = video.play();
+    if (played && played.catch) played.catch(() => { /* 自动播放被挡：控件还在，用户自己点 */ });
+  }
+}
+
+// ---- 老流程（studio 没有 /v1/jobs 时的回退）--------------------------------
+
+function stopLegacyProgress() {
+  if (legacyProgressTimer) {
+    clearInterval(legacyProgressTimer);
+    legacyProgressTimer = null;
+  }
+}
+
+/** 老流程的进度只有"第几场"，照样写进卡片，让用户看着是同一回事。 */
+function startLegacyProgress(jobId, projectId) {
+  stopLegacyProgress();
+  legacyProgressTimer = setInterval(async () => {
+    try {
+      const res = await apiFetch(`/api/studio/progress?id=${encodeURIComponent(projectId)}`);
+      if (!res.ok) return;
+      const p = await res.json().catch(() => null);
+      const job = studioJobs.get(jobId);
+      if (!job || !p || !p.ok || p.status === 'idle') return;
+      if (p.status === 'running') {
+        job.label = p.label || '渲染中';
+        job.done = Number(p.done) || 0;
+        job.total = Number(p.total) || 0;
+        job.elapsedMs = Number(p.elapsedMs) || job.elapsedMs;
+      }
+      renderStudioJobs();
+    } catch (err) {
+      /* 进度是旁路信息 */
+    }
+  }, 2000);
+}
+
+/**
+ * 回退流程：拆分镜 → 补动画 → 建项目 → 渲染。
+ * 卡片照样先出现、照样更新，所以用户看着和正常任务一样（只是没有那么细的阶段）。
+ */
+async function legacyStudioRun(payload, title) {
+  const jobId = `local-${Date.now().toString(36)}`;
+  adoptStudioJob(jobId, {
+    title: title || '未命名',
+    seconds: Number(payload.seconds) || 60,
+    status: 'running',
+    label: '写分镜',
+    createdAt: Date.now(),
+    startedAt: Date.now(),
+  });
+  const patch = (fields) => {
+    const job = studioJobs.get(jobId);
+    if (!job) return;
+    Object.assign(job, fields);
+    if (!job.elapsedMs || fields.status === 'failed' || fields.status === 'done') {
+      job.elapsedMs = Date.now() - (Number(job.startedAt) || Date.now());
+    }
+    renderStudioJobs();
+  };
+  const fail = (reason) => patch({ status: 'failed', error: String(reason || '未知原因'), canRerun: Boolean(studioRecipe(jobId)) });
+  const seconds = Number(payload.seconds) || 60;
+  const style = payload.style || '';
+  const voice = payload.voice || '';
+  try {
+    let scenes = Array.isArray(payload.scenes) && payload.scenes.length ? payload.scenes : null;
+    let projectTitle = title || '';
+    if (!scenes) {
+      const r = payload.script
+        ? await studioRequest('/api/studio/script', { script: payload.script, seconds, style, voice }, 'POST')
+        : await studioRequest('/api/studio/plan', { prompt: payload.prompt, seconds, style, voice }, 'POST');
+      if (!studioOk(r.status) || !r.data || !r.data.ok) return fail(studioErrorText(r.data || {}));
+      adoptStudioScenes(r.data);
+      projectTitle = studioTitle || projectTitle;
+      scenes = studioPlanFromScenes().scenes;
+    } else {
+      adoptStudioScenes({ title: projectTitle, scenes });
+    }
+    if (scenesNeedFill()) {
+      patch({ label: '生成动画' });
+      const filled = await studioRequest('/api/studio/scenes', {
+        title: projectTitle,
+        projectId: studioProjectId,
+        scenes,
+        style,
+        voice,
+      }, 'POST');
+      if (filled.status !== 200 || !filled.data || !filled.data.ok) return fail(studioErrorText(filled.data || {}));
+      adoptStudioScenes(filled.data);
+      scenes = studioPlanFromScenes().scenes;
+    }
+    patch({ label: '准备渲染' });
+    const created = await studioRequest('/api/studio/project', {
+      id: studioProjectId,
+      title: projectTitle,
+      scenes,
+      style,
+      voice,
+    }, 'POST');
+    if (created.status !== 200 || !created.data || !created.data.ok) return fail(studioErrorText(created.data || {}));
+    if (created.data.project && created.data.project.id) studioProjectId = String(created.data.project.id);
+    patch({ label: '渲染中' });
+    startLegacyProgress(jobId, studioProjectId);
+    const rendered = await studioRequest('/api/studio/project/render', {
+      id: studioProjectId,
+      scope: 'auto',
+      style,
+      voice,
+    }, 'POST');
+    stopLegacyProgress();
+    if (rendered.status !== 200 || !rendered.data || !rendered.data.ok) return fail(studioErrorText(rendered.data || {}));
+    const data = rendered.data;
+    const videoId = String(data.jobId || data.renderId || data.id || '');
+    patch({
+      status: 'done',
+      label: '完成',
+      ms: Number(data.ms) || 0,
+      bytes: Number(data.bytes) || 0,
+      seconds: Number(data.seconds) || seconds,
+      warnings: Array.isArray(data.warnings) ? data.warnings.map(String) : [],
+      videoPath: videoId ? `/api/studio/video?id=${encodeURIComponent(videoId)}` : '',
+      hasVideo: Boolean(videoId),
+    });
+    rememberStudioRecipe(jobId, { title: projectTitle, seconds, payload: slimStudioPayload(payload) });
+    loadStudioLibrary();
+    return studioJobs.get(jobId) || null;
+  } catch (err) {
+    stopLegacyProgress();
+    return fail('出错：' + ((err && err.message) || err));
+  }
+}
+
+/** 高级区专用：把每场的「画什么」翻译成动画代码（不渲染）。 */
 async function studioFillScenes() {
   if (studioBusy) return;
   if (!studioScenes.length) {
-    studioSetHint(studioEls.sceneHint, '还没有分镜：先写稿，或者加一场。');
+    setStudioSceneHint('还没有分镜：先写一句点「开始做」，或者点「加一场」自己写。');
     return;
   }
-  const config = readStudioConfig();
-  studioConfig = Object.assign({}, config);
   setStudioBusy(true);
-  studioProgressShow(false);
   const manim = studioScenes.filter((s) => s.tool !== 'text').length;
-  studioSetHint(studioEls.sceneHint, `正在生成动画代码：${manim} 场要画，可能要一两分钟…`);
+  setStudioSceneHint(`正在生成动画代码：${manim} 场要画，可能要一两分钟…`);
   try {
-    const plan = studioPlanFromScenes();
-    const r = await studioPost('/api/studio/scenes', {
+    const r = await studioRequest('/api/studio/scenes', {
       title: studioTitle,
       projectId: studioProjectId,
-      scenes: plan.scenes,
-      style: config.style,
-      voice: config.voice,
-    });
-    if (!r || !r.ok) return studioFailure(r, studioEls.sceneHint);
-    adoptStudioScenes(r);
-    const stats = r.stats || {};
-    studioSetHint(
-      studioEls.sceneHint,
-      `补全完成：manim ${stats.manim || 0} 场 / 文字卡 ${stats.text || 0} 场` +
-      (stats.fallback ? `（${stats.fallback} 场生成失败，已降级）` : '') + '。点「渲染」出片。',
+      scenes: studioPlanFromScenes().scenes,
+      style: studioEls.style ? studioEls.style.value : '',
+      voice: studioEls.voice ? studioEls.voice.value : '',
+    }, 'POST');
+    if (!studioOk(r.status) || !r.data || !r.data.ok) {
+      setStudioSceneHint('没做成：' + studioErrorText(r.data || {}));
+      return;
+    }
+    adoptStudioScenes(r.data);
+    studioScenesTouched = true;
+    const stats = r.data.stats || {};
+    setStudioSceneHint(
+      `补全完成：动画 ${stats.manim || 0} 场 / 文字卡 ${stats.text || 0} 场`
+      + (stats.fallback ? `（${stats.fallback} 场降级成文字卡）` : '') + '。回上面点「开始做」出片。',
     );
   } catch (err) {
-    studioSetHint(studioEls.sceneHint, '出错：' + ((err && err.message) || err));
+    setStudioSceneHint('出错：' + ((err && err.message) || err));
   } finally {
     setStudioBusy(false);
   }
 }
 
-/** 全自动：给个主题，写分镜并直接出片（这一步是长请求，没有中间进度）。 */
-async function studioAutoCreate() {
-  if (studioBusy) return;
-  const prompt = studioEls.prompt ? studioEls.prompt.value.trim() : '';
-  if (!prompt) {
-    studioSetHint(studioEls.resultHint, '先写一句想要什么。');
-    return;
-  }
-  const config = readStudioConfig();
-  studioConfig = Object.assign({}, config);
-  setStudioBusy(true);
-  studioProgressShow(true);
-  studioProgressSet('全自动：写分镜并渲染，可能要 1~3 分钟…', 0.05);
-  const startedAt = Date.now();
-  const ticker = setInterval(() => {
-    const sec = Math.round((Date.now() - startedAt) / 1000);
-    studioProgressSet(`全自动：写分镜并渲染中… 已用 ${sec} 秒`, 0.08);
-  }, 1000);
-  try {
-    const r = await studioPost('/api/studio/create', {
-      prompt,
-      seconds: config.seconds,
-      style: config.style,
-      voice: config.voice,
-    });
-    if (!r || !r.ok) return studioFailure(r, studioEls.resultHint);
-    adoptStudioScenes(r);
-    studioRenderOk(r, '做好了：');
-  } catch (err) {
-    studioSetHint(studioEls.resultHint, '出错：' + ((err && err.message) || err));
-  } finally {
-    clearInterval(ticker);
-    setStudioBusy(false);
-  }
-}
+// ---- 进视频页时把状态补齐 --------------------------------------------------
 
-/** 预览分镜：三种模式各自的"只出分镜"。 */
-async function studioPreview() {
-  if (studioMode === 'script') return studioGenerateScript();
-  if (studioMode === 'scenes') return studioFillScenes();
-  if (studioBusy) return;
-  const prompt = studioEls.prompt ? studioEls.prompt.value.trim() : '';
-  if (!prompt) {
-    studioSetHint(studioEls.resultHint, '先写一句想要什么。');
-    return;
-  }
-  const config = readStudioConfig();
-  studioConfig = Object.assign({}, config);
-  setStudioBusy(true);
-  studioSetHint(studioEls.resultHint, '正在写分镜…（只写不渲染）');
-  try {
-    const r = await studioPost('/api/studio/plan', {
-      prompt,
-      seconds: config.seconds,
-      style: config.style,
-      voice: config.voice,
-    });
-    if (!r || !r.ok) return studioFailure(r, studioEls.resultHint);
-    adoptStudioScenes(r);
-    studioSetHint(studioEls.resultHint, `分镜写好了：${studioScenes.length} 场，还没渲染。`);
-  } catch (err) {
-    studioSetHint(studioEls.resultHint, '出错：' + ((err && err.message) || err));
-  } finally {
-    setStudioBusy(false);
-  }
-}
-
-// ---------------------------------------------------------------- 渲染 --
-
-/** 渲染成功：<video> 走不可猜的 jobId，下载用同一个地址。 */
-function studioRenderOk(r, prefix) {
-  if (!r || !r.jobId) {
-    studioFailure(r, studioEls.resultHint);
-    return;
-  }
-  const url = `/api/studio/video?id=${encodeURIComponent(r.jobId)}`;
-  if (studioEls.video) {
-    studioEls.video.src = url;
-    studioEls.video.classList.remove('hidden');
-  }
-  if (studioEls.download) {
-    studioEls.download.href = url;
-    studioEls.download.setAttribute('download', `studio-${r.jobId}.mp4`);
-    studioEls.download.classList.remove('hidden');
-  }
-  const mb = typeof r.bytes === 'number' ? (r.bytes / 1048576).toFixed(1) : '?';
-  const ms = Number(r.ms) || 0;
-  const took = ms > 0 ? (ms / 1000).toFixed(1) + ' 秒' : '?';
-  studioProgressShow(true);
-  studioProgressSet('渲染完成', 1);
-  studioSetHint(
-    studioEls.resultHint,
-    `${prefix || ''}${r.seconds} 秒 / ${mb} MB / 旁白 ${r.narrationCount || 0} 条 / 用时 ${took}`,
-  );
-}
-
-/** 渲染：缺代码先补全，再建项目、发渲染请求、同时轮询进度。 */
-async function studioRenderCurrent() {
-  if (studioBusy) return;
-  if (studioMode === 'auto') return studioAutoCreate();
-  if (!studioScenes.length) {
-    studioSetHint(studioEls.sceneHint, '还没有分镜：先写稿，或者加一场。');
-    return;
-  }
-  if (!studioScenes.some((s) => String(s.text || '').trim() || String(s.narration || '').trim())) {
-    studioSetHint(studioEls.sceneHint, '每场都空着，渲出来会是纯色块；先写点东西。');
-    return;
-  }
-  const config = readStudioConfig();
-  studioConfig = Object.assign({}, config);
-  if (studioEls.video) studioEls.video.classList.add('hidden');
-  if (studioEls.download) studioEls.download.classList.add('hidden');
-  if (studioEls.raw) studioEls.raw.classList.add('hidden');
-  setStudioBusy(true);
-  studioProgressShow(true);
-  try {
-    if (scenesNeedFill()) {
-      studioProgressSet('先把「画什么」翻译成动画代码…', 0.03);
-      studioSetHint(studioEls.sceneHint, '正在补全动画代码…');
-      const plan = studioPlanFromScenes();
-      const filled = await studioPost('/api/studio/scenes', {
-        title: studioTitle,
-        projectId: studioProjectId,
-        scenes: plan.scenes,
-        style: config.style,
-        voice: config.voice,
-      });
-      if (!filled || !filled.ok) return studioFailure(filled, studioEls.sceneHint);
-      adoptStudioScenes(filled);
+/** 刷新后要恢复三样：任务卡、历史、人设绑定。 */
+async function loadStudioView() {
+  if (!studioOptionsLoaded) {
+    try {
+      await loadStudioBinding();
+    } catch (err) {
+      /* 人设读不到不影响做视频 */
     }
-
-    // 建/更新项目：拿到稳定 id，进度和成片都按这个 id 走
-    studioProgressSet('正在准备渲染…', 0.06);
-    const plan = studioPlanFromScenes();
-    const created = await studioPost('/api/studio/project', {
-      id: studioProjectId,
-      title: studioTitle,
-      scenes: plan.scenes,
-      style: config.style,
-      voice: config.voice,
-    });
-    if (!created || !created.ok) return studioFailure(created, studioEls.sceneHint);
-    studioProjectId = String(created.project.id);
-
-    startStudioPoll(studioProjectId);
-    studioProgressSet('正在渲染…', 0.08);
-    studioSetHint(studioEls.sceneHint, '渲染中：进度会显示第几场。');
-    const r = await studioPost('/api/studio/project/render', {
-      id: studioProjectId,
-      scope: 'auto',
-      style: config.style,
-      voice: config.voice,
-    });
-    stopStudioPoll();
-    if (!r || !r.ok) {
-      studioProgressSet('渲染失败', 1);
-      return studioFailure(r, studioEls.sceneHint);
-    }
-    studioRenderOk(r, '做好了：');
-    studioSetHint(studioEls.sceneHint, `渲染完成：${r.seconds} 秒。改一句台词后可以再点渲染，画面会复用缓存。`);
-  } catch (err) {
-    studioProgressSet('渲染失败', 1);
-    studioSetHint(studioEls.sceneHint, '出错：' + ((err && err.message) || err));
-  } finally {
-    stopStudioPoll();
-    setStudioBusy(false);
   }
+  if (!studioScenes.length) updateStudioMeta();
+  updateStudioHint();
+  renderStudioRefBox();
+  await Promise.all([
+    loadStudioJobs().catch(() => {}),
+    loadStudioLibrary().catch(() => {}),
+  ]);
 }
 
-// ------------------------------------------------------------------ 绑定 --
-
-for (const tab of studioEls.tabs) {
-  tab.addEventListener('click', () => setStudioMode(tab.dataset.mode));
+/** 从服务端恢复任务列表（本地的配方只用来补标题和「重做」）。 */
+async function loadStudioJobs() {
+  const r = await studioRequest('/api/studio/jobs', null, 'GET');
+  if (!studioOk(r.status) || !r.data || !r.data.ok) return; // 老 studio：没有就算了
+  const list = Array.isArray(r.data.jobs) ? r.data.jobs : (Array.isArray(r.data.items) ? r.data.items : []);
+  for (const raw of list.slice(0, 30)) {
+    const id = String((raw && (raw.id || raw.jobId)) || '');
+    if (!id) continue;
+    const recipe = studioRecipe(id);
+    adoptStudioJob(id, {
+      title: String((raw && raw.title) || (recipe && recipe.title) || ''),
+      status: String((raw && raw.status) || 'queued').toLowerCase(),
+      label: raw && raw.label,
+      done: raw && raw.done,
+      total: raw && raw.total,
+      elapsedMs: raw && raw.elapsedMs,
+      ms: raw && raw.ms,
+      bytes: raw && raw.bytes,
+      videoUrl: raw && raw.videoUrl,
+      warnings: raw && raw.warnings,
+      error: raw && raw.error,
+      queuePosition: raw && raw.queuePosition,
+      seconds: Number((raw && raw.seconds) || (recipe && recipe.seconds) || 0),
+      createdAt: studioTimeOf(raw && raw.createdAt) || (recipe && recipe.at) || Date.now(),
+    });
+  }
+  renderStudioJobs();
+  if (studioJobsRunning().length) startStudioPoll();
 }
-if (studioEls.scriptGo) studioEls.scriptGo.addEventListener('click', studioGenerateScript);
+
+// ---- 绑定 ------------------------------------------------------------------
+
+if (studioEls.go) studioEls.go.addEventListener('click', studioStart);
+if (studioEls.input) {
+  studioEls.input.addEventListener('input', () => {
+    setStudioStartError('');
+    updateStudioHint();
+  });
+  // Ctrl+Enter 直接开工：和聊天那边一个手感
+  studioEls.input.addEventListener('keydown', (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+      event.preventDefault();
+      studioStart();
+    }
+  });
+}
+if (studioEls.seconds) studioEls.seconds.addEventListener('change', updateStudioHint);
+if (studioEls.advToggle) studioEls.advToggle.addEventListener('click', () => setStudioAdvanced(!studioAdvOpen));
+if (studioEls.libToggle) {
+  studioEls.libToggle.addEventListener('click', () => {
+    setStudioLibrary(studioEls.libBody ? studioEls.libBody.classList.contains('hidden') : true);
+  });
+}
 if (studioEls.fill) studioEls.fill.addEventListener('click', studioFillScenes);
-if (studioEls.preview) studioEls.preview.addEventListener('click', studioPreview);
-if (studioEls.render) studioEls.render.addEventListener('click', studioRenderCurrent);
 if (studioEls.sceneAdd) studioEls.sceneAdd.addEventListener('click', studioAddScene);
 if (studioEls.sceneList) {
   // 事件委托：行是动态生成的，绑一次就够。input 直接改数组，不重建 DOM。
   studioEls.sceneList.addEventListener('input', onStudioSceneEdit);
   studioEls.sceneList.addEventListener('change', onStudioSceneEdit);
+  studioEls.sceneList.addEventListener('click', onStudioSceneImageClick);
+  studioEls.sceneList.addEventListener('click', onStudioSceneStickerClick);
   studioEls.sceneList.addEventListener('click', studioDeleteScene);
 }
-for (const sel of [studioEls.scriptStyle, studioEls.autoStyle, studioEls.scriptVoice, studioEls.autoVoice]) {
-  if (sel) sel.addEventListener('change', () => { studioConfig = readStudioConfig(); updateStudioEstimate(); });
+// 参考图：首屏那个小按钮和分镜行共用同一个 file input
+if (studioEls.refBtn) studioEls.refBtn.addEventListener('click', () => pickStudioImage('ref'));
+if (studioEls.refClear) studioEls.refClear.addEventListener('click', clearStudioRefImage);
+if (studioEls.imageInput) studioEls.imageInput.addEventListener('change', onStudioImagePicked);
+// 分镜表情选择器：关掉 / 点遮罩 / Esc / 搜索 / 全部-收藏
+if (sceneStickerEls.close) sceneStickerEls.close.addEventListener('click', closeSceneStickerPicker);
+if (sceneStickerEls.modal) {
+  sceneStickerEls.modal.addEventListener('click', (event) => {
+    if (event.target === sceneStickerEls.modal) closeSceneStickerPicker();
+  });
 }
+document.addEventListener('keydown', (event) => {
+  const open = sceneStickerEls.modal && !sceneStickerEls.modal.classList.contains('hidden');
+  if (event.key === 'Escape' && open) closeSceneStickerPicker();
+});
+if (sceneStickerEls.search) {
+  sceneStickerEls.search.addEventListener('input', () => {
+    clearTimeout(sceneStickerTimer);
+    sceneStickerTimer = setTimeout(() => loadSceneStickers(sceneStickerEls.search.value.trim()), 300);
+  });
+}
+if (sceneStickerEls.tabAll) sceneStickerEls.tabAll.addEventListener('click', () => setSceneStickerTab(false));
+if (sceneStickerEls.tabFav) sceneStickerEls.tabFav.addEventListener('click', () => setSceneStickerTab(true));
+if (studioEls.jobs) studioEls.jobs.addEventListener('click', onStudioJobClick);
+if (studioEls.libList) studioEls.libList.addEventListener('click', onStudioLibClick);
+
+
 
 /** 切栏：聊天 / 记忆 / 人格 / 账号。 */
 function setView(name) {

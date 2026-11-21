@@ -79,6 +79,9 @@ function sceneKey(scene, cfg) {
     textColor: scene.textColor || null,
     bg: scene.bg || null,
     image: scene.image || null,
+    // 参考图解析后的绝对路径也进缓存键：换了一张图必须重渲，不能复用旧画面。
+    // （image 是用户原始引用，imagePath 是 uploads 下的落地文件，两者都算素材。）
+    imagePath: scene.imagePath || null,
     motion: scene.motion || null,
     // 表情叠加也影响画面，必须进缓存键 —— 否则改了表情却复用旧片段
     stickers: Array.isArray(scene.stickers) ? scene.stickers : null,
@@ -163,13 +166,13 @@ function listProjects(root) {
  * 应用增量修改。AI 只发"第几场改哪个字段"，不用重发整个分镜 ——
  * 一场 60 字的分镜，改一个字只花十几 token，而不是整份 JSON。
  */
-function applyPatches(project, patches) {
+function applyPatches(project, patches, opts = {}) {
   const touched = [];
   for (const p of Array.isArray(patches) ? patches : []) {
     if (!p || typeof p !== 'object') continue;
     if (p.op === 'insert') {
       const at = Math.max(0, Math.min(project.scenes.length, Number(p.index)));
-      const scene = normalizeScene(p.scene || {});
+      const scene = normalizeScene(p.scene || {}, Object.assign({}, opts, { label: `scene#${at}` }));
       project.scenes.splice(at, 0, scene);
       touched.push(at);
       continue;
@@ -183,13 +186,23 @@ function applyPatches(project, patches) {
     }
     // 默认 op = patch：只覆盖给出的字段
     const merged = Object.assign({}, project.scenes[index], p.patch || {});
-    project.scenes[index] = normalizeScene(merged);
+    project.scenes[index] = normalizeScene(merged, Object.assign({}, opts, { label: `scene#${index}` }));
     touched.push(index);
   }
   return touched;
 }
 
-function normalizeScene(raw) {
+/**
+ * 场景归一化。
+ *
+ * 第二个参数是"降级要出声"的钩子：调用方传 { label, onDegrade }，
+ * normalizeScene 决定把 aivideo 退回文字卡时会回调一次。
+ * 以前这里是静默的 —— 用户选了「AI 生成视频」，prompt 又在链路上丢了，
+ * 最后只看到一张空背景卡，日志里一个字都没有。降级必须留痕。
+ */
+function normalizeScene(raw, opts = {}) {
+  const onDegrade = opts && typeof opts.onDegrade === 'function' ? opts.onDegrade : null;
+  const label = String((opts && opts.label) || 'scene');
   const hex = (v, fallback) => (/^#[0-9a-f]{6}$/i.test(String(v || '')) ? String(v) : fallback);
   const bg = raw.bg || {};
   const seconds = Math.min(12, Math.max(1, Number(raw.seconds) || 3));
@@ -217,12 +230,19 @@ function normalizeScene(raw) {
   else if (video) kind = 'aivideo';
   if (kind === 'manim' && !manim) kind = 'text';
   if (kind === 'aivideo' && !video) kind = 'text';
+  // 明确标了 aivideo 却没有 video.prompt（且没有 manim 脚本可退）：这一场只能出文字卡。
+  // 这是"静默降级"的高发点 —— 面板选了什么、prompt 在哪一环丢了，必须留一条日志。
+  const wantsAi = String(raw.kind || '') === 'aivideo' || String(raw.tool || '') === 'aivideo';
+  if (wantsAi && !video && !manim && onDegrade) {
+    onDegrade(`${label} 是 aivideo 但没有 video.prompt，降级文字卡`);
+  }
   // 表情叠加：坐标用 0~1 相对值，渲染器自己换算成像素
   const stickers = (Array.isArray(raw.stickers) ? raw.stickers : [])
     .filter((s) => s && /^[0-9a-f]{6,40}$/i.test(String(s.id || '')))
     .slice(0, 4)
     .map((s) => ({
-      id: String(s.id),
+      // 文件名是 sha1 的小写十六进制；模型偶尔写成大写，统一小写才找得到 <id>.gif
+      id: String(s.id).toLowerCase(),
       at: Math.max(0, Number(s.at) || 0),
       duration: Math.min(10, Math.max(0.4, Number(s.duration) || 1.6)),
       x: Math.min(1, Math.max(0, s.x == null ? 0.82 : Number(s.x))),
@@ -236,7 +256,9 @@ function normalizeScene(raw) {
     narration: String(raw.narration || '').slice(0, 200),
     seconds: Number(seconds.toFixed(2)),
     bg: { c0: hex(bg.c0, '#101a33'), c1: hex(bg.c1, '#3a2a5a') },
-    image: raw.image ? String(raw.image).slice(0, 200) : null,
+    image: raw.image ? String(raw.image).slice(0, 240) : null,
+    // 参考图解析后的绝对路径（data/studio/uploads 下）；渲染层用它注入 manim / 文字卡
+    imagePath: raw.imagePath ? String(raw.imagePath).slice(0, 320) : null,
     motion: raw.motion || null,
     textSize: Number(raw.textSize) || null,
     textColor: raw.textColor || null,

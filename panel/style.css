@@ -497,16 +497,103 @@ a.bubble-file:hover { border-color: var(--accent); }
 .bubble-file-sub { font-size: 11px; color: var(--muted); }
 .msg.user .bubble-sticker { margin-bottom: 6px; }
 /* --------------------------------------------------------- 视频创作 -- */
-.plan { white-space: pre-line; font-size: 12.5px; color: var(--muted); margin: 8px 0; }
-.plan:empty { display: none; }
-.studio-video { width: 100%; border-radius: 8px; border: 1px solid var(--border); margin-top: 8px; background: #000; }
-/* 模型吐回来但不合格式的原始输出：等宽、可滚、别把卡片撑爆 */
-.raw {
-  max-height: 180px; overflow: auto; white-space: pre-wrap; word-break: break-word;
-  font: 12px/1.5 ui-monospace, Consolas, monospace; color: var(--muted);
-  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
-  padding: 8px 10px; margin: 8px 0 0;
+/* 首屏就三样：输入框、时长、「开始做」。其它能力收在「高级」和「历史」两个折叠区里。 */
+.studio-root { gap: 12px; }
+
+.studio-hero { padding: 14px 14px 12px; }
+.studio-ask {
+  display: block; margin-bottom: 8px;
+  font-size: 15px; font-weight: 600; letter-spacing: .2px; color: var(--text);
 }
+.studio-input {
+  width: 100%; min-height: 76px; max-height: 220px; resize: vertical;
+  padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border);
+  background: var(--panel); color: var(--text); font: inherit; font-size: 14px;
+  line-height: 1.6; outline: none;
+}
+.studio-input:focus { border-color: var(--accent); }
+
+.studio-hero-foot {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; flex-wrap: wrap; margin-top: 10px;
+}
+.studio-seconds { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.studio-seconds select {
+  background: var(--panel); color: var(--text); border: 1px solid var(--border);
+  border-radius: 8px; padding: 7px 10px; font: inherit; font-size: 13px; outline: none;
+}
+.studio-seconds select:focus { border-color: var(--accent); }
+button.studio-go { padding: 8px 26px; font-size: 14px; }
+
+.studio-hint { margin: 10px 0 0; font-size: 12px; line-height: 1.6; }
+
+/* 首屏参考图：一行小字 + 可选缩略图，不占大块 */
+.studio-ref { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.studio-ref-btn {
+  padding: 2px 9px; font-size: 12px; line-height: 1.6; cursor: pointer;
+  border: 1px dashed var(--border); border-radius: 999px;
+  background: transparent; color: var(--muted);
+}
+.studio-ref-btn:hover { color: var(--text); border-color: var(--accent); }
+.studio-ref-thumb { position: relative; display: inline-flex; }
+.studio-ref-thumb img {
+  width: 34px; height: 34px; object-fit: cover;
+  border-radius: 6px; border: 1px solid var(--border);
+}
+.studio-ref-x {
+  position: absolute; top: -6px; right: -6px;
+  width: 16px; height: 16px; line-height: 1; padding: 0;
+  border-radius: 50%; border: 1px solid var(--border);
+  background: var(--panel); color: var(--muted); font-size: 11px; cursor: pointer;
+}
+.studio-ref-x:hover { color: var(--err); border-color: var(--err); }
+.studio-ref-hint { font-size: 11.5px; }
+.studio-error {
+  margin: 8px 0 0; padding: 7px 10px; font-size: 12px; line-height: 1.5;
+  color: var(--err); background: rgba(255, 107, 107, .08);
+  border: 1px solid rgba(255, 107, 107, .35); border-radius: 8px;
+}
+
+/* 高级：默认收起；展开才是风格/音色/分镜表格 */
+.studio-adv { padding: 0; background: transparent; border: 0; }
+.studio-adv-toggle, .studio-lib-toggle {
+  display: inline-flex; align-items: center; gap: 5px;
+  background: transparent; border: 1px solid var(--border); color: var(--muted);
+  border-radius: 999px; padding: 4px 12px; font-size: 12.5px; cursor: pointer;
+}
+.studio-adv-toggle:hover, .studio-lib-toggle:hover { color: var(--text); border-color: var(--accent); }
+/* 展开箭头用 CSS 画：字符三角在雅黑里太小，看着像个点 */
+.studio-adv-toggle .chev, .studio-lib-toggle .chev {
+  display: inline-block;
+  width: 0; height: 0; overflow: hidden; font-size: 0; line-height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid currentColor;
+  transition: transform .15s ease;
+}
+.studio-adv-toggle[aria-expanded="true"] .chev,
+.studio-lib-toggle[aria-expanded="true"] .chev { transform: rotate(180deg); }
+.studio-adv-body {
+  margin-top: 10px; padding: 12px;
+  border: 1px solid var(--border); border-radius: 10px; background: var(--bg);
+}
+.studio-adv-note { margin: 0 0 8px; font-size: 12.5px; color: var(--text); }
+.studio-binding {
+  margin: 0 0 10px; padding: 7px 10px; border-radius: 8px;
+  background: var(--panel); border: 1px solid var(--border);
+  font-size: 12px; color: var(--muted); line-height: 1.6;
+}
+.studio-adv-row { margin-bottom: 4px; }
+/* 额度用完这类"提前说清楚"的提示：不吓人，但要看得见 */
+.studio-quota-note {
+  margin: 8px 0 0; padding: 6px 9px; font-size: 11.5px; line-height: 1.6;
+  color: #e5b567; background: rgba(229, 181, 103, .08);
+  border: 1px solid rgba(229, 181, 103, .3); border-radius: 8px;
+}
+.studio-scenes-box { margin-top: 10px; }
+.studio-scenes-box > summary { cursor: pointer; font-size: 12.5px; color: var(--muted); padding: 4px 0; }
+.studio-scenes-box > summary:hover { color: var(--text); }
+
 /* ------------------------------------------------------- 分镜编辑区 -- */
 .scene-list { display: flex; flex-direction: column; gap: 10px; margin: 4px 0 0; }
 .scene-list > .muted { margin: 0; font-size: 12.5px; }
@@ -514,13 +601,15 @@ a.bubble-file:hover { border-color: var(--accent); }
 .scene {
   display: flex; flex-direction: column; gap: 8px;
   border: 1px solid var(--border); border-radius: 10px;
-  background: var(--bg); padding: 10px 12px;
+  background: var(--panel); padding: 10px 12px;
 }
 
-.scene-head { display: flex; align-items: center; justify-content: space-between; }
+/* 场次 + 状态字符挨在一起，删除靠右 */
+.scene-head { display: flex; align-items: center; gap: 8px; }
 .scene-no { font-size: 12px; font-weight: 600; color: var(--muted); }
 
 .scene-del {
+  margin-left: auto;
   background: none; border: 1px solid var(--border); color: var(--muted);
   border-radius: 6px; padding: 2px 9px; font-size: 12px; line-height: 1.5;
 }
@@ -529,7 +618,7 @@ a.bubble-file:hover { border-color: var(--accent); }
 /* 卡片里 field 之间的间距由 .scene 的 gap 管，别再叠一层 margin */
 .scene .field { margin-bottom: 0; }
 
-/* 秒数/颜色/运动横排，图片单独占一行剩下的宽度 */
+/* 秒数/工具横排，「画什么」单独占一行 */
 .scene-grid { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; }
 .scene-grid .field { flex: 1 1 140px; min-width: 0; }
 .scene-grid .field.small { flex: 0 0 82px; }
@@ -542,63 +631,158 @@ a.bubble-file:hover { border-color: var(--accent); }
 .scene-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
 .scene-note { margin-left: auto; margin-right: 2px; font-size: 11.5px; }
 
-/* 创作卡片多了一个按钮：窄屏时让它换行，别把选择框挤没 */
-#studioCard .row { flex-wrap: wrap; }
-
-/* --------------------------------------------- 三种创作方式（新入口） -- */
-.studio-binding {
-  margin: 0 0 10px; padding: 8px 10px; border-radius: 8px;
-  background: var(--panel); border: 1px solid var(--border);
-  font-size: 12.5px; color: var(--text);
-}
-.studio-tabs { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
-.studio-tab {
-  background: var(--panel); border: 1px solid var(--border); color: var(--muted);
-  border-radius: 999px; padding: 5px 16px; font-size: 13px; cursor: pointer;
-}
-.studio-tab:hover { color: var(--text); }
-.studio-tab.active { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
-.studio-pane { margin-bottom: 10px; }
-.studio-textarea { min-height: 150px; max-height: 380px; resize: vertical; }
-.field textarea {
-  width: 100%; background: var(--panel); color: var(--text);
-  border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
-  font: inherit; font-size: 13px; outline: none;
-}
-.field textarea:focus { border-color: var(--accent); }
-/* 给底部操作栏留出位置，免得它压住最后一个输入框 */
-.studio-result { margin-bottom: 76px; }
-.studio-progress { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
-.studio-progress-bar {
-  height: 6px; border-radius: 999px; background: var(--bg);
-  border: 1px solid var(--border); overflow: hidden;
-}
-.studio-progress-bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s ease; }
-#studioProgressText { font-size: 12.5px; color: var(--muted); }
-.studio-actionbar {
-  position: sticky; bottom: 0; z-index: 5;
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-  margin-top: 4px; padding: 10px 12px;
-  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-  box-shadow: 0 -6px 20px rgba(0, 0, 0, .25);
-}
-.studio-actionbar #studioEstimate { margin-left: auto; font-size: 12px; }
-.studio-download {
-  display: inline-block; margin-top: 8px; padding: 7px 14px; border-radius: 8px;
-  background: var(--accent); color: #fff; text-decoration: none; font-size: 13px;
-}
+/* 状态只显示一个字符：✓ / ↓（降级）/ ✗ */
 .scene-badge {
-  font-size: 11.5px; border-radius: 999px; padding: 1px 8px;
+  min-width: 18px; text-align: center; font-size: 12px; font-weight: 700;
+  border-radius: 999px; padding: 0 5px; line-height: 1.7;
   border: 1px solid var(--border); color: var(--muted);
 }
 .scene-badge.good { color: var(--ok); border-color: var(--ok); }
 .scene-badge.wait { color: #e5b567; border-color: #e5b567; }
 .scene-badge.plain { color: var(--muted); }
 .scene-badge.bad { color: var(--err); border-color: var(--err); }
-.scene-grid .field.scene-tool { flex: 0 0 110px; }
+.scene-grid .field.scene-tool { flex: 0 0 150px; }
 .scene-visual-hint { min-height: 46px; max-height: 120px; resize: vertical; }
 .scene-warning { margin: 0; font-size: 12px; color: #e5b567; }
 body.studio-busy { cursor: progress; }
+
+/* 每场的参考图：选图按钮 + 34px 缩略图 + 去掉 */
+.scene-image { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.scene-image-pick {
+  padding: 2px 9px; font-size: 11.5px; line-height: 1.6; cursor: pointer;
+  border: 1px dashed var(--border); border-radius: 999px;
+  background: transparent; color: var(--muted);
+}
+.scene-image-pick:hover { color: var(--text); border-color: var(--accent); }
+.scene-image-hint { font-size: 11.5px; }
+.scene-image-thumb { position: relative; display: inline-flex; }
+.scene-image-thumb img {
+  width: 34px; height: 34px; object-fit: cover;
+  border-radius: 6px; border: 1px solid var(--border);
+}
+.scene-image-x {
+  position: absolute; top: -6px; right: -6px;
+  width: 16px; height: 16px; line-height: 1; padding: 0;
+  border-radius: 50%; border: 1px solid var(--border);
+  background: var(--panel); color: var(--muted); font-size: 11px; cursor: pointer;
+}
+.scene-image-x:hover { color: var(--err); border-color: var(--err); }
+
+/* 每场的 GIF 表情：按钮 + 已选数量 + 小缩略图（可删） */
+.scene-stickers { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.scene-sticker-pick {
+  padding: 2px 9px; font-size: 11.5px; line-height: 1.6; cursor: pointer;
+  border: 1px dashed var(--border); border-radius: 999px;
+  background: transparent; color: var(--muted);
+}
+.scene-sticker-pick:hover { color: var(--text); border-color: var(--accent); }
+.scene-sticker-count { font-size: 11.5px; }
+.scene-sticker-hint { font-size: 11.5px; }
+.scene-sticker-thumb { position: relative; display: inline-flex; }
+.scene-sticker-thumb img {
+  width: 34px; height: 34px; object-fit: contain;
+  border-radius: 6px; border: 1px solid var(--border);
+  background: rgba(255, 255, 255, .04);
+}
+.scene-sticker-x {
+  position: absolute; top: -6px; right: -6px;
+  width: 16px; height: 16px; line-height: 1; padding: 0;
+  border-radius: 50%; border: 1px solid var(--border);
+  background: var(--panel); color: var(--muted); font-size: 11px; cursor: pointer;
+}
+.scene-sticker-x:hover { color: var(--err); border-color: var(--err); }
+
+/* ------------------------------------------------------------ 任务卡 -- */
+/* 排队 / 进行 / 完成 / 失败：同一套结构，左边一个字符，右边一句话。 */
+.studio-jobs-card { padding: 12px; }
+.studio-jobs-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+.studio-jobs-head h2 { margin: 0; font-size: 14px; font-weight: 600; }
+.studio-jobs-empty { margin: 0; font-size: 12px; }
+.studio-jobs { display: flex; flex-direction: column; gap: 8px; }
+
+.job {
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--panel); padding: 10px 12px;
+}
+.job-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.job-dot { font-size: 12px; line-height: 1; color: var(--muted); }
+.job-running .job-dot, .job-queued .job-dot { color: var(--accent); animation: pulse 1.4s infinite; }
+.job-done .job-dot { color: var(--ok); }
+.job-failed .job-dot { color: var(--err); }
+.job-title {
+  font-size: 13.5px; font-weight: 600; max-width: 62%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.job-dur { font-size: 12px; color: var(--muted); }
+.job-state { margin-left: auto; font-size: 12px; color: var(--muted); }
+.job-done .job-state { color: var(--ok); }
+.job-failed .job-state { color: var(--err); }
+.job-sub { margin: 5px 0 0; font-size: 12px; color: var(--muted); }
+.job-error { margin: 6px 0 0; font-size: 12.5px; color: var(--err); line-height: 1.6; }
+.job-warn { margin: 6px 0 0; font-size: 12px; color: #e5b567; }
+.job-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.job-btn {
+  display: inline-block; padding: 3px 12px; border-radius: 7px; font-size: 12.5px;
+  border: 1px solid var(--border); background: transparent; color: var(--text);
+  text-decoration: none; cursor: pointer; line-height: 1.6;
+}
+.job-btn:hover { border-color: var(--accent); color: var(--accent); }
+.job-meta { margin-left: auto; font-size: 11.5px; color: var(--muted); }
+.job-video {
+  width: 100%; margin-top: 8px; border-radius: 8px;
+  border: 1px solid var(--border); background: #000;
+}
+
+/* --------------------------------------------------------------- 历史 -- */
+.studio-lib-body {
+  margin: 0 0 10px; padding: 8px 10px;
+  border: 1px dashed var(--border); border-radius: 8px;
+}
+.studio-lib-note { margin: 0 0 6px; font-size: 11.5px; }
+.studio-lib-empty { margin: 0; font-size: 11.5px; }
+.studio-lib-list {
+  list-style: none; margin: 0; padding: 0;
+  display: flex; flex-direction: column; gap: 6px;
+  max-height: 320px; overflow-y: auto;
+}
+.lib-item { border-bottom: 1px dashed var(--border); padding-bottom: 5px; }
+.lib-item:last-child { border-bottom: 0; padding-bottom: 0; }
+.lib-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.lib-title {
+  max-width: 100%; padding: 0; border: 0; background: none; cursor: pointer;
+  color: var(--text); font-size: 12.5px; text-align: left;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lib-title:hover { color: var(--accent); text-decoration: underline; }
+.lib-meta { font-size: 11px; color: var(--muted); }
+.lib-ops { margin-left: auto; display: flex; gap: 4px; }
+.lib-btn {
+  padding: 1px 8px; border-radius: 6px; font-size: 11.5px; cursor: pointer;
+  border: 1px solid var(--border); background: transparent; color: var(--muted);
+}
+.lib-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.lib-btn.danger:hover:not(:disabled) { color: var(--err); border-color: var(--err); }
+.lib-detail {
+  margin: 6px 0 0; padding: 6px 8px; border-radius: 6px;
+  background: var(--bg); font-size: 11.5px; line-height: 1.6;
+}
+.lib-scene { margin: 0 0 5px; color: var(--text); }
+.lib-scene:last-child { margin-bottom: 0; }
+.lib-scene-line { display: block; color: var(--muted); }
+
+/* 窄屏：输入框 + 时长 + 按钮仍在同一屏，按钮不换到奇怪的位置 */
+@media (max-width: 900px) {
+  .studio-hero-foot { gap: 8px; }
+  .studio-seconds select { min-width: 92px; }
+  button.studio-go { padding: 8px 18px; }
+  .job-title { max-width: 55%; }
+}
+@media (max-width: 560px) {
+  .studio-ask { font-size: 14px; }
+  .job-meta { margin-left: 0; }
+  .lib-ops { margin-left: 0; }
+}
+
 
 /* --------------------------------------------------------- 表情包 -- */
 .sticker-panel {
@@ -644,6 +828,25 @@ body.studio-busy { cursor: progress; }
 }
 .sticker-star:hover, .sticker-star:focus-visible { opacity: 1; color: #ffd25a; outline: none; }
 .sticker-star.on { color: #ffd25a; opacity: 1; }
+
+/* 分镜表情选择器：盖住整页的浮层，只服务"给某一场挑表情" */
+.sticker-modal {
+  position: fixed; inset: 0; z-index: 80;
+  display: flex; align-items: center; justify-content: center;
+  padding: 16px; background: rgba(0, 0, 0, .58);
+}
+.sticker-modal-card {
+  width: min(600px, 100%); max-height: min(82vh, 720px); overflow: auto;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+  padding: 12px; box-shadow: 0 18px 50px rgba(0, 0, 0, .45);
+}
+.sticker-modal-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; margin-bottom: 8px; font-size: 13px; font-weight: 600;
+}
+/* 分镜里挑表情时网格可以高一点，一屏看全再点 */
+.scene-sticker-grid { max-height: 480px; }
+.sticker-cell.picked { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
 .bubble-media { padding: 4px; background: transparent !important; border: none !important; }
 .bubble-sticker { width: 140px; height: 140px; object-fit: contain; border-radius: 8px; display: block; }
 

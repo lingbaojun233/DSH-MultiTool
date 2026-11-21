@@ -16,6 +16,8 @@ const os = require('node:os');
 const crypto = require('node:crypto');
 const R = require('./lib/render.js');
 const P = require('./lib/project.js');
+// 任务与"可重做配方"的落盘（原子写 + 标题规则）。见 lib/jobs.js 顶部注释。
+const JS = require('./lib/jobs.js');
 // 风格预设：配色/线宽/字体/节奏。渲染时机械地套到 manim 代码与文字卡上。
 const S = require('./lib/styles.js');
 // 人设 → 语气。旁白要像"她"在讲，而不是播音腔；见 lib/persona-binding.js。
@@ -103,11 +105,22 @@ const CFG = Object.assign({
   // 为什么要它：xfade 是 0.4 秒重叠，两张文字卡在这个窗口里同时全亮 → 标题叠字。
   textEdgeFade: 0.15,
   // AI 生成画面（wan3.0-video）的成本护栏：一集最多几条。
-  // 每条 5 秒、要等约 100 秒、还占网关额度 —— 不设上限，模型一口气写 8 场就能把额度烧光。
+  // 每条要 100~400 秒（实测 100 秒左右，排队/重试时会到 400 秒）、还占网关额度 ——
+  // 不设上限，模型一口气写 8 场就能把额度烧光。默认 2。
   // 超出的场次在渲染时降级成文字卡并记日志（见 renderProject 的 planAiVideoQuota）。
-  maxAiVideo: 4,
+  // 请求体可以带 maxAiVideo 覆盖本集上限（任务化之后每个任务自己决定）。
+  maxAiVideo: 2,
   // 一条 AI 视频的总超时（提交 + 轮询 + 下载）。实测 100 秒出片，留到 8 分钟。
   wanTimeoutMs: 480000,
+  // aivideo 场是否把参考图作为 first_frame_url 传上去。
+  // 网关对未知字段常常"接受但忽略"，所以默认关闭；对照实验证实生效后再打开。
+  aivideoImage: false,
+  // 同时跑几个渲染任务。默认 1：manim/ffmpeg 都是 CPU 密集型，并发只会互相拖慢，
+  // 而且 speak 的 BreezeBlue Starter 档并发上限就是 1。其余任务排队。
+  jobConcurrency: 1,
+  // 任务替模型调 io 时用的用户 id。插件/面板会带 x-dsh-user；直接 curl 提任务时
+  // 没有身份，用一个固定的服务账号（默认 1）比"整个任务在写分镜阶段 E_UNAUTHORIZED"好。
+  defaultUserId: 1,
 }, readJson(path.join(DIR, 'config.json'), {}));
 
 // 把静帧模式交给渲染层（在 require 之后、任何 sceneClip 之前）
@@ -120,6 +133,11 @@ if (!CFG.internalToken) CFG.internalToken = process.env.DSH_INTERNAL_TOKEN || ''
 // 图片素材目录：分镜里 image 只是文件名时，render.js 要去某个目录下找图。
 // 必须放在 CFG 合并之后补默认值 —— 默认值依赖 CFG.outDir，而 config.json 可能改了 outDir。
 if (!CFG.imageDir) CFG.imageDir = path.join(CFG.outDir, 'images');
+// 参考图（用户上传）：studio 自己的规范目录是 data/studio/uploads；
+// 面板的 PUT /api/upload 落在 ../data/uploads（返回 uploadId）。两个目录都认，
+// 但找面板的文件时会**复制**到 studio/uploads，避免面板的 30 分钟 TTL 把图删掉。
+if (!CFG.uploadDir) CFG.uploadDir = path.join(CFG.outDir, 'uploads');
+if (!CFG.panelUploadDir) CFG.panelUploadDir = path.join(DIR, '..', 'data', 'uploads');
 // 人设→风格的缓存：跟成片放一起（data/studio/persona-style.json），
 // 按 persona.version 失效，见 lib/styles.js 的 resolvePersonaStyle。
 if (!CFG.styleCacheFile) CFG.styleCacheFile = path.join(CFG.outDir, 'persona-style.json');
@@ -130,6 +148,12 @@ if (!CFG.styleCacheFile) CFG.styleCacheFile = path.join(CFG.outDir, 'persona-sty
 // 这样"新装一个 wan.key"和"沿用旧 key"都能跑，不用改配置。
 if (!CFG.wanKeyPath) CFG.wanKeyPath = path.join(DIR, '..', 'secrets', 'wan.key');
 if (!CFG.wanKeyJson) CFG.wanKeyJson = path.join(DIR, '..', 'video', 'secrets.json');
+
+// 任务状态与"可重做配方"分开落盘（都在 data/studio 下，和成片并列）：
+//   jobs/<jobId>.json    这一次执行到哪、成片在哪（重启后可以作废）
+//   library/<jobId>.json 当初要做什么 + 最终分镜（重启后必须还在，能一键重跑）
+const JOBS_DIR = path.join(CFG.outDir, 'jobs');
+const LIBRARY_DIR = path.join(CFG.outDir, 'library');
 
 // ---- 旁白驱动时长的三个常量（秒）----
 // NARRATION_PAD：旁白念完之后留的余量。0.6 秒够一次换气，再短听着像被掐断。
@@ -354,9 +378,16 @@ async function postJson(url, obj, headers = {}, timeoutMs = 60000) {
 // ------------------------------------------------------------------ 分镜 ----
 
 /**
- * 取几个表情给模型挑。优先收藏的（那是它自己"满意的"），不够再补普通的。
+ * 取几个表情给模型挑。优先收藏的（那是它自己"满意的"），不够再补"情绪覆盖"的。
  * 只给 10 个：给太多它会挑花眼，而且提示词会变长。
+ *
+ * 为什么不能只靠收藏 + /v1/list 默认顺序：没有收藏时 /v1/list 按名字排序，
+ * 前 10 个会是「爱心/按钮/被击中/馋」—— 跟"时间膨胀"这种科普主题毫无关系，
+ * 模型只能瞎配。这里用一组常用情绪各取一张，保证候选里有笑/哭/困/惊讶/无语，
+ * 模型才可能真的挑到切题的那张。
  */
+const STICKER_MOOD_SPREAD = ['笑', '哭', '睡觉', '惊吓', '汗', '生气', '点赞', '加油', '停止工作', '问号'];
+
 async function stickerHints(limit = 10) {
   const grab = async (query) => {
     try {
@@ -365,17 +396,57 @@ async function stickerHints(limit = 10) {
       return data && data.ok && Array.isArray(data.items) ? data.items : [];
     } catch { return []; }
   };
-  const fav = await grab(`favorite=1&limit=${limit}`);
-  const all = fav.length >= 4 ? [] : await grab(`limit=${limit}`);
-  const seen = new Set();
   const out = [];
-  for (const it of [...fav, ...all]) {
-    if (out.length >= limit) break;
-    if (!it || !it.id || seen.has(it.id)) continue;
-    seen.add(it.id);
-    out.push({ id: String(it.id), name: String(it.mood || it.name || it.id).slice(0, 16) });
+  const seen = new Set();
+  const push = (it) => {
+    if (out.length >= limit) return false;
+    const id = String((it && it.id) || '');
+    if (!/^[0-9a-f]{6,40}$/i.test(id) || seen.has(id)) return false;
+    seen.add(id);
+    out.push({ id, name: String((it && (it.mood || it.name)) || id).slice(0, 16) });
+    return true;
+  };
+
+  // 1) 收藏优先（用户/它自己点过星的）
+  for (const it of await grab(`favorite=1&limit=${limit}`)) push(it);
+  // 2) 收藏不够：按情绪各取一张，凑出"能表达情绪"的一组候选。
+  // 用 q= 而不是 mood=：线上那版表情服务的搜索参数只有 q，传 mood 会被静默忽略，
+  // 结果每次都拿回同一批「爱心/按钮」，模型根本没法挑。
+  if (out.length < limit) {
+    const spread = await Promise.all(
+      STICKER_MOOD_SPREAD.map((m) => grab(`q=${encodeURIComponent(m)}&limit=1`)),
+    );
+    for (const items of spread) for (const it of items) push(it);
+  }
+  // 3) 还不够（表情模块缺某些情绪）：退回普通列表，至少保证候选不为空
+  if (out.length < limit) {
+    for (const it of await grab(`limit=${Math.max(limit * 3, 30)}`)) push(it);
   }
   return out;
+}
+
+/**
+ * 把模型挑的表情打进日志：id + 情绪名 + 时间/位置。
+ *
+ * 自动规划"挑得切不切题"模型不会解释，日志是唯一可复盘的东西 ——
+ * 这里把候选表反查成情绪名，一眼能看出"讲时间膨胀配了睡觉"这种选择。
+ */
+function logStickerPicks(stage, scenes, candidates) {
+  const list = Array.isArray(candidates) ? candidates : [];
+  const names = new Map(list.map((s) => [String(s.id || ''), String(s.name || '')]));
+  const picks = [];
+  (Array.isArray(scenes) ? scenes : []).forEach((s, i) => {
+    for (const st of (s && Array.isArray(s.stickers) ? s.stickers : [])) {
+      const id = String((st && st.id) || '');
+      const name = names.get(id) || (list.length ? '不在候选里' : '没有候选');
+      picks.push(`第${i + 1}场 ${id}=${name} @${Number(st.at) || 0}s ${Number(st.duration) || 0}s`);
+    }
+  });
+  if (!picks.length) {
+    log(`${stage}：这一集没有加表情`);
+    return;
+  }
+  log(`${stage}：加了 ${picks.length} 个表情 -> ${picks.join('；')}`);
 }
 
 /** 把表情提示并进写分镜的参数（body 里显式给了就不覆盖）。 */
@@ -461,10 +532,16 @@ function buildSkeletonPrompt(prompt, total, opts = {}) {
     lines.push(
       '',
       '## 表情包（可选，用来加"大肥鱼"的在场感）',
-      '- 给某个场景加 stickers：{"id":"<下面列表里的 id>","at":1.2,"duration":1.6,"x":0.82,"y":0.2,"scale":0.22}',
-      '- x/y 是中心点相对位置（0~1），常用右上 0.82/0.2、左下 0.18/0.78；别挡住图和公式。',
-      '- 全片用 2~4 次就够，放在惊讶、吐槽、结论这种情绪点上。',
-      `- 可用表情：${stickerIds.map((s) => `${s.id}=${s.name}`).join('，')}`,
+      '- 只放在情绪点上：吐槽、惊讶、结论、自嘲。没有情绪点的场次不要放。',
+      '- 每条视频 1~3 处就够（不是每场都放，最多 3 场）；同一场最多 1 个。',
+      '- 在场景对象里加 stickers 数组，一项长这样：',
+      '  {"id":"<下面列表里的 id>","at":1.2,"duration":1.6,"x":0.82,"y":0.18,"scale":0.2}',
+      '  - at：这一场里的第几秒开始，放中后段（0.5~2 秒起；且不要超过这一场的 seconds-1.5）',
+      '  - duration：1.2~2.0 秒',
+      '  - x/y：中心点相对位置（0~1），放角落别挡住图和公式：右上 0.82/0.18，左下 0.16/0.80',
+      '  - scale：0.15~0.25（占画面高度的比例）',
+      `- 可用表情（id=情绪）：${stickerIds.map((s) => `${s.id}=${s.name}`).join('，')}`,
+      '- 只能从上面这个列表里挑 id；没有合适的那一场就干脆不加，宁缺勿滥。',
     );
   }
   return lines.join('\n');
@@ -535,6 +612,20 @@ function buildVisualPrompt(scene, kind, style) {
       '',
       '上面这段是用户自己写的"画什么"。把它翻译成 manim 动画：图形、元素、动作、先后顺序都要对上；',
       '不要换成另一个画法，也不要只画个标题糊过去。旁白只用来对齐节奏，不是画面内容。',
+      '',
+    );
+  }
+  // 参考图：这一场有用户上传的图，必须让模型用 ImageMobject 真的嵌进去。
+  // 路径已经由 attachSceneImages 解析成绝对路径（uploads 目录内）。
+  const imagePath = String(scene.imagePath || scene.image || '').trim();
+  if (imagePath && String(kind || '').toLowerCase() !== 'aivideo') {
+    head.push(
+      '## 这一场有一张参考图（必须用上）',
+      `图片绝对路径：${imagePath}`,
+      '必须用 ImageMobject 把这张图嵌进画面，不要自己画一个近似图形代替它。',
+      '推荐写法（背景层）：bg = ImageMobject("<上面的路径>").scale_to_fit_height(config.frame_height); bg.set_opacity(0.35); self.add(bg)',
+      '也可以当画中画：ImageMobject("<上面的路径>").scale(0.4).to_corner(DR)',
+      '图片路径必须原样照抄，不要改路径，也不要用 open/PIL 去读它。',
       '',
     );
   }
@@ -614,6 +705,15 @@ function buildAiVideoPrompt(scene, hint) {
       '把上面这段翻成英文 prompt：主体、动作、风格、镜头都要对得上，不要换成别的场景。',
     );
   }
+  const imageRef = String(scene.imagePath || scene.image || '').trim();
+  if (imageRef) {
+    lines.push(
+      '',
+      '## 参考图（首帧）',
+      `这一场有一张参考图：${imageRef}`,
+      'prompt 要延续这张图的构图、主体和风格，不要写成完全不同的场景（生成时这张图会作为 first_frame_url 传入）。',
+    );
+  }
   return lines;
 }
 
@@ -634,10 +734,186 @@ function stripMathDelims(code) {
   );
 }
 
+// ------------------------------------------------------------ 参考图（上传）----
+// 用户上传的图片：scene.image 可能是 uploadId、/api/upload/<id> 链接，或绝对路径。
+// 只认两个目录（studio/uploads 与面板的 data/uploads），扩展名白名单，禁止 ..
+// 逃逸 —— 分镜 JSON 是模型/面板给的，不能当成读任意文件的入口。
+const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
+
+function imageRoots() {
+  return [CFG.uploadDir, CFG.panelUploadDir].filter(Boolean).map((p) => path.resolve(p));
+}
+
+function pathInside(dir, file) {
+  const rel = path.relative(dir, file);
+  return Boolean(rel) && !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
+function imageExtOk(file) {
+  return IMAGE_EXTS.has(path.extname(String(file || '')).toLowerCase());
+}
+
+/** 在 uploads 目录里按 uploadId 找文件（面板的文件名是 <uuid><ext>）。 */
+function findUploadedById(id) {
+  for (const root of imageRoots()) {
+    let names = [];
+    try { names = fs.readdirSync(root); } catch { continue; }
+    for (const name of names) {
+      if (!name.startsWith(`${id}.`)) continue;
+      const file = path.join(root, name);
+      if (!imageExtOk(file)) continue;
+      try { if (fs.statSync(file).isFile()) return file; } catch { }
+    }
+  }
+  return '';
+}
+
+/** 面板目录里的图复制进 studio/uploads：面板 30 分钟 TTL 不能影响已经在跑的任务。 */
+function copyIntoStudioUploads(src) {
+  const root = path.resolve(CFG.uploadDir);
+  const abs = path.resolve(src);
+  if (pathInside(root, abs)) return abs;
+  fs.mkdirSync(root, { recursive: true });
+  const dest = path.join(root, `${crypto.randomUUID()}${path.extname(abs).toLowerCase()}`);
+  fs.copyFileSync(abs, dest);
+  return dest;
+}
+
+/**
+ * 解析一场的 image 引用。
+ * 返回 { ok, path, source } 或 { ok:false, error }，永不抛。
+ */
+function resolveSceneImage(ref) {
+  const raw = String(ref == null ? '' : ref).trim();
+  if (!raw) return { ok: false, error: 'EMPTY' };
+  if (raw.includes('\0')) return { ok: false, error: 'BAD_PATH' };
+
+  // 1) uploadId / /api/upload/<id> 链接
+  let id = '';
+  const m = raw.match(/\/api\/upload\/([0-9a-fA-F-]{8,64})/);
+  if (m) id = m[1];
+  else if (/^[0-9a-fA-F-]{8,64}$/.test(raw)) id = raw;
+  if (id) {
+    const found = findUploadedById(id);
+    if (!found) return { ok: false, error: 'UPLOAD_NOT_FOUND' };
+    if (!imageExtOk(found)) return { ok: false, error: 'BAD_EXT' };
+    try {
+      const copy = copyIntoStudioUploads(found);
+      return { ok: true, path: copy, source: found };
+    } catch (err) {
+      return { ok: false, error: `COPY_FAILED(${err && err.message || err})` };
+    }
+  }
+
+  // 2) 绝对路径：必须落在两个 uploads 目录之一
+  if (path.isAbsolute(raw)) {
+    const abs = path.resolve(raw);
+    const root = imageRoots().find((r) => pathInside(r, abs));
+    if (!root) return { ok: false, error: 'OUTSIDE_UPLOAD_DIR' };
+    if (!imageExtOk(abs)) return { ok: false, error: 'BAD_EXT' };
+    if (!fs.existsSync(abs)) return { ok: false, error: 'NOT_FOUND' };
+    return { ok: true, path: abs, source: abs };
+  }
+
+  // 3) 相对名：禁止 ..，只在 uploads 根下找
+  const rel = raw.replace(/^[\\/]+/, '');
+  if (rel.split(/[\\/]/).includes('..')) return { ok: false, error: 'PATH_TRAVERSAL' };
+  for (const root of imageRoots()) {
+    const abs = path.resolve(root, rel);
+    if (!pathInside(root, abs) || !imageExtOk(abs) || !fs.existsSync(abs)) continue;
+    return { ok: true, path: abs, source: abs };
+  }
+  return { ok: false, error: 'NOT_FOUND' };
+}
+
+/**
+ * 给一组场景解析参考图。非法引用**只拒这一场**：记日志 + 警告 + 清掉 image，
+ * 继续用分镜本身渲染（不能让一张坏图把整条任务打死）。
+ */
+function attachSceneImages(scenes, warnings) {
+  for (let i = 0; i < scenes.length; i++) {
+    const s = scenes[i];
+    if (!s || typeof s !== 'object' || !s.image) continue;
+    const ref = s.image;
+    const r = resolveSceneImage(ref);
+    if (!r.ok) {
+      log(`scene#${i} image 被拒（${r.error}）：${String(ref).slice(0, 120)}`);
+      warnings.push(`第 ${i + 1} 场：图片被拒（${r.error}），这一场不用图`);
+      s.image = '';
+      s.imagePath = null;
+      continue;
+    }
+    s.image = r.path;
+    s.imagePath = r.path;
+    log(`scene#${i} image ${String(ref).slice(0, 48)} -> ${r.path}`
+      + `${r.source && r.source !== r.path ? '（已复制到 studio/uploads）' : ''}`);
+  }
+  return scenes;
+}
+
+/**
+ * 兜底注入：模型没把参考图写进 manim 代码时，在 construct 开头加一层半透明背景图。
+ * 为什么必须兜底：提示词里写清了路径，模型仍可能不写 ImageMobject；"用了参考图"
+ * 不能靠运气。图片 35% 不透明度铺满画面，上面再叠模型的动画，文字仍然可读。
+ */
+function ensureManimImage(code, imagePath) {
+  const src = String(code || '');
+  const p = String(imagePath || '').trim();
+  if (!p) return { code: src, injected: false };
+  // 已经引用了这张图（路径以任意引号/转义形式出现）就不动。
+  // Windows 路径注入进代码时是 JSON 转义形式（\\），所以两种形态都要认，
+  // 否则同一条 code 再跑一次会重复插一段背景图（渲染也不会错，但很脏）。
+  if (src.includes('ImageMobject')
+    && (src.includes(p) || src.includes(JSON.stringify(p)) || src.includes(path.basename(p)))) {
+    return { code: src, injected: false };
+  }
+  const lines = src.split(/\r?\n/);
+  const idx = lines.findIndex((l) => /^\s*def\s+construct\s*\(\s*self\s*\)\s*:/.test(l));
+  if (idx < 0) return { code: src, injected: false, error: 'NO_CONSTRUCT' };
+  let indent = null;
+  for (let i = idx + 1; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    indent = (lines[i].match(/^\s*/) || [''])[0];
+    break;
+  }
+  if (indent == null) indent = ((lines[idx].match(/^\s*/) || [''])[0]) + '    ';
+  // JSON.stringify 产出的双引号字符串同时是合法的 Python 字符串字面量（反斜杠已转义）
+  const lit = JSON.stringify(p);
+  const inject = [
+    `${indent}# 参考图由 studio 注入（模型未写 ImageMobject 时兜底）`,
+    `${indent}bg = ImageMobject(${lit}).scale_to_fit_height(config.frame_height)`,
+    `${indent}bg.set_opacity(0.35)`,
+    `${indent}self.add(bg)`,
+  ];
+  lines.splice(idx + 1, 0, ...inject);
+  return { code: lines.join('\n'), injected: true };
+}
+
+/**
+ * 把本地图片编码成 data URL（first_frame_url 用）。
+ * 网关如果只认公网 URL，这条路走不通 —— 由对照实验决定是否启用（CFG.aivideoImage）。
+ */
+function imageAsDataUrl(file) {
+  const ext = path.extname(String(file || '')).toLowerCase();
+  const mime = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg';
+  const buf = fs.readFileSync(file);
+  if (buf.length > 4 * 1024 * 1024) throw new Error(`IMAGE_TOO_LARGE(${buf.length})`);
+  return `data:${mime};base64,${buf.toString('base64')}`;
+}
+
 async function planTwoStage(prompt, opts = {}) {
   const total = Number(opts.seconds) || 12;
   const style = opts.style || null;
-  const skel = await askJson(buildSkeletonPrompt(prompt, total, { style, stickerIds: opts.stickerIds, toneLines: opts.toneLines }), opts);
+  // 表情候选：调用方没给就自己取（收藏优先 + 情绪覆盖）。
+  // 放在这里而不是各个入口，是为了让 /v1/jobs、/v1/plan、/v1/create 走同一条路 ——
+  // 之前只有 /v1/create 带了候选，面板建任务那条路模型根本看不到表情列表。
+  const stickerIds = Array.isArray(opts.stickerIds) && opts.stickerIds.length
+    ? opts.stickerIds
+    : await stickerHints();
+  if (stickerIds.length) {
+    log(`写分镜：表情候选 ${stickerIds.length} 个（${stickerIds.map((s) => `${s.id}=${s.name}`).join('，')}）`);
+  }
+  const skel = await askJson(buildSkeletonPrompt(prompt, total, { style, stickerIds, toneLines: opts.toneLines }), opts);
   if (!skel.ok) return skel;
   const scenes = Array.isArray(skel.json.scenes) ? skel.json.scenes.slice(0, CFG.maxScenes) : [];
   if (!scenes.length) return { ok: false, error: 'NO_SCENES' };
@@ -645,25 +921,27 @@ async function planTwoStage(prompt, opts = {}) {
   let visuals = 0;
   let textCards = 0;
   let aiVideos = 0;
-  const aiLimit = Math.max(0, Number(CFG.maxAiVideo) || 0);
-  for (const s of scenes) {
+  // 本集 aivideo 上限：任务可以按请求体覆盖（默认 CFG.maxAiVideo）。
+  const aiLimit = Math.max(0, Number(opts.maxAiVideo != null ? opts.maxAiVideo : CFG.maxAiVideo) || 0);
+  for (let si = 0; si < scenes.length; si++) {
+    const s = scenes[si];
     // 三种取值：manim / aivideo / text。plot、draw 这两条旧路子已经停用，
     // 模型写了也会被当成 text（白占一场），所以提示词里连提都不提它们。
     const visual = String(s.visual || '').trim().toLowerCase();
     if (visual === 'aivideo' || (s.video && s.video.prompt)) {
       // 护栏在规划阶段先拦一次：省得模型一口气写 8 场 aivideo，渲染时才逐场降级
       if (aiVideos >= aiLimit) {
-        log(`场「${s.text}」超出本集 aivideo 上限 ${aiLimit} 场，规划阶段降级文字卡`);
+        log(`scene#${si} aivideo 失败/不可用，降级为 文字卡：超出本集上限 ${aiLimit} 场`);
         textCards += 1;
         continue;
       }
       const aiPrompt = normalizeAiPrompt(s.video && s.video.prompt);
       if (!aiPrompt) {
-        log(`场「${s.text}」标了 aivideo 但没给 video.prompt，降级文字卡`);
+        log(`scene#${si} aivideo 失败/不可用，降级为 文字卡：没有 video.prompt`);
         textCards += 1;
         continue;
       }
-      s.video = { prompt: aiPrompt, size: (s.video && s.video.size) || '1280*720' };
+      s.video = { prompt: aiPrompt, size: (s.video && s.video.size) || '832*480' };
       s.kind = 'aivideo';
       aiVideos += 1;
       continue;
@@ -671,9 +949,17 @@ async function planTwoStage(prompt, opts = {}) {
     const kind = visual === 'manim' ? 'manim' : 'text';
     if (kind === 'text') { textCards += 1; continue; }
     const r = await askJson(buildVisualPrompt(s, kind, style), { ...opts, sessionId: 'studio-visual' });
-    if (!r.ok) { log(`场「${s.text}」视觉生成失败，降级文字卡`); textCards += 1; continue; }
+    if (!r.ok) {
+      log(`scene#${si} manim 失败/不可用，降级为 文字卡：视觉生成失败（${String(r.error || '').slice(0, 160)}）`);
+      textCards += 1;
+      continue;
+    }
     const code = r.json && r.json.manim && typeof r.json.manim.code === 'string' ? r.json.manim.code : '';
-    if (!code.trim()) { log(`场「${s.text}」没给 manim.code，降级文字卡`); textCards += 1; continue; }
+    if (!code.trim()) {
+      log(`scene#${si} manim 失败/不可用，降级为 文字卡：模型没给 manim.code`);
+      textCards += 1;
+      continue;
+    }
     // 先清洗常见的 Markdown/LaTeX 写法问题，再过安全闸门（否则白等一次 manim）
     const clean = stripMathDelims(code);
     // 安全过滤与 LaTeX 闸门在规划阶段就做一次：命中当场降级，
@@ -681,10 +967,10 @@ async function planTwoStage(prompt, opts = {}) {
     const unsafe = Manim ? Manim.checkCode(clean) : 'manim 模块不可用';
     const noLat = Manim ? Manim.checkNoLatex(clean) : null;
     if (unsafe) {
-      log(`场「${s.text}」manim 代码被拒（${unsafe}），降级`);
+      log(`scene#${si} manim 失败/不可用，降级为 文字卡：代码被拒（${unsafe}）`);
       textCards += 1;
     } else if (noLat) {
-      log(`场「${s.text}」manim 代码含 LaTeX 组件（${noLat}），降级`);
+      log(`scene#${si} manim 失败/不可用，降级为 文字卡：代码含 LaTeX 组件（${noLat}）`);
       textCards += 1;
     } else {
       s.manim = { code: clean.slice(0, 8000), scene: r.json.manim.scene || null };
@@ -694,6 +980,8 @@ async function planTwoStage(prompt, opts = {}) {
   }
   const ratio = scenes.length ? Math.round((visuals / scenes.length) * 100) : 0;
   log(`两段式规划：${scenes.length} 场，manim ${visuals} 场（${ratio}%），aivideo ${aiVideos} 场，文字卡 ${textCards} 场`);
+  // 把"挑了哪几个表情、配给第几场"写进日志：自动挑选是否切题只能靠这条复盘
+  logStickerPicks('两段式规划', scenes, stickerIds);
   return { ok: true, json: { title: skel.json.title || '', scenes }, visuals, aiVideos, manimRatio: ratio };
 }
 
@@ -712,6 +1000,10 @@ const MANIM_HINT_WORDS = [
  */
 function decideTool(scene) {
   const raw = String((scene && scene.tool) || '').trim().toLowerCase();
+  // kind 是分镜保存后的引擎标记（面板/项目里的场景只有 kind，没有 tool）。
+  // 以前这里只看 tool，于是"面板回填 kind:'aivideo'"的场被当成文字卡 —— 这就是
+  // 空白视频那个 bug 的来源。kind 和 tool 都认，且 tool 优先（它更显式）。
+  const rawKind = String((scene && scene.kind) || '').trim().toLowerCase();
   if (raw === 'manim' || raw === 'text') {
     return { tool: raw, reason: `用户指定：${raw}` };
   }
@@ -721,6 +1013,18 @@ function decideTool(scene) {
       tool: 'aivideo',
       reason: videoPrompt ? '分镜里给了 video.prompt，直接按它生成画面' : '用户指定：aivideo',
     };
+  }
+  // tool 没写时按 kind 兜底：kind:'manim' + 已有代码 → 直接沿用，别再问一次模型
+  const givenCode = scene && scene.manim && typeof scene.manim.code === 'string'
+    ? scene.manim.code.trim() : '';
+  if (rawKind === 'manim' && givenCode) {
+    return { tool: 'manim', reason: '分镜里已有 manim 代码，直接沿用' };
+  }
+  if (rawKind === 'aivideo') {
+    return { tool: 'aivideo', reason: '分镜标记为 aivideo' };
+  }
+  if (rawKind === 'text') {
+    return { tool: 'text', reason: '分镜标记为 text' };
   }
   const hint = String((scene && scene.visual_hint) || '').trim();
   if (hint) return { tool: 'manim', reason: '用户写了「画什么」，按画面描述生成 manim' };
@@ -737,6 +1041,28 @@ function clampSceneSeconds(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return 8;
   return Math.min(10, Math.max(3, Math.round(n * 10) / 10));
+}
+
+/**
+ * 这组分镜是不是"已经补全过"（每一场都带 manim 代码 / video.prompt / 明确的 text）？
+ *
+ * 用于重跑配方：库里的 scenes 是**最终分镜**，直接拿去渲就行。
+ * 再走一遍 fillScenes 虽然不会发模型请求（已有代码会沿用），但会把 seconds
+ * 重新夹到 3~10 —— 旁白撑长的场次被改短，缓存键就变了，重跑等于重渲。
+ * 所以能直通的就直通，一个字段都不动。
+ */
+function scenesLookFinal(list) {
+  const arr = Array.isArray(list) ? list : [];
+  if (!arr.length) return false;
+  return arr.every((s) => {
+    if (!s || typeof s !== 'object') return false;
+    const code = s.manim && typeof s.manim.code === 'string' && s.manim.code.trim();
+    const video = s.video && typeof s.video.prompt === 'string' && s.video.prompt.trim();
+    if (code || video) return true;
+    const kind = String(s.kind || '').toLowerCase();
+    const tool = String(s.tool || '').toLowerCase();
+    return kind === 'text' || tool === 'text';
+  });
 }
 
 /**
@@ -843,7 +1169,7 @@ async function fillScenes(inputScenes, opts = {}) {
   let textCount = 0;
   let aiVideoCount = 0;
   let fallbackCount = 0;
-  const aiLimit = Math.max(0, Number(CFG.maxAiVideo) || 0);
+  const aiLimit = Math.max(0, Number(opts.maxAiVideo != null ? opts.maxAiVideo : CFG.maxAiVideo) || 0);
 
   for (let i = 0; i < inputScenes.length; i++) {
     const src = inputScenes[i] || {};
@@ -853,6 +1179,12 @@ async function fillScenes(inputScenes, opts = {}) {
       narration: String(src.narration || '').slice(0, 200),
       seconds: clampSceneSeconds(src.seconds),
       visual_hint: String(src.visual_hint || '').slice(0, 600),
+      // 参考图：原引用先带着，prepareJob 会统一解析成绝对路径（attachSceneImages）
+      image: src.image ? String(src.image).slice(0, 240) : '',
+      imagePath: src.imagePath ? String(src.imagePath).slice(0, 320) : '',
+      // 表情：面板里手动选的表情必须带过去。这里以前是手写字段，stickers 被丢掉 ——
+      // 用户加完表情、点「补全动画」，表情就全没了，渲出来一个都没有。
+      stickers: P.normalizeScene(src).stickers,
       tool: String(src.tool || '').trim().toLowerCase(),
       kind: 'text',
       manim: null,
@@ -863,6 +1195,23 @@ async function fillScenes(inputScenes, opts = {}) {
     const decided = decideTool(src);
     base.tool = decided.tool;
     base.tool_reason = decided.reason;
+
+    // 已经带 manim 代码的场景：直接用，不再问模型。
+    // 两条路都走这里：重跑配方（library rerun）和"面板把分镜回填给我"。
+    // 必须一个模型调用都不发 —— 否则重跑会重写代码，缓存键全变，
+    // "画面能复用就复用" 直接失效；更糟的是模型可能把好代码写成坏代码。
+    if (decided.tool === 'manim') {
+      const given = src.manim && typeof src.manim.code === 'string' ? src.manim.code.trim() : '';
+      if (given) {
+        base.kind = 'manim';
+        base.manim = { code: given.slice(0, 8000), scene: (src.manim && src.manim.scene) || null };
+        base.status = 'manim';
+        manimCount += 1;
+        scenes.push(base);
+        continue;
+      }
+    }
+
     if (decided.tool === 'text') {
       textCount += 1;
       base.status = 'text';
@@ -875,6 +1224,8 @@ async function fillScenes(inputScenes, opts = {}) {
       if (aiVideoCount >= aiLimit) {
         base.status = 'fallback';
         base.note = `本集 aivideo 已到上限（${aiLimit} 场），这一场出文字卡`;
+        // 规划阶段的降级同样要写日志：场次 + 原引擎 + 新引擎 + 原因
+        log(`scene#${i} aivideo 超出本集上限（${aiLimit} 场），降级为 文字卡：${base.note}`);
         warnings.push(`第 ${i + 1} 场：${base.note}`);
         fallbackCount += 1;
         textCount += 1;
@@ -883,24 +1234,38 @@ async function fillScenes(inputScenes, opts = {}) {
       }
       // 用户已经写了 video.prompt 就直接用；只写了中文「画什么」才让模型翻英文
       let aiPrompt = normalizeAiPrompt(src.video && src.video.prompt);
-      let aiSize = (src.video && src.video.size) || '1280*720';
+      let aiSize = (src.video && src.video.size) || '832*480';
       if (!aiPrompt) {
+        // 没给 prompt 不一定是错：用户可能只写了中文「画什么」，这里负责翻成英文。
+        // 但要留痕 —— 之前这一步失败时只在返回体里塞个 note，日志里什么都没有。
+        log(`scene#${i} 是 aivideo 但没有 video.prompt，先用「画什么」生成画面描述`);
         const r = await askJson(buildVisualPrompt(base, 'aivideo', style), { ...opts, sessionId: 'studio-aivideo' });
         const got = r.ok && r.json && r.json.video && typeof r.json.video === 'object' ? r.json.video : null;
         aiPrompt = normalizeAiPrompt(got && got.prompt);
         if (got && got.size) aiSize = got.size;
         if (!aiPrompt) {
-          base.status = 'fallback';
-          base.note = r.ok ? '模型没给出 video.prompt，这一场出文字卡' : `画面描述生成失败（${r.error}），这一场出文字卡`;
-          warnings.push(`第 ${i + 1} 场：${base.note}`);
-          fallbackCount += 1;
-          textCount += 1;
-          scenes.push(base);
-          continue;
+          // 翻译失败不该让整场作废：wan 也能吃中文，只是效果不如英文。
+          // 直接用用户写的「画什么」兜底 —— 有画面总比变成文字卡强。
+          const rawHint = String((base && (base.visual_hint || base.text)) || '').trim();
+          if (rawHint) {
+            aiPrompt = rawHint.slice(0, 400);
+            log(`scene#${i} 英文画面描述生成失败（${r.error || '无 prompt'}），改用原始描述直接生成：${rawHint.slice(0, 40)}…`);
+            warnings.push(`第 ${i + 1} 场：英文描述没生成出来，直接用中文提示词（效果可能不稳）`);
+          } else {
+            base.status = 'fallback';
+            base.note = r.ok ? '模型没给出 video.prompt，这一场出文字卡' : `画面描述生成失败（${r.error}），这一场出文字卡`;
+            // 明确的降级日志：场次 + 原因，和 normalizeScene 的告警同一个口径
+            log(`scene#${i} 是 aivideo 但没有 video.prompt，降级文字卡（${base.note}）`);
+            warnings.push(`第 ${i + 1} 场：${base.note}`);
+            fallbackCount += 1;
+            textCount += 1;
+            scenes.push(base);
+            continue;
+          }
         }
       }
       base.kind = 'aivideo';
-      base.video = { prompt: aiPrompt, size: /^\d{2,5}\*\d{2,5}$/.test(String(aiSize)) ? String(aiSize) : '1280*720' };
+      base.video = { prompt: aiPrompt, size: /^\d{2,5}\*\d{2,5}$/.test(String(aiSize)) ? String(aiSize) : '832*480' };
       base.status = 'aivideo';
       aiVideoCount += 1;
       scenes.push(base);
@@ -912,6 +1277,7 @@ async function fillScenes(inputScenes, opts = {}) {
     if (!r.ok) {
       base.status = 'fallback';
       base.note = `动画生成失败（${r.error}），这一场会出文字卡`;
+      log(`scene#${i} manim 失败/不可用，降级为 文字卡：${String(r.error || 'askJson 失败').slice(0, 200)}`);
       warnings.push(`第 ${i + 1} 场：${base.note}`);
       fallbackCount += 1;
       textCount += 1;
@@ -923,6 +1289,7 @@ async function fillScenes(inputScenes, opts = {}) {
     if (!code) {
       base.status = 'fallback';
       base.note = '模型没给出 manim.code，这一场会出文字卡';
+      log(`scene#${i} manim 失败/不可用，降级为 文字卡：模型没给 manim.code`);
       warnings.push(`第 ${i + 1} 场：${base.note}`);
       fallbackCount += 1;
       textCount += 1;
@@ -937,6 +1304,7 @@ async function fillScenes(inputScenes, opts = {}) {
     if (unsafe || noLat) {
       base.status = 'fallback';
       base.note = `代码被拒（${unsafe || noLat}），这一场会出文字卡`;
+      log(`scene#${i} manim 失败/不可用，降级为 文字卡：代码被拒（${unsafe || noLat}）`);
       warnings.push(`第 ${i + 1} 场：${base.note}`);
       fallbackCount += 1;
       textCount += 1;
@@ -1015,7 +1383,7 @@ function saveDraftProject(input) {  const { projectId, title, scenes, style, voi
   // 空串表示"按人设决定"，这是契约的一部分，不能被 || 覆盖成别的
   project.style = style == null ? project.style : String(style);
   project.voice = voice == null ? project.voice : String(voice);
-  project.scenes = scenes.map((s) => P.normalizeScene(s));
+  project.scenes = scenes.map((s, i) => P.normalizeScene(s, { label: `scene#${i}`, onDegrade: log }));
   P.saveProject(CFG.projectDir, project);
   return {
     id: project.id,
@@ -1062,10 +1430,10 @@ function normalizePlan(plan) {
   // 这里过于严格反而会丢掉调用方后续可能加的新玩法。
   const optStr = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
   const MOTIONS = ['zoom-in', 'zoom-out', 'pan-left', 'pan-right'];
-  const scenes = (plan.scenes || []).slice(0, CFG.maxScenes).map((s) => {
+  const scenes = (plan.scenes || []).slice(0, CFG.maxScenes).map((s, i) => {
     // 统一交给 project.js 的 normalizeScene：字段白名单只该有一份。
     // 之前这里手写了一份，结果 kind/html/steps/stickers 全被丢掉 —— 讲解画面永远出不来。
-    const normalized = P.normalizeScene(s);
+    const normalized = P.normalizeScene(s, { label: `scene#${i}`, onDegrade: log });
     normalized.seconds = Math.min(MAX_SCENE_SECONDS, Math.max(CFG.minSceneSeconds, Number(s.seconds) || normalized.seconds));
     normalized.actualSeconds = normalized.seconds;
     normalized.narrationMs = 0;
@@ -1429,6 +1797,12 @@ function sceneEngines(s) {
   if (hasPython) out.push('plot');
   if (hasDraw) out.push('draw');
   if (hasHtml) out.push('html');
+  // 这一场是 aivideo 场（两种素材都有）时，AI 画面优先：
+  // 用户明确选了生成画面，先按它来；失败再退 manim（自愈规则："aivideo 失败 → manim"）。
+  if (hasVideo && String(sc.kind || '') === 'aivideo') {
+    const at = out.indexOf('aivideo');
+    if (at > 0) { out.splice(at, 1); out.unshift('aivideo'); }
+  }
   out.push('text');
   return out;
 }
@@ -1493,7 +1867,19 @@ async function renderSceneEngine({ eng, s, index, style, work }) {
     if (!Manim) return { ok: false, error: 'MANIM_MODULE_MISSING' };
     if (!fs.existsSync(CFG.python)) return { ok: false, error: 'NO_PYTHON' };
     // 风格注入在这里做：颜色/背景/线宽/字体都改成风格值，模型写 BLUE 也会被换掉。
-    const styled = S.applyToManimCode(s.manim.code, style);
+    // 参考图在风格注入之前兜底注入：模型没写 ImageMobject 也能看到图。
+    let manimCode = s.manim.code;
+    const imagePath = s.imagePath || (s.image ? (resolveSceneImage(s.image).path || '') : '');
+    if (imagePath) {
+      const inj = ensureManimImage(manimCode, imagePath);
+      if (inj.injected) {
+        manimCode = inj.code;
+        log(`scene#${index} 参考图已注入 manim 背景层：${path.basename(imagePath)}`);
+      } else if (inj.error) {
+        log(`scene#${index} 参考图注入失败（${inj.error}），按模型代码继续`);
+      }
+    }
+    const styled = S.applyToManimCode(manimCode, style);
     const mm = await Manim.renderManim({
       python: CFG.python, work, index, code: styled.code, sceneName: s.manim.scene,
       quality: CFG.manimQuality || '-qm', seconds: s.seconds,
@@ -1518,13 +1904,27 @@ async function renderSceneEngine({ eng, s, index, style, work }) {
         error: 'WAN_KEY_MISSING: 没有密钥（配 config.wanKeyPath 指向 secrets\\wan.key，或放 secrets\\qwen.key）',
       };
     }
+    // 首帧参考图：只有 CFG.aivideoImage 打开（对照实验证实网关真的吃这个字段）才传。
+    // 传本地文件时编码成 data URL —— 服务器端口不对外，网关拿不到我们的上传链接。
+    let firstFrameUrl = '';
+    if (s.imagePath && CFG.aivideoImage) {
+      try {
+        firstFrameUrl = imageAsDataUrl(s.imagePath);
+        log(`scene#${index} ai 画面带首帧参考图（data URL ${Math.round(firstFrameUrl.length / 1024)}KB）：${path.basename(s.imagePath)}`);
+      } catch (err) {
+        log(`scene#${index} 首帧参考图编码失败，本条不带图：${err && err.message || err}`);
+      }
+    } else if (s.imagePath) {
+      log(`scene#${index} 有参考图，但 aivideoImage 关闭（网关是否生效未证实），本条不带图`);
+    }
     // 密钥来源只打路径，密钥本身永远不进日志
-    log(`scene#${index} ai 画面生成中（prompt=${String(s.video.prompt).slice(0, 60)}… 密钥来自 ${path.basename(keyInfo.source)}）`);
+    log(`scene#${index} ai 画面生成中（prompt=${String(s.video.prompt).slice(0, 60)}… 密钥来自 ${path.basename(keyInfo.source)}${firstFrameUrl ? ' 带首帧图' : ''}）`);
     const clip = await Wan.generateClip({
       key: keyInfo.key,
       prompt: s.video.prompt,
       seconds: s.seconds,
       size: s.video.size,
+      firstFrameUrl,
       work, index,
       timeoutMs: CFG.wanTimeoutMs,
       ffmpeg: CFG.ffmpeg,
@@ -1535,9 +1935,9 @@ async function renderSceneEngine({ eng, s, index, style, work }) {
     // 5/10 秒的产物对到本场秒数：短的克隆末帧补足、长的截断，规格统一到项目宽高
     const norm = await fitAiVideoClip({ inFile: clip.file, work, index, seconds: s.seconds, w, h, fps });
     if (!norm.ok) return { ok: false, error: norm.error };
-    log(`scene#${index} ai 画面完成 ${clip.ms}ms（task=${clip.taskId} ${clip.width}x${clip.height} ${clip.duration}s ${Math.round(clip.bytes / 1024)}KB）` +
+    log(`scene#${index} ai 画面完成 ${clip.ms}ms（task=${clip.taskId} ${clip.width}x${clip.height} ${clip.duration}s ${Math.round(clip.bytes / 1024)}KB${clip.firstFrame ? ' 首帧图已提交' : ''}）` +
       `${norm.reencoded ? ' → 已对齐项目规格' : ''}`);
-    return { ok: true, file: norm.file, taskId: clip.taskId, ms: clip.ms };
+    return { ok: true, file: norm.file, taskId: clip.taskId, ms: clip.ms, firstFrame: Boolean(clip.firstFrame) };
   }
   if (eng === 'plot') {
     if (!Pyplot || !fs.existsSync(CFG.python)) return { ok: false, error: 'PYPLOT_UNAVAILABLE' };
@@ -1589,7 +1989,7 @@ async function renderPlan(plan, opts = {}) {
     voice: opts.voice || '', bgm: opts.bgm || '',
     style: opts.style || '',
   });
-  project.scenes = norm.scenes.map((s) => P.normalizeScene(s));
+  project.scenes = norm.scenes.map((s, i) => P.normalizeScene(s, { label: `scene#${i}`, onDegrade: log }));
   P.saveProject(CFG.projectDir, project);
 
   const r = await renderProject(project, opts, 'all');
@@ -1645,31 +2045,46 @@ async function buildStepClip({ work, index, pngs, seconds, fps = 30, w, h, fade 
  * 缓存键是 (文本, 音色)，所以"只改台词"时只有改到的那几场需要重新合成。
  *
  * 失败返回 { error, status }（不带 wav）—— 不写缓存，下次还会重试。
- * 上层拿到失败必须整体中止（VOICE_UNAVAILABLE），不能跳过这一句。
+ * 任务化之后这里多了"每句重试 2 次（间隔 3s/8s）"：一句拿不到不该让整集失败，
+ * 渲染层会把这一场静音并记 warnings，整集继续出片（见 renderProject）。
  */
-async function getSpeechCached(project, scene, voice, cdir) {
+async function getSpeechCached(project, scene, voice, cdir, opts = {}) {
   const text = String(scene.narration || '');
   if (!text) return null;
   const key = P.audioKey(text, voice);
   const hit = project.audioCache[key];
-  if (hit && fs.existsSync(hit.wav)) return { wav: hit.wav, ms: hit.ms, key, cached: true };
+  if (hit && fs.existsSync(hit.wav)) return { wav: hit.wav, ms: hit.ms, key, cached: true, attempts: 0 };
 
   const wav = path.join(cdir, `tts-${key}.wav`);
-  const got = await fetchSpeech(text, voice, wav);
-  if (!got || !got.ok) {
-    return {
-      error: (got && got.error) || 'SPEAK_FAILED',
-      status: (got && got.status) || 0,
-      speakError: (got && got.speakError) || '',
-      attempts: (got && got.attempts) || 0,
-      retries: (got && got.retries) || 0,
-      detail: (got && got.detail) || '',
-      key,
-    };
+  const retries = Math.max(0, Number(opts.retries == null ? 2 : opts.retries) || 0);
+  const delays = Array.isArray(opts.delays) && opts.delays.length ? opts.delays : [3000, 8000];
+  let last = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    if (attempt > 0) {
+      const waitMs = Math.max(0, Number(delays[Math.min(attempt - 1, delays.length - 1)]) || 0);
+      log(`旁白重试 ${attempt}/${retries}（等 ${Math.round(waitMs / 1000)}s 再合成）：${text.slice(0, 24)}…`);
+      await sleep(waitMs);
+    }
+    const got = await fetchSpeech(text, voice, wav);
+    if (got && got.ok) {
+      const ms = await measureAudioMs(got.file);
+      project.audioCache[key] = { wav: got.file, ms, at: new Date().toISOString() };
+      return { wav: got.file, ms, key, cached: false, attempts: attempt + 1 };
+    }
+    last = got || {};
+    log(`旁白失败（第 ${attempt + 1}/${retries + 1} 次）：${last.error || 'SPEAK_FAILED'}`
+      + `${last.speakError ? `/${last.speakError}` : ''} ${String(last.detail || '').slice(0, 120)}`);
   }
-  const ms = await measureAudioMs(got.file);
-  project.audioCache[key] = { wav: got.file, ms, at: new Date().toISOString() };
-  return { wav: got.file, ms, key, cached: false };
+  return {
+    error: (last && last.error) || 'SPEAK_FAILED',
+    status: (last && last.status) || 0,
+    speakError: (last && last.speakError) || '',
+    attempts: (last && last.attempts) || (retries + 1),
+    retries: (last && last.retries) || retries,
+    detail: (last && last.detail) || '',
+    key,
+    tried: retries + 1,
+  };
 }
 
 /**
@@ -1697,12 +2112,74 @@ async function fitNarration(wav, ms, maxSeconds, work, index) {
 }
 
 /**
+ * 等一会儿。配音重试的间隔（3s/8s）用它，不引入额外依赖。
+ */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+}
+
+/**
+ * manim 首次渲染失败 → 把 stderr 尾部（≤400 字符）贴回模型，让它修一次。
+ *
+ * 为什么值得多花一次模型调用：模型写 manim 代码的失败率不低（MathTex 包 $、
+ * include_numbers、少个冒号），直接降级文字卡等于把用户要的动画扔了。
+ * 模型看到真实报错后大部分能改对；改不对再按引擎链降级，成本只是一次调用。
+ *
+ * 返回 { ok, code, scene } 或 { ok:false, error }。
+ */
+async function repairManimScene({ scene, index, style, errorText, req }) {
+  const tail = String(errorText || '')
+    .replace(/^MANIM_[A-Z]+\([^)]*\)\s*/, '')
+    .replace(/^UNSAFE_CODE\(([^)]*)\)\s*/, '代码被安全闸门拒收（$1）：')
+    .trim()
+    .slice(-400);
+  const code = scene && scene.manim && scene.manim.code ? String(scene.manim.code) : '';
+  const lines = [
+    `上一次生成的 manim 代码报错了：${tail || '未知错误'}`,
+    '请修正后重新输出完整脚本，只输出 JSON。',
+    '',
+    `这一场：标题「${(scene && scene.text) || ''}」，旁白「${(scene && scene.narration) || ''}」，${Number(scene && scene.seconds) || 4} 秒。`,
+    scene && scene.visual_hint ? `用户指定的画面：${String(scene.visual_hint).slice(0, 400)}` : '',
+    '',
+    '## 输出形状',
+    '{"manim":{"scene":"类名","code":"from manim import *\\nclass 类名(Scene):\\n    def construct(self):\\n        ..."}}',
+    '',
+    '## 硬约束（违反会再次失败）',
+    '- 只写 from manim import * + 一个 class X(Scene) 和它的 def construct(self)，类名与 manim.scene 逐字一致',
+    '- 只修报错相关的地方，不要整段重写成别的画面；不要 include_numbers=True / DecimalNumber / Integer',
+    '- MathTex 参数不要再包 $；中文 Text 必须 font="Microsoft YaHei"',
+    '- 代码 ≤60 行，单类，不要 __main__，不要读写文件/网络/subprocess',
+    '',
+    '## 报错的代码（供你定位）',
+    code.slice(0, 4000),
+  ].filter(Boolean);
+  const r = await askJson(lines.join('\n'), { req, sessionId: 'studio-manim-repair' });
+  if (!r.ok) return { ok: false, error: r.error || 'REPAIR_FAILED' };
+  const obj = r.json && r.json.manim && typeof r.json.manim === 'object' ? r.json.manim : null;
+  const fixed = obj && typeof obj.code === 'string' ? stripMathDelims(obj.code.trim()) : '';
+  if (!fixed) return { ok: false, error: 'REPAIR_NO_CODE' };
+  const unsafe = Manim ? Manim.checkCode(fixed) : null;
+  if (unsafe) return { ok: false, error: `REPAIR_UNSAFE(${unsafe})` };
+  const noLat = Manim ? Manim.checkNoLatex(fixed) : null;
+  if (noLat) return { ok: false, error: `REPAIR_NO_LATEX(${noLat})` };
+  const sceneName = obj && typeof obj.scene === 'string' && obj.scene.trim() ? obj.scene.trim() : null;
+  return { ok: true, code: fixed.slice(0, 8000), scene: sceneName };
+}
+
+/**
  * 渲染一个项目。
  *   scope='auto'  内容优先：旁白决定每场时长，只有受影响的场需要重画（默认）
  *   scope='all'   全部重画（换了分辨率/字体/需要绝对一致时用）
  *   scope='audio' 画面优先：所有片段必须已存在，只重做旁白与混音 —— 秒级完成
  *
- * 返回里带 reuse/rendered 两个计数，调用方一眼能看出"这次省了多少"。
+ * 任务化之后这里承担"自愈"的两层：
+ *   1) 场景级：manim 首次失败 → 把 stderr 尾部贴回模型修一次 → 再失败退 aivideo
+ *      → 再失败退文字卡；任何一场彻底没画面就跳过它（≥1 场成功仍然出片）。
+ *   2) 配音级：每句重试 2 次（3s/8s）仍失败 → 这一场静音继续；全部旁白都失败
+ *      才按失败上报，但画面照样渲完、成片照样保留（不丢已完成的部分）。
+ *
+ * 返回里带 reuse/rendered 两个计数，调用方一眼能看出"这次省了多少"；
+ * scenes[] 是每场的最终引擎与状态（ok/degraded/failed），warnings 是给人看的原因。
  */
 async function renderProject(project, opts = {}, scope = 'auto') {
   const started = Date.now();
@@ -1714,6 +2191,29 @@ async function renderProject(project, opts = {}, scope = 'auto') {
 
   const work = path.join(os.tmpdir(), `studio-${crypto.randomUUID().slice(0, 8)}`);
   fs.mkdirSync(work, { recursive: true });
+
+  // 进度：内存进度表给 /v1/project/progress 用，onProgress 给任务（GET /v1/jobs/:id）用。
+  const report = (patch) => {
+    progressUpdate(project.id, patch);
+    if (typeof opts.onProgress === 'function') {
+      try { opts.onProgress(patch); } catch { /* 进度回写失败不能影响渲染 */ }
+    }
+  };
+  // 取消：只在场次边界检查。ffmpeg/manim 正在跑的时候硬杀会留下半个片段，
+  // 反而要重渲一次；等这一场结束再停，已完成的片段全部保留。
+  const abortCheck = () => {
+    if (typeof opts.shouldAbort === 'function' && opts.shouldAbort()) {
+      const err = new Error('CANCELLED');
+      err.code = 'CANCELLED';
+      throw err;
+    }
+  };
+
+  const warnings = [];
+  const sceneResults = [];
+  const voiceFailed = [];
+  let narrationWanted = 0;
+  const repaired = new Set();
 
   try {
     if (!project.scenes.length) return { ok: false, error: 'NO_SCENES' };
@@ -1729,59 +2229,46 @@ async function renderProject(project, opts = {}, scope = 'auto') {
     const pal = S.textPalette(style);
     log(`风格 ${style.id}（${styleInfo.source}）：${styleInfo.reason}`);
 
-    // ---- 1) 旁白：**先全部拿到**，缺一条就整片失败 ----
-    // 以前这里失败就默默跳过，成片于是"一半真一半假"：某几句没声音、
-    // 或者 speak 回退了别的音色，事后根本查不出是哪一句。现在整体失败。
+    // ---- 1) 旁白：逐句拿；失败重试 2 次，仍失败就这一场静音，整集继续 ----
+    // 关键改动（旧行为）：以前任何一句拿不到就整集 VOICE_UNAVAILABLE，前面渲的画面全白费。
     const speeches = [];
     const narrationMs = project.scenes.map(() => 0);
-    const missing = [];
     for (let i = 0; i < project.scenes.length; i++) {
       const s = project.scenes[i];
       if (!s.narration) { speeches.push(null); continue; }
-      progressUpdate(project.id, {
+      narrationWanted += 1;
+      report({
         phase: 'voice', current: i, done: i, total: sceneTotal,
         label: `正在合成第 ${i + 1}/${sceneTotal} 句旁白`,
       });
-      const got = await getSpeechCached(project, s, voice, cdir);
+      const got = await getSpeechCached(project, s, voice, cdir, { retries: 2, delays: [3000, 8000] });
       if (!got || !got.wav) {
-        missing.push({
+        const tried = Number((got && got.tried) || 3);
+        const reason = String((got && (got.speakError || got.detail || got.error)) || 'SPEAK_FAILED').slice(0, 160);
+        voiceFailed.push({
           index: i,
           text: String(s.narration).slice(0, 40),
           error: (got && got.error) || 'SPEAK_FAILED',
-          status: (got && got.status) || 0,
           speakError: (got && got.speakError) || '',
-          attempts: (got && got.attempts) || 0,
-          retries: (got && got.retries) || 0,
+          attempts: tried,
           detail: (got && got.detail) || '',
         });
         speeches.push(null);
+        warnings.push(`第 ${i + 1} 场没有声音：配音合成失败（${reason}，已重试 ${Math.max(0, tried - 1)} 次），这一场静音继续`);
+        log(`scene#${i} 旁白最终没拿到，这一场静音继续出片：${reason}`);
         continue;
       }
       speeches.push(got);
       narrationMs[i] = got.ms;
     }
-    if (missing.length) {
-      log(`渲染中止 VOICE_UNAVAILABLE：${missing.length}/${project.scenes.length} 条旁白没拿到（scene#${missing.map((m) => m.index).join(',')}）`);
-      // 说话失败最多重试了几次：面板要能说"已重试 4 次"，而不是只说"失败"。
-      const maxAttempts = missing.reduce((a, m) => Math.max(a, Number(m.attempts) || 0), 0);
-      const speakError = missing.find((m) => m.speakError) ? missing.find((m) => m.speakError).speakError : '';
-      progressUpdate(project.id, {
-        status: 'failed', phase: 'failed',
-        label: speakError === 'QUEUE_TIMEOUT' ? '配音排队超时' : '配音服务不可用',
-        error: 'VOICE_UNAVAILABLE', detail: speakError || missing[0].error,
-        attempts: maxAttempts, total: sceneTotal,
-      });
-      return {
-        ok: false,
-        error: 'VOICE_UNAVAILABLE',
-        speakError,
-        attempts: maxAttempts,
-        scenes: missing,
-        hint: '有旁白没合成出来（speak strict 模式）。整片不渲染，避免产出"半真半假"的成片；修好音色后重试即可。',
-        ms: Date.now() - started,
-      };
+    const allVoiceFailed = narrationWanted > 0 && voiceFailed.length === narrationWanted;
+    if (voiceFailed.length) {
+      log(`旁白部分失败：${voiceFailed.length}/${narrationWanted} 条没拿到（scene#${voiceFailed.map((m) => m.index).join(',')}），这些场次静音，整集继续渲染`);
     }
-
+    if (allVoiceFailed) {
+      log(`全部旁白都失败（${narrationWanted} 条）：任务按 failed 上报，但画面继续渲完并保留成片`);
+      warnings.push(`全部旁白都失败（${narrationWanted} 条），成片没有声音`);
+    }
 
     // ---- 2) 时长 ----
     let finalPlan;
@@ -1800,75 +2287,133 @@ async function renderProject(project, opts = {}, scope = 'auto') {
     }
 
     // ---- 2.5) AI 画面配额：一集最多 maxAiVideo 条 ----
-    // 每条要等 ~100 秒、还占网关额度。超出的场次在这里就定死降级，
+    // 每条要等 100~400 秒、还占网关额度。超出的场次在这里就定死降级，
     // 渲染循环里直接跳过 aivideo 引擎 —— 而不是"渲到一半才发现超预算"。
-    const aiQuota = planAiVideoQuota(finalPlan.scenes, CFG.maxAiVideo);
+    const maxAi = Math.max(0, Number(opts.maxAiVideo != null ? opts.maxAiVideo : CFG.maxAiVideo) || 0);
+    const aiQuota = planAiVideoQuota(finalPlan.scenes, maxAi);
     if (aiQuota.total > aiQuota.allowed.size) {
       log(`成本护栏：本集 aivideo ${aiQuota.total} 场，上限 ${aiQuota.max} 场；`
         + `第 ${aiQuota.degraded.map((i) => i + 1).join('、')} 场降级为文字卡（省额度/时间）`);
     }
 
-    // ---- 3) 画面片段：能复用就复用 ----
+    // ---- 3) 画面片段：能复用就复用；不能复用就按引擎链自愈 ----
     const clips = [];
-    const durations = [];
+    const timeline = [];      // [{ scene, index }] 真正进了成片的场次（跳过失败的场）
     let reused = 0;
     let rendered = 0;
     const totalScenes = finalPlan.scenes.length;
     for (let i = 0; i < finalPlan.scenes.length; i++) {
+      abortCheck();
       const s = finalPlan.scenes[i];
       const key = P.sceneKey(s, sceneCfg);
       const hit = project.cache[key];
       const hasClip = hit && fs.existsSync(hit.clip);
-      const canReuse = scope !== 'all' && hasClip;
+      // 上一轮表情没叠上（素材目录坏了/转码失败）就别复用那份"没表情"的片段：
+      // 修好之后重渲一次能补上，否则坏结果会被缓存永久钉住。
+      const wantsStickers = Array.isArray(s.stickers) && s.stickers.length > 0;
+      const retryStickers = Boolean(wantsStickers && hit && hit.stickersSkipped);
+      const canReuse = scope !== 'all' && hasClip && !retryStickers;
+      if (retryStickers) log(`scene#${i} 上次表情没叠上，这次重渲这一场（其它场照旧复用）`);
       if (canReuse) {
         clips.push(hit.clip);
+        timeline.push({ scene: s, index: i });
         reused += 1;
-        progressUpdate(project.id, {
-          phase: 'scenes', current: i, done: i + 1, total: totalScenes,
-          engine: 'cache', label: `第 ${i + 1}/${totalScenes} 场复用缓存`
-        });
-      } else {
-        // 按"手里有什么素材"排引擎链（sceneEngines），逐个试，谁先成用谁。
-        // 有 draw 就一定会被轮到 —— 不会再出现"有 draw 却被 manim 分支吞掉"。
-        let chain = sceneEngines(s);
-        // 成本护栏之外的场次不许再调生成接口：直接把它从链条里摘掉，
-        // 后面的 manim/plot/draw/html 照常有机会，最后落到文字卡。
-        if (chain.includes('aivideo') && !aiQuota.allowed.has(i)) {
-          chain = chain.filter((e) => e !== 'aivideo');
+        sceneResults.push({ index: i, engine: String(hit.engine || 'cache'), status: 'ok', note: '复用缓存' });
+        report({ phase: 'scenes', current: i, done: i + 1, total: totalScenes, engine: 'cache', label: `第 ${i + 1}/${totalScenes} 场复用缓存` });
+        continue;
+      }
+
+      // 按"手里有什么素材"排引擎链（sceneEngines），逐个试，谁先成用谁。
+      let chain = sceneEngines(s);
+      // 成本护栏之外的场次不许再调生成接口：直接把它从链条里摘掉。
+      if (chain.includes('aivideo') && !aiQuota.allowed.has(i)) {
+        chain = chain.filter((e) => e !== 'aivideo');
+        log(`scene#${i} aivideo 超出本集上限（${aiQuota.max} 场），降级为 ${engineLabel(chain[0] || 'text')}`);
+      }
+      const firstEng = chain[0] || 'text';
+      const originallyText = firstEng === 'text';
+      report({
+        phase: 'scenes', current: i, done: i, total: totalScenes,
+        engine: firstEng, label: `第 ${i + 1}/${totalScenes} 场 ${engineLabel(firstEng)} 渲染中…`,
+      });
+
+      let clipFile = null;
+      let engine = 'text';
+      let note = '';
+      let degraded = false;
+      for (let ci = 0; ci < chain.length; ci++) {
+        const eng = chain[ci];
+        if (eng === 'text') break;
+        const next = chain[ci + 1] || 'text';
+        let got = null;
+        try {
+          got = await renderSceneEngine({ eng, s, index: i, style, work });
+        } catch (err) {
+          got = { ok: false, error: String((err && err.message) || err) };
         }
-        const firstEng = chain[0] || 'text';
-        progressUpdate(project.id, {
-          phase: 'scenes', current: i, done: i, total: totalScenes,
-          engine: firstEng, label: `第 ${i + 1}/${totalScenes} 场 ${engineLabel(firstEng)} 渲染中…`,
-        });
-        let clipFile = null;
-        let engine = 'text';
-        for (const eng of chain) {
-          if (eng === 'text') break;
-          try {
-            const got = await renderSceneEngine({ eng, s, index: i, style, work });
-            if (got && got.ok) {
-              clipFile = got.file;
-              engine = eng;
-              if (chain.indexOf(eng) > 0) log(`scene#${i} 退回 ${eng} 成功（前一个引擎失败）`);
-              break;
+
+        // ---- manim 自愈：第一次失败就把 stderr 尾部贴回模型，让它改一次 ----
+        if (eng === 'manim' && got && !got.ok && !repaired.has(i) && opts.manimRepair !== false) {
+          repaired.add(i);
+          const rawError = String(got.error || 'unknown');
+          const preview = rawError.replace(/^MANIM_[A-Z]+\([^)]*\)\s*/, '').slice(0, 120);
+          log(`scene#${i} manim 失败（${preview || rawError.slice(0, 80)}），把错误贴回给模型重试一次`);
+          const fix = await repairManimScene({ scene: s, style, errorText: rawError, req: opts.req });
+          if (fix.ok) {
+            // finalPlan.scene 是副本，得同步回项目，否则下次渲染又拿旧代码
+            s.manim = { code: fix.code, scene: fix.scene || (s.manim && s.manim.scene) || null };
+            if (project.scenes[i]) project.scenes[i].manim = s.manim;
+            try { P.saveProject(CFG.projectDir, project); } catch { }
+            log(`scene#${i} manim 修正代码已返回（${fix.code.length} 字符），重新渲染一次`);
+            try {
+              got = await renderSceneEngine({ eng: 'manim', s, index: i, style, work });
+            } catch (err) {
+              got = { ok: false, error: String((err && err.message) || err) };
             }
-            log(`scene#${i} ${eng} 失败：${String((got && got.error) || 'unknown').slice(0, 200)}`);
-          } catch (err) {
-            log(`scene#${i} ${eng} 异常：${err && err.message || err}`);
+            if (got && got.ok) {
+              degraded = true;
+              note = `manim 首次失败，把错误贴回模型修正后成功（${preview.slice(0, 80)}）`;
+              warnings.push(`第 ${i + 1} 场：manim 首次报错，已把错误贴回模型修正后重渲成功`);
+            } else {
+              note = `manim 修正后仍失败：${String((got && got.error) || '').slice(0, 140)}`;
+            }
+          } else {
+            note = `manim 修复失败（${fix.error}）`;
+            log(`scene#${i} manim 修复失败（${fix.error}），按引擎链继续降级`);
           }
         }
-        if (!clipFile) {
-          // 文字卡：渐变底 + 一行大字，配色来自风格；标题入场/出场各 textEdgeFade 秒，
-          // 这样 xfade 的 0.4 秒重叠期里两个标题不会同时全亮。
-          engine = 'text';
+
+        if (got && got.ok) {
+          clipFile = got.file;
+          engine = eng;
+          if (!degraded) {
+            if (ci > 0) {
+              degraded = true;
+              note = `${engineLabel(chain[ci - 1])} 失败，退回 ${engineLabel(eng)}`;
+            } else if (!note) {
+              note = '';
+            }
+          }
+          break;
+        }
+        // 每次降级都写一条：原引擎 / 新引擎 / 原因。排查时能对上到底是哪一场变成了什么。
+        const reason = String((got && got.error) || 'unknown').slice(0, 200);
+        log(`scene#${i} ${engineLabel(eng)} 失败/不可用，降级为 ${engineLabel(next)}：${reason}`);
+        if (!note) note = `${engineLabel(eng)} 失败：${reason}`;
+      }
+
+      // ---- 文字卡：永远的最后兜底（渐变底 + 一行大字） ----
+      if (!clipFile) {
+        if (!originallyText) degraded = true;
+        engine = 'text';
+        try {
           const stillScene = Object.assign({}, s, { bg: pal.bg, textColor: pal.textColor });
           const still = await R.sceneStill({
             ffmpeg: CFG.ffmpeg, work, index: i, scene: stillScene,
             w: CFG.width, h: CFG.height, font: CFG.font,
             imageDir: CFG.imageDir, image: s.image || undefined, motion: s.motion || undefined,
           });
-          if (!still.ok) return { ok: false, error: `SCENE_STILL_FAILED#${i}: ${(still.error || '').slice(0, 300)}` };
+          if (!still.ok) throw new Error(`SCENE_STILL_FAILED: ${(still.error || '').slice(0, 200)}`);
           const clip = await R.sceneClip({
             ffmpeg: CFG.ffmpeg, work, index: i, stillPng: still.png,
             seconds: s.seconds, w: CFG.width, h: CFG.height, fps: CFG.fps,
@@ -1879,40 +2424,127 @@ async function renderProject(project, opts = {}, scope = 'auto') {
             // 淡到风格底色而不是黑：白板这类浅色风格淡到黑会变成一下黑屏闪烁
             edgeColor: pal.bg.c0,
           });
-          if (!clip.ok) return { ok: false, error: `SCENE_CLIP_FAILED#${i}: ${(clip.error || '').slice(0, 300)}` };
+          if (!clip.ok) throw new Error(`SCENE_CLIP_FAILED: ${(clip.error || '').slice(0, 200)}`);
           clipFile = clip.file;
+          if (!note) note = originallyText ? '' : '降级为文字卡';
+          if (degraded) warnings.push(`第 ${i + 1} 场：${note.slice(0, 120)}`);
+        } catch (err) {
+          // 连文字卡都出不来（ffmpeg 挂了/磁盘满）：跳过这一场，保住其它场。
+          const reason = String((err && err.message) || err).slice(0, 200);
+          sceneResults.push({ index: i, engine: 'none', status: 'failed', note: `画面生成失败：${reason}` });
+          warnings.push(`第 ${i + 1} 场没有画面，已跳过：${reason}`);
+          log(`scene#${i} 连文字卡都失败，跳过这一场：${reason}`);
+          report({ phase: 'scenes', current: i, done: i + 1, total: totalScenes, label: `第 ${i + 1}/${totalScenes} 场失败，已跳过` });
+          continue;
         }
+      }
 
-        // 表情叠加：加"大肥鱼"的在场感。失败不致命 —— 画面对了比表情重要。
-        if (Array.isArray(s.stickers) && s.stickers.length && Overlay) {
+      // 表情叠加：加"大肥鱼"的在场感。失败不致命 —— 画面对了比表情重要。
+      // 这一步在片段落进缓存之前跑，所以缓存里的 clip 本身就是"已经带表情"的最终画面；
+      // 复用缓存时不需要再叠一次（再叠会重复叠两层）。
+      let stickerApplied = 0;
+      let stickerMs = 0;
+      let stickerSkipped = false;
+      if (Array.isArray(s.stickers) && s.stickers.length) {
+        if (!Overlay) {
+          stickerSkipped = true;
+          log(`scene#${i} 表情叠加跳过：overlay 模块不可用（用原片段）`);
+        } else {
+          const ovStarted = Date.now();
           try {
             const ov = await Overlay.overlayStickers({
               ffmpeg: CFG.ffmpeg, stickerDir: CFG.stickerDir, work, index: i,
               videoIn: clipFile, out: path.join(work, `ov-${i}.mp4`),
               w: CFG.width, h: CFG.height, stickers: s.stickers,
             });
-            if (ov && ov.ok && ov.applied > 0) clipFile = ov.file;
-            else log(`scene#${i} 表情叠加跳过: ${(ov && (ov.warning || ov.error) || '').slice(0, 160)}`);
+            stickerMs = Date.now() - ovStarted;
+            if (ov && ov.ok && ov.applied > 0) {
+              clipFile = ov.file;
+              stickerApplied = ov.applied;
+              const detail = (ov.details || [])
+                .map((d) => `${d.id}@${d.at}s(${d.kind}${d.cached ? '/缓存' : ''},${d.transcodeMs || 0}ms)`)
+                .join('，');
+              log(`scene#${i} 表情叠加 ${ov.applied} 个 ${stickerMs}ms：${detail}`);
+              if (Array.isArray(ov.skipped) && ov.skipped.length) {
+                log(`scene#${i} 表情跳过 ${ov.skipped.length} 个：`
+                  + ov.skipped.map((x) => `${x.id}@${x.at}s（${x.reason}）`).join('，'));
+              }
+            } else {
+              stickerSkipped = true;
+              // 失败原因要写全：常见的是 stickerDir 指错（文件不存在）或 GIF 转码失败，
+              // 只说"跳过了"没法排查，所以把 overlay 的 skipped 明细也带上。
+              const why = (Array.isArray(ov && ov.skipped) ? ov.skipped : [])
+                .map((x) => `${x.id}（${x.reason}）`).join('，');
+              log(`scene#${i} 表情叠加跳过：${String((ov && (ov.warning || ov.error)) || '没有可叠加的表情').slice(0, 200)}`
+                + (why ? `；原因：${why}` : '') + '（用原片段，不影响出片）');
+            }
           } catch (err) {
-            log(`scene#${i} 表情叠加异常: ${err && err.message || err}`);
+            stickerMs = Date.now() - ovStarted;
+            stickerSkipped = true;
+            log(`scene#${i} 表情叠加异常：${String((err && err.message) || err).slice(0, 200)}（用原片段，不影响出片）`);
           }
         }
-
-        const dest = path.join(cdir, `clip-${key}.mp4`);
-        fs.copyFileSync(clipFile, dest);
-        // engine 记下来：排查"这场的坐标轴为什么没了"时一眼看出是哪个引擎出的片
-        project.cache[key] = { clip: dest, engine, style: style.id, at: new Date().toISOString() };
-        clips.push(dest);
-        rendered += 1;
       }
-      durations.push(s.seconds);
-      progressUpdate(project.id, { phase: 'scenes', done: i + 1, total: totalScenes });
+
+      const dest = path.join(cdir, `clip-${key}.mp4`);
+      fs.copyFileSync(clipFile, dest);
+      // engine 记下来：排查"这场的坐标轴为什么没了"时一眼看出是哪个引擎出的片
+      project.cache[key] = {
+        clip: dest,
+        engine,
+        style: style.id,
+        at: new Date().toISOString(),
+        // 表情结果也记进缓存索引：stickersSkipped=true 的片段下一轮会重渲一次，
+        // 不能把"素材目录坏了"这种失败长期缓存住；overlayMs 用来估算每场多花多少秒。
+        stickersApplied: stickerApplied,
+        stickersSkipped: stickerSkipped,
+        overlayMs: stickerMs,
+      };
+      // 每渲完一场就落盘：进程被杀时已完成的片段不会丢，重跑直接复用。
+      try { P.saveProject(CFG.projectDir, project); } catch { }
+      clips.push(dest);
+      timeline.push({ scene: s, index: i });
+      rendered += 1;
+      sceneResults.push({
+        index: i,
+        engine,
+        status: degraded ? 'degraded' : 'ok',
+        // 没降级时也把"加了几个表情"写上：任务卡上一眼能看出这场的表情生效了
+        note: note || (stickerApplied ? `表情 ${stickerApplied} 个` : ''),
+      });
+      if (degraded && !note) warnings.push(`第 ${i + 1} 场降级为 ${engineLabel(engine)}`);
+      report({ phase: 'scenes', done: i + 1, total: totalScenes, engine, label: `第 ${i + 1}/${totalScenes} 场 ${engineLabel(engine)} 完成` });
+    }
+
+    // 一场都没成功：这才是真的没法出片（正常情况下文字卡永远成功）。
+    if (!clips.length) {
+      report({ status: 'failed', phase: 'failed', label: '所有场次都没有画面', error: 'ALL_SCENES_FAILED' });
+      return { ok: false, error: 'ALL_SCENES_FAILED', scenes: sceneResults, warnings, ms: Date.now() - started, voice: { wanted: narrationWanted, failed: voiceFailed } };
     }
 
     // ---- 4) 拼接（可缓存：画面没变就不用重拼）----
-    progressUpdate(project.id, { phase: 'concat', label: '正在拼接画面' });
+    // 被跳过的场次不再占用时间轴，成片是"保留下来的场次"按顺序拼起来。
+    const timelineScenes = timeline.map((t) => t.scene);
+    const totalSeconds = Number(Math.max(0.5, timelineScenes.reduce((a, s) => a + Number(s.seconds || 0), 0)
+      - CFG.fade * Math.max(0, timelineScenes.length - 1)).toFixed(2));
+    const durations = timelineScenes.map((s) => Number(s.seconds) || 0);
+    finalPlan.totalSeconds = totalSeconds;
+
+    report({ phase: 'concat', label: '正在拼接画面', total: totalScenes, done: totalScenes });
     // 只换声音时最值钱的一步：拼接要跑一次全片编码，几十秒的片子就是 1~3 秒白花。
-    const joinedKey = P.sha1(JSON.stringify({ clips: clips.map((c) => path.basename(c)), durations, fade: CFG.fade, w: CFG.width, h: CFG.height, fps: CFG.fps }));
+    // 片段的时间戳/大小也进 key：同一场重渲（表情重试、manim 修复）产出的文件名不变，
+    // 只看 basename 会把"重渲前的拼接结果"当成还能用 —— 表情就是这样被偷偷丢掉的。
+    const clipStamp = (file) => {
+      try {
+        const st = fs.statSync(file);
+        return `${path.basename(file)}:${st.size}:${Math.round(st.mtimeMs)}`;
+      } catch {
+        return path.basename(file);
+      }
+    };
+    const joinedKey = P.sha1(JSON.stringify({
+      clips: clips.map(clipStamp), durations, fade: CFG.fade, w: CFG.width, h: CFG.height, fps: CFG.fps,
+    }));
     let joined = null;
     if (project.joined && project.joined.key === joinedKey && fs.existsSync(project.joined.file) && scope !== 'all') {
       joined = project.joined.file;
@@ -1920,67 +2552,762 @@ async function renderProject(project, opts = {}, scope = 'auto') {
     } else {
       joined = path.join(cdir, `joined-${joinedKey}.mp4`);
       const cat = await R.concatClips({ ffmpeg: CFG.ffmpeg, clips, durations, out: joined, fade: CFG.fade });
-      if (!cat.ok) return { ok: false, error: `CONCAT_FAILED: ${(cat.error || '').slice(0, 300)}` };
+      if (!cat.ok) return { ok: false, error: `CONCAT_FAILED: ${(cat.error || '').slice(0, 300)}`, scenes: sceneResults, warnings, ms: Date.now() - started, voice: { wanted: narrationWanted, failed: voiceFailed } };
       project.joined = { key: joinedKey, file: joined, at: new Date().toISOString() };
     }
 
-    // ---- 5) 旁白排位 ----
+    // ---- 5) 旁白排位（跳过场次不占位；静音场只占画面时间）----
     const narrations = [];
     let at = 0;
-    for (let i = 0; i < finalPlan.scenes.length; i++) {
-      const sp = speeches[i];
+    for (const item of timeline) {
+      const s = item.scene;
+      const sp = speeches[item.index];
       if (sp) {
         let wav = sp.wav;
         let ms = sp.ms;
         if (scope === 'audio') {
           // 只重做声音时，画面长度是既定的，旁白要自己塞进去
-          const fitted = await fitNarration(wav, ms, finalPlan.scenes[i].seconds, work, i);
+          const fitted = await fitNarration(wav, ms, s.seconds, work, item.index);
           wav = fitted.wav; ms = fitted.ms;
         }
         narrations.push({ file: wav, at: Math.max(0, at), ms });
       }
-      at += finalPlan.scenes[i].seconds - CFG.fade;
+      at += Number(s.seconds) - CFG.fade;
     }
-    guardAudioTail(narrations, finalPlan.totalSeconds);
+    guardAudioTail(narrations, totalSeconds);
 
     // 成片落在 outDir 根下（面板按 jobId 直接取 /api/studio/video?id=），
     // 项目目录里只留缓存与记录，避免两处路径含义不一致。
     const renderId = crypto.randomUUID();
     const outFile = path.join(CFG.outDir, `${renderId}.mp4`);
-    progressUpdate(project.id, { phase: 'mix', label: '正在混音' });
+    report({ phase: 'mix', label: '正在混音' });
     const mixed = await R.mixAudio({
       ffmpeg: CFG.ffmpeg, videoIn: joined, narrations,
-      bgm: pickBgm(opts.bgm || project.bgm), totalSeconds: finalPlan.totalSeconds, out: outFile,
+      bgm: pickBgm(opts.bgm || project.bgm), totalSeconds, out: outFile,
     });
-    if (!mixed.ok) return { ok: false, error: `AUDIO_FAILED: ${(mixed.error || '').slice(0, 300)}` };
+    if (!mixed.ok) {
+      return { ok: false, error: `AUDIO_FAILED: ${(mixed.error || '').slice(0, 300)}`, scenes: sceneResults, warnings, ms: Date.now() - started, voice: { wanted: narrationWanted, failed: voiceFailed } };
+    }
 
     const stat = fs.statSync(outFile);
     const record = {
       renderId, file: outFile, bytes: stat.size,
-      seconds: finalPlan.totalSeconds, at: new Date().toISOString(),
+      seconds: totalSeconds, at: new Date().toISOString(),
       scope, reused, rendered, ms: Date.now() - started,
       style: style.id,
     };
     project.renders = (project.renders || []).concat([record]).slice(-10);
-    P.saveProject(CFG.projectDir, project);
-    log(`project ${project.id} render scope=${scope} reused=${reused} rendered=${rendered} style=${style.id} ${Math.round(stat.size / 1024)}KB ${Date.now() - started}ms`);
-    progressUpdate(project.id, {
+    try { P.saveProject(CFG.projectDir, project); } catch { }
+    log(`project ${project.id} render scope=${scope} reused=${reused} rendered=${rendered} skipped=${timelineScenes.length - rendered}`
+      + ` style=${style.id} ${Math.round(stat.size / 1024)}KB ${Date.now() - started}ms`
+      + `${voiceFailed.length ? ` 静音场=${voiceFailed.map((f) => f.index + 1).join(',')}` : ''}`);
+    report({
       status: 'done', phase: 'done', done: totalScenes, total: totalScenes,
-      label: `做好了：${finalPlan.totalSeconds} 秒`,
-      renderId, file: outFile, seconds: finalPlan.totalSeconds, bytes: stat.size, ms: Date.now() - started,
+      label: `做好了：${totalSeconds} 秒`,
+      renderId, file: outFile, seconds: totalSeconds, bytes: stat.size, ms: Date.now() - started,
     });
 
-    return {
+    const voiceSummary = { wanted: narrationWanted, ok: narrationWanted - voiceFailed.length, failed: voiceFailed, attempts: voiceFailed.reduce((a, f) => Math.max(a, Number(f.attempts) || 0), 0) };
+    const base = {
       ok: true, ...record,
       plan: finalPlan,
       narrationCount: narrations.length,
       overBudget: finalPlan.overBudget || false,
       style: { id: style.id, name: style.name, source: styleInfo.source, reason: styleInfo.reason, personaVersion: styleInfo.personaVersion || 0 },
+      scenes: sceneResults,
+      warnings,
+      voice: voiceSummary,
     };
+    if (allVoiceFailed) {
+      // 规则：全部旁白都失败 → 任务 failed 且要有明确 error。
+      // 但画面已经渲完、成片已经存在，绝不删——record 里的 renderId/file/bytes 照旧返回。
+      const first = voiceFailed[0] || {};
+      return Object.assign({}, base, {
+        ok: false,
+        error: 'VOICE_UNAVAILABLE',
+        speakError: first.speakError || '',
+        attempts: voiceSummary.attempts,
+        hint: `全部旁白都没拿到（${narrationWanted}/${narrationWanted} 场）；画面已渲完并保留成片（无声音）。修好 speak 后用 /v1/library/:id/rerun 重跑，已渲画面会复用。`,
+      });
+    }
+    return base;
   } finally {
     try { fs.rmSync(work, { recursive: true, force: true }); } catch { }
   }
 }
+// ---------------------------------------------------------------- 任务化 ----
+/**
+ * 任务状态机：
+ *
+ *   queued ──(排队)──> running ──(prepare → voice → scenes → concat → mix)──> done
+ *                         │
+ *                         └──(任何没兜住的异常 / 全部旁白失败)──> failed
+ *
+ * 为什么要有这一层：以前 POST /v1/create 是一个长 HTTP 请求，中间任何一步抛错
+ * 都等于"全错"，用户点一次只拿到 500，前面渲好的场次全白费。现在请求体先落库、
+ * 立刻返回 jobId，服务端按任务跑到"至少产出一个 mp4"为止。
+ *
+ * 并发上限 JOB_CONCURRENCY（默认 1）：manim/ffmpeg 都是 CPU 密集型，并发只会互相拖慢；
+ * speak 的 BreezeBlue Starter 档并发上限也是 1。其余任务排队，GET 里能看到 queuePosition。
+ */
+const JOB_CONCURRENCY = Math.max(1, Math.min(4, Number(CFG.jobConcurrency) || 1));
+const JOB_KEEP = 200;
+const JOBS = new Map();
+const JOB_QUEUE = [];
+const JOB_ACTIVE = new Set();
+let jobsReady = false;
+
+function jobFilePath(jobId) { return path.join(JOBS_DIR, `${jobId}.json`); }
+function libFilePath(id) { return path.join(LIBRARY_DIR, `${id}.json`); }
+
+function jobLog(job, msg) {
+  log(`[job ${job && job.jobId}] ${msg}`);
+}
+
+function jobError(code, message) {
+  const err = new Error(message || code);
+  err.code = code;
+  return err;
+}
+
+/**
+ * 把提交请求的身份头固化成一个小对象存进任务里。
+ *
+ * 为什么要固化：任务在 HTTP 响应之后才执行，req 对象已经不可靠；而且 io 的内部通道
+ * 必须带 x-dsh-user（否则 E_UNAUTHORIZED）。插件/面板会带用户身份；直接 curl 没有，
+ * 就回落到 defaultUserId（默认 1）—— 至少让"服务端负责到底"在无人值守时也成立。
+ */
+function jobAuthContext(req) {
+  const headers = {};
+  const src = (req && req.headers) || {};
+  if (src.authorization) headers.authorization = String(src.authorization);
+  const uid = Number(src['x-dsh-user'] || process.env.DSH_USER_ID || 0);
+  const fallback = Math.max(1, Number(CFG.defaultUserId) || 1);
+  headers['x-dsh-user'] = String(Number.isInteger(uid) && uid > 0 ? uid : fallback);
+  const sid = String(src['x-dsh-session'] || process.env.DSH_SESSION_ID || '');
+  if (sid) headers['x-dsh-session'] = sid;
+  return { headers };
+}
+
+function uniq(list) {
+  const out = [];
+  const seen = new Set();
+  for (const item of Array.isArray(list) ? list : []) {
+    const s = String(item == null ? '' : item).trim();
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
+/** 落盘时去掉内存字段（req 是 HTTP 请求对象，序列化会炸）。 */
+function jobRecord(job) {
+  const rec = Object.assign({}, job);
+  delete rec.req;
+  delete rec._lastSave;
+  delete rec._dirty;
+  return rec;
+}
+
+/**
+ * 启动时恢复任务表。
+ *
+ * 关键规则：进程重启后，running/queued 的任务已经不可能继续（执行它的进程没了），
+ * 一律标 failed + error='服务重启，任务中断'。不这么做它们会永远挂在 running，
+ * 调用方一直轮询、用户以为还在渲。
+ *
+ * 已完成（done/failed）的任务原样保留 —— GET /v1/jobs/:id 重启后仍能读到结果。
+ */
+function ensureJobs() {
+  if (jobsReady) return;
+  jobsReady = true;
+  try { fs.mkdirSync(JOBS_DIR, { recursive: true }); } catch { }
+  try { fs.mkdirSync(LIBRARY_DIR, { recursive: true }); } catch { }
+  let recovered = 0;
+  for (const rec of JS.listRecords(JOBS_DIR)) {
+    const jobId = String(rec.jobId || rec.id || '');
+    if (!JS.isSafeId(jobId)) continue;
+    rec.jobId = jobId;
+    if (rec.status === 'running' || rec.status === 'queued') {
+      const nowIso = new Date().toISOString();
+      rec.status = 'failed';
+      rec.phase = 'failed';
+      rec.label = '服务重启，任务中断';
+      rec.error = '服务重启，任务中断';
+      rec.finishedAt = nowIso;
+      rec.elapsedMs = Math.max(0, Date.parse(nowIso) - Date.parse(rec.createdAt || nowIso));
+      rec.scenes = (Array.isArray(rec.scenes) ? rec.scenes : []).map((s) => ({
+        index: Number(s && s.index) || 0,
+        engine: String((s && s.engine) || ''),
+        status: s && s.status === 'ok' ? 'ok' : 'failed',
+        // 中断时的 note 直接写清楚原因；"等待渲染"这种进度文案会被覆盖掉
+        note: s && s.status === 'ok' ? String((s && s.note) || '') : '服务重启，任务中断',
+      }));
+      try { JS.writeJson(jobFilePath(jobId), rec); } catch (err) { log('恢复任务写盘失败: ' + (err && err.message || err)); }
+      recovered += 1;
+      // 配方状态跟着改成 failed，但 request/scenes 一个字节都不动 —— 重启后照样能重跑
+      try {
+        const item = JS.readJson(libFilePath(jobId), null);
+        if (item && item.status !== 'done') {
+          item.status = 'failed';
+          item.updatedAt = nowIso;
+          JS.writeJson(libFilePath(jobId), item);
+        }
+      } catch { }
+    }
+    JOBS.set(jobId, rec);
+  }
+  if (JOBS.size > JOB_KEEP) {
+    const sorted = [...JOBS.values()].sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+    JOBS.clear();
+    for (const rec of sorted.slice(0, JOB_KEEP)) JOBS.set(rec.jobId, rec);
+  }
+  if (recovered) log(`任务恢复：${recovered} 个 running/queued 任务标记为 failed（服务重启，任务中断）`);
+}
+
+function getJob(jobId) {
+  ensureJobs();
+  const id = String(jobId || '');
+  if (!JS.isSafeId(id)) return null;
+  const mem = JOBS.get(id);
+  if (mem) return mem;
+  const rec = JS.readJson(jobFilePath(id), null);
+  if (rec && JS.isSafeId(String(rec.jobId || id))) {
+    rec.jobId = String(rec.jobId || id);
+    JOBS.set(rec.jobId, rec);
+    return rec;
+  }
+  return null;
+}
+
+function saveJob(job, force = false) {
+  const now = Date.now();
+  if (!force && job._lastSave && now - job._lastSave < 800) {
+    job._dirty = true;
+    return;
+  }
+  job._lastSave = now;
+  job._dirty = false;
+  try {
+    JS.writeJson(jobFilePath(job.jobId), jobRecord(job));
+  } catch (err) {
+    log(`任务落盘失败 ${job.jobId}: ${err && err.message || err}`);
+  }
+}
+
+/**
+ * 配方落盘（library/<jobId>.json）。request 是**原封不动的提交体**，
+ * scenes 是最终解析出的分镜（含 manim code / video.prompt）。
+ * 任务失败也要写 —— 用户最需要重跑的正是失败的那一次。
+ */
+function saveLibrary(job, patch = {}, initial = false) {
+  try {
+    const file = libFilePath(job.jobId);
+    const prev = initial ? null : JS.readJson(file, null);
+    const item = Object.assign({}, prev || {}, {
+      id: job.jobId,
+      jobId: job.jobId,
+      createdAt: job.createdAt,
+      updatedAt: new Date().toISOString(),
+      title: job.title || '',
+      seconds: Number(job.seconds) || 0,
+      style: job.style || '',
+      voice: job.voice || '',
+      status: job.status || '',
+      projectId: job.projectId || '',
+      rerunOf: job.rerunOf || '',
+      request: job.request,
+      scenes: Array.isArray(prev && prev.scenes) ? prev.scenes : [],
+      videoUrl: job.videoUrl || (prev && prev.videoUrl) || '',
+      jobIdForVideo: job.jobIdForVideo || (prev && prev.jobIdForVideo) || '',
+    }, patch || {});
+    if (Array.isArray(item.scenes)) item.sceneCount = item.scenes.length;
+    else item.sceneCount = Number(item.sceneCount) || 0;
+    JS.writeJson(file, item);
+    return item;
+  } catch (err) {
+    jobLog(job, '配方落盘失败: ' + (err && err.message || err));
+    return null;
+  }
+}
+
+function readLibrary(id) {
+  if (!JS.isSafeId(String(id || ''))) return null;
+  return JS.readJson(libFilePath(String(id)), null);
+}
+
+function libraryView(item, full = false) {
+  const it = item || {};
+  const base = {
+    id: it.id || it.jobId || '',
+    createdAt: it.createdAt || '',
+    title: it.title || '',
+    seconds: Number(it.seconds) || 0,
+    sceneCount: Array.isArray(it.scenes) ? it.scenes.length : (Number(it.sceneCount) || 0),
+    style: it.style || '',
+    voice: it.voice || '',
+    status: it.status || '',
+    thumb: it.thumb || '',
+    videoUrl: it.videoUrl || '',
+  };
+  if (full) {
+    base.request = it.request === undefined ? null : it.request;
+    base.scenes = Array.isArray(it.scenes) ? it.scenes : [];
+    base.projectId = it.projectId || '';
+    base.rerunOf = it.rerunOf || '';
+    base.jobIdForVideo = it.jobIdForVideo || '';
+    base.updatedAt = it.updatedAt || '';
+  }
+  return base;
+}
+
+/** 任务对外的 JSON 形状（GET /v1/jobs 与 /v1/jobs/:id 共用）。 */
+function jobView(job) {
+  const created = Date.parse(job.createdAt || '') || Date.now();
+  const end = job.finishedAt ? (Date.parse(job.finishedAt) || Date.now()) : Date.now();
+  const queuePosition = job.status === 'queued' ? Math.max(1, JOB_QUEUE.indexOf(job.jobId) + 1) : 0;
+  return {
+    ok: true,
+    jobId: job.jobId,
+    status: job.status,
+    phase: job.phase,
+    label: job.label,
+    done: Number(job.done) || 0,
+    total: Number(job.total) || 0,
+    queuePosition,
+    elapsedMs: Math.max(0, end - created),
+    ms: Number(job.ms) || 0,
+    bytes: Number(job.bytes) || 0,
+    seconds: Number(job.seconds) || 0,
+    reused: Number(job.reused) || 0,
+    rendered: Number(job.rendered) || 0,
+    videoUrl: job.videoUrl || '',
+    jobIdForVideo: job.jobIdForVideo || '',
+    file: job.file || '',
+    credits: Number(job.credits) || 0,
+    warnings: Array.isArray(job.warnings) ? job.warnings : [],
+    error: job.error || '',
+    scenes: Array.isArray(job.scenes) ? job.scenes : [],
+    title: job.title || '',
+    style: job.style || '',
+    voice: job.voice || '',
+    projectId: job.projectId || '',
+    rerunOf: job.rerunOf || '',
+    createdAt: job.createdAt || '',
+    startedAt: job.startedAt || null,
+    finishedAt: job.finishedAt || null,
+  };
+}
+
+/**
+ * 提交一个任务：立刻落盘两份文件（jobs + library）再入队，返回 jobId。
+ * 请求体原样保存 —— 这是"刷新/关闭/重启都不丢"的基础。
+ */
+function createJob(body, extra = {}) {
+  ensureJobs();
+  const request = body && typeof body === 'object' ? body : {};
+  const jobId = JS.newJobId();
+  const requestedMaxAi = Number(request.maxAiVideo);
+  const job = {
+    jobId,
+    status: 'queued',
+    phase: 'queued',
+    label: '排队中',
+    done: 0,
+    total: Array.isArray(request.scenes) ? request.scenes.length : 0,
+    createdAt: new Date().toISOString(),
+    startedAt: null,
+    finishedAt: null,
+    elapsedMs: 0,
+    ms: 0,
+    bytes: 0,
+    seconds: Number(request.seconds) || 0,
+    videoUrl: '',
+    jobIdForVideo: '',
+    file: '',
+    credits: 0,
+    warnings: [],
+    error: '',
+    scenes: [],
+    title: JS.deriveTitle(request),
+    planTitle: '',
+    style: String(request.style || ''),
+    voice: request.voice == null ? '' : String(request.voice),
+    maxAiVideo: Number.isFinite(requestedMaxAi) && requestedMaxAi >= 0
+      ? Math.floor(requestedMaxAi)
+      : Math.max(0, Number(CFG.maxAiVideo) || 0),
+    request,
+    projectId: String(request.projectId || request.existingProjectId || ''),
+    rerunOf: String(extra.rerunOf || ''),
+    scope: ['auto', 'all', 'audio'].includes(request.scope) ? request.scope : 'auto',
+    cancelRequested: false,
+    req: jobAuthContext(extra.req),
+  };
+  JOBS.set(jobId, job);
+  try {
+    JS.writeJson(jobFilePath(jobId), jobRecord(job));
+    saveLibrary(job, { status: 'queued' }, true);
+  } catch (err) {
+    jobLog(job, '初始落盘失败: ' + (err && err.message || err));
+  }
+  JOB_QUEUE.push(jobId);
+  jobLog(job, `入队（前面还有 ${Math.max(0, JOB_QUEUE.length - 1)} 个；并发上限 ${JOB_CONCURRENCY}）`);
+  pumpJobs();
+  return job;
+}
+
+/** 队列泵：并发没满就取下一个；完成一个立刻泵下一个。 */
+function pumpJobs() {
+  ensureJobs();
+  while (JOB_ACTIVE.size < JOB_CONCURRENCY) {
+    const jobId = JOB_QUEUE.shift();
+    if (!jobId) return;
+    const job = JOBS.get(jobId);
+    if (!job || job.status !== 'queued') continue;
+    if (job.cancelRequested) {
+      failJob(job, 'CANCELLED', '已取消');
+      continue;
+    }
+    JOB_ACTIVE.add(jobId);
+    job.status = 'running';
+    job.startedAt = new Date().toISOString();
+    job.phase = 'prepare';
+    job.label = '正在准备分镜';
+    saveJob(job, true);
+    saveLibrary(job, { status: 'running' });
+    jobLog(job, '开始');
+    runJob(job)
+      .catch((err) => {
+        // 最后一道兜底：runJob 内部已有 try/catch，这里只防"错误处理本身又抛"
+        jobLog(job, '任务异常: ' + (err && err.message || err));
+        failJob(job, 'JOB_CRASHED', String(err && err.message || err).slice(0, 200));
+      })
+      .finally(() => {
+        JOB_ACTIVE.delete(jobId);
+        setImmediate(() => { try { pumpJobs(); } catch { } });
+      });
+  }
+}
+
+function failJob(job, code, message) {
+  job.status = 'failed';
+  job.phase = 'failed';
+  job.error = String(code || 'FAILED');
+  job.label = String(message || code || '失败').slice(0, 120);
+  job.finishedAt = new Date().toISOString();
+  job.elapsedMs = Math.max(0, Date.parse(job.finishedAt) - Date.parse(job.createdAt || job.finishedAt));
+  job.scenes = (Array.isArray(job.scenes) ? job.scenes : []).map((s) => ({
+    index: Number(s && s.index) || 0,
+    engine: String((s && s.engine) || ''),
+    status: s && s.status === 'ok' ? 'ok' : 'failed',
+    note: String(s && s.status === 'ok' ? (s.note || '')
+      : ((s.note && s.note !== '等待渲染') ? s.note : (message || code || ''))).slice(0, 300),
+  }));
+  saveJob(job, true);
+  saveLibrary(job, { status: 'failed' });
+}
+
+/** 进度回写：每一步都更新 done/total/phase/label，前端不用自己猜。 */
+function applyProgress(job, patch) {
+  const p = patch || {};
+  if (p.phase) job.phase = String(p.phase);
+  if (p.label) job.label = String(p.label);
+  if (p.total != null) job.total = Number(p.total) || job.total;
+  if (p.done != null) job.done = Math.max(0, Number(p.done) || 0);
+  if (p.engine) job.currentEngine = String(p.engine);
+  if (p.status === 'done') { job.status = 'done'; job.phase = 'done'; }
+  if (p.status === 'failed') { job.phase = 'failed'; }
+  saveJob(job, false);
+}
+
+function normalizeSceneResults(list, fallback) {
+  if (Array.isArray(list) && list.length) {
+    return list.map((s) => ({
+      index: Number(s && s.index) || 0,
+      engine: String((s && s.engine) || ''),
+      status: ['ok', 'degraded', 'failed'].includes(s && s.status) ? s.status : 'ok',
+      note: String((s && s.note) || '').slice(0, 300),
+    }));
+  }
+  return Array.isArray(fallback) ? fallback : [];
+}
+
+/**
+ * 任务的前半段：把 prompt/script/scenes 变成"落好盘、能渲染的项目"。
+ * 注意顺序：先写分镜，再渲染。分镜一写好就更新配方（library），
+ * 这样即使渲染阶段崩溃，用户也能拿到"当时打算做什么"。
+ */
+async function prepareJob(job) {
+  const body = job.request || {};
+  const req = job.req;
+  const reuseId = String(body.projectId || body.existingProjectId || '');
+  const warnings = [];
+  let title = String(body.title || '').trim();
+  let project = null;
+  let scenes = null;
+
+  job.phase = 'prepare';
+  job.label = '正在准备分镜';
+  saveJob(job, true);
+
+  const binding = await resolveBinding({ styleId: body.style || '' });
+  const styleObj = binding.styleObject;
+  if (!job.style) job.style = String((binding.style && binding.style.id) || '');
+  job.voice = body.voice == null ? '' : String(body.voice);
+
+  const fromScenes = Array.isArray(body.scenes) && body.scenes.length > 0;
+  if (!fromScenes && reuseId) {
+    // /v1/project/render 的路径：分镜已经在项目里，直接用，不要重写。
+    project = P.loadProject(CFG.projectDir, reuseId);
+    if (!project) throw jobError('NOT_FOUND', `项目 ${reuseId} 不存在`);
+    scenes = project.scenes;
+    title = title || project.title;
+  } else if (fromScenes) {
+    // 分镜模式：把每一场补成能渲染的场景。已经补全过的（重跑配方）直接直通，
+    // 一个字段都不动 —— 连 seconds 都不重夹，缓存键才不会变。
+    if (scenesLookFinal(body.scenes)) {
+      scenes = body.scenes;
+      jobLog(job, '分镜已带渲染素材（manim 代码/AI prompt/文字卡），直接使用，不调用模型');
+    } else {
+      job.label = '正在补全分镜';
+      saveJob(job, true);
+      const filled = await fillScenes(body.scenes, { style: styleObj, req, maxAiVideo: job.maxAiVideo });
+      if (!filled.ok) throw jobError(filled.error || 'STORYBOARD_FAILED', '分镜补全失败');
+      scenes = filled.scenes;
+      if (Array.isArray(filled.warnings)) warnings.push(...filled.warnings);
+    }
+  } else if (String(body.script || '').trim()) {
+    job.label = '正在把稿子拆成分镜';
+    saveJob(job, true);
+    const split = await splitScript(String(body.script), {
+      seconds: body.seconds, style: styleObj,
+      toneLines: tonePromptLines(binding, { spoken: false }), req,
+    });
+    if (!split.ok) throw jobError(split.error || 'SCRIPT_SPLIT_FAILED', '稿子拆场失败');
+    const filled = await fillScenes(split.scenes, { style: styleObj, req, maxAiVideo: job.maxAiVideo });
+    if (!filled.ok) throw jobError(filled.error || 'STORYBOARD_FAILED', '分镜补全失败');
+    scenes = filled.scenes;
+    if (Array.isArray(split.warnings)) warnings.push(...split.warnings);
+    if (Array.isArray(filled.warnings)) warnings.push(...filled.warnings);
+  } else if (String(body.prompt || '').trim()) {
+    job.label = '正在写分镜';
+    saveJob(job, true);
+    const two = await planTwoStage(String(body.prompt), {
+      seconds: body.seconds, style: styleObj, req,
+      toneLines: tonePromptLines(binding),
+      stickerIds: body.stickerIds,
+      maxAiVideo: job.maxAiVideo,
+    });
+    if (!two.ok) throw jobError(two.error || 'PLAN_FAILED', '写分镜失败');
+    const plan = normalizePlan(two.json);
+    scenes = plan.scenes;
+    title = title || plan.title;
+    job.planTitle = plan.title || '';
+  } else {
+    throw jobError('INPUT_REQUIRED', 'prompt / script / scenes 三选一');
+  }
+
+  if (!Array.isArray(scenes) || !scenes.length) throw jobError('NO_SCENES', '没有分镜');
+
+  // 参考图：解析成 uploads 下的绝对路径。浅拷贝一份再改，保证 library 里的 request
+  // 与用户提交的一字不差（图片引用还是原来的 uploadId）。
+  scenes = scenes.map((s) => Object.assign({}, s));
+  attachSceneImages(scenes, warnings);
+
+  if (fromScenes || !reuseId) {
+    // 新建或更新同一个项目。重跑时给同一个 projectId，片段缓存/旁白缓存全部复用，
+    // 这就是"重跑同一配方第二次明显更快"的原因。
+    const saved = saveDraftProject({
+      projectId: reuseId,
+      title: title || JS.deriveTitle(body),
+      scenes,
+      style: String(body.style || ''),
+      voice: job.voice,
+    });
+    project = P.loadProject(CFG.projectDir, saved.id);
+  }
+  if (!project) throw jobError('PROJECT_MISSING', '项目没建起来');
+
+  job.projectId = project.id;
+  job.total = project.scenes.length;
+  job.done = 0;
+  job.title = job.title || title || JS.deriveTitle(body);
+  const chars = project.scenes.reduce((a, s) => a + String(s.narration || '').length, 0);
+  const planSeconds = Number(project.scenes.reduce((a, s) => a + Number(s.seconds || 0), 0).toFixed(2));
+  return {
+    project,
+    scenes: project.scenes,
+    warnings: uniq(warnings),
+    credits: Math.round(chars * 0.185 * 10) / 10,
+    planSeconds,
+    bindingSummary: binding.summary,
+    voiceName: binding.voice && binding.voice.name,
+    toneLabel: binding.tone && binding.tone.label,
+  };
+}
+
+/** 任务真正执行。所有分支都收敛到"要么 done、要么 failed，但已完成的片段一定保留"。 */
+async function runJob(job) {
+  try {
+    const prepared = await prepareJob(job);
+    job.projectId = prepared.project.id;
+    job.total = prepared.scenes.length;
+    job.done = 0;
+    job.seconds = prepared.planSeconds || job.seconds;
+    job.credits = prepared.credits;
+    job.warnings = uniq([...job.warnings, ...prepared.warnings]);
+    job.bindingSummary = prepared.bindingSummary || '';
+    job.voiceName = prepared.voiceName || '';
+    job.toneLabel = prepared.toneLabel || '';
+    job.scenes = prepared.scenes.map((s, i) => ({
+      index: i,
+      engine: String((s && s.kind) || (s && s.tool) || 'text'),
+      status: 'pending',
+      note: '等待渲染',
+    }));
+    saveJob(job, true);
+    saveLibrary(job, {
+      scenes: prepared.scenes,
+      title: job.title,
+      seconds: job.seconds,
+      status: 'running',
+      projectId: job.projectId,
+    });
+    jobLog(job, `分镜就绪：${prepared.scenes.length} 场，开始渲染`);
+    if (job.cancelRequested) throw jobError('CANCELLED', '已取消');
+
+    const result = await renderProject(prepared.project, {
+      voice: job.voice,
+      bgm: job.request.bgm,
+      style: job.request.style,
+      maxAiVideo: job.maxAiVideo,
+      req: job.req,
+      scope: job.scope,
+      onProgress: (patch) => applyProgress(job, patch),
+      shouldAbort: () => job.cancelRequested === true,
+    }, job.scope);
+
+    job.ms = Number(result.ms) || 0;
+    job.reused = Number(result.reused) || 0;
+    job.rendered = Number(result.rendered) || 0;
+    job.warnings = uniq([...job.warnings, ...(Array.isArray(result.warnings) ? result.warnings : [])]);
+    job.scenes = normalizeSceneResults(result.scenes, job.scenes);
+    if (result.renderId) {
+      // 成片已经产出来了：不管 ok 与否都记下位置，失败也不能丢（规则 3）。
+      job.jobIdForVideo = String(result.renderId);
+      job.videoUrl = `/api/studio/video?id=${encodeURIComponent(result.renderId)}`;
+      job.file = String(result.file || '');
+      job.bytes = Number(result.bytes) || 0;
+      job.seconds = Number(result.seconds) || job.seconds;
+    }
+    if (result.ok) {
+      job.status = 'done';
+      job.phase = 'done';
+      job.label = `做好了：${job.seconds} 秒`;
+      job.done = job.total;
+      job.error = '';
+    } else {
+      job.status = 'failed';
+      job.phase = 'failed';
+      job.error = String(result.error || 'RENDER_FAILED');
+      job.label = job.error === 'VOICE_UNAVAILABLE'
+        ? '全部旁白失败（成片已保留，无声音）'
+        : `渲染失败：${job.error}`;
+      if (result.hint) job.warnings = uniq([...job.warnings, String(result.hint)]);
+      // 把失败原因写进每一场没成功的 note 里
+      const reason = String(result.error || 'failed');
+      job.scenes = job.scenes.map((s) => (
+        s.status === 'ok' ? s : Object.assign({}, s, { status: 'failed', note: s.note || reason })
+      ));
+      if (job.cancelRequested) job.error = 'CANCELLED';
+    }
+  } catch (err) {
+    const code = String((err && err.code) || 'JOB_FAILED');
+    const message = String((err && err.message) || err).slice(0, 240);
+    job.status = 'failed';
+    job.phase = 'failed';
+    job.error = job.cancelRequested ? 'CANCELLED' : code;
+    job.label = job.cancelRequested ? '已取消' : `失败：${message}`;
+    // 没兜住的异常：已完成场次的 note 保留，其余写失败原因；**绝不删已渲好的 mp4**。
+    job.scenes = (Array.isArray(job.scenes) ? job.scenes : []).map((s) => (
+      s.status === 'ok' ? s : Object.assign({}, s, {
+        status: 'failed',
+        note: (s.note && s.note !== '等待渲染') ? s.note : message,
+      })
+    ));
+    // 项目里最后一次成功的 render 也认：异常发生在返程路上时，成片其实已经存在。
+    try {
+      const p = job.projectId ? P.loadProject(CFG.projectDir, job.projectId) : null;
+      const last = p && Array.isArray(p.renders) ? p.renders[p.renders.length - 1] : null;
+      if (last && last.file && fs.existsSync(last.file)) {
+        job.jobIdForVideo = job.jobIdForVideo || String(last.renderId || '');
+        job.videoUrl = job.videoUrl || (job.jobIdForVideo ? `/api/studio/video?id=${encodeURIComponent(job.jobIdForVideo)}` : '');
+        job.file = job.file || String(last.file);
+        job.bytes = job.bytes || Number(last.bytes) || 0;
+        job.seconds = job.seconds || Number(last.seconds) || 0;
+      }
+    } catch { }
+    jobLog(job, `任务失败 ${job.error}: ${message}`);
+  } finally {
+    job.finishedAt = new Date().toISOString();
+    job.elapsedMs = Math.max(0, Date.parse(job.finishedAt) - Date.parse(job.createdAt || job.finishedAt));
+    saveJob(job, true);
+    saveLibrary(job, { status: job.status, seconds: job.seconds, videoUrl: job.videoUrl, jobIdForVideo: job.jobIdForVideo });
+    jobLog(job, `结束 status=${job.status}${job.error ? ` error=${job.error}` : ''}`
+      + ` done=${job.done}/${job.total} ${(job.elapsedMs / 1000).toFixed(1)}s`);
+  }
+}
+
+/** 兼容旧接口（/v1/create、/v1/project/render）：等任务结束再按老形状返回。 */
+function waitJob(jobId, timeoutMs = 30 * 60 * 1000) {
+  const started = Date.now();
+  return new Promise((resolve) => {
+    const tick = () => {
+      const job = getJob(jobId);
+      if (!job) return resolve(null);
+      if (job.status === 'done' || job.status === 'failed') return resolve(job);
+      if (Date.now() - started > timeoutMs) return resolve(job);
+      setTimeout(tick, 500);
+    };
+    tick();
+  });
+}
+
+/** 取片：支持 Range，浏览器/播放器可以直接播。 */
+function serveVideo(req, res, file) {
+  let stat = null;
+  try { stat = fs.statSync(file); } catch { return json(res, 404, { ok: false, error: 'NOT_FOUND' }); }
+  const total = stat.size;
+  const range = String(req.headers.range || '');
+  const m = range.match(/^bytes=(\d*)-(\d*)$/);
+  if (m) {
+    let start = m[1] ? Number(m[1]) : 0;
+    let end = m[2] ? Number(m[2]) : total - 1;
+    if (!Number.isFinite(start) || start < 0) start = 0;
+    if (!Number.isFinite(end) || end >= total) end = total - 1;
+    if (start > end) {
+      res.writeHead(416, { 'content-range': `bytes */${total}` });
+      return res.end();
+    }
+    res.writeHead(206, {
+      'content-type': 'video/mp4',
+      'content-length': String(end - start + 1),
+      'content-range': `bytes ${start}-${end}/${total}`,
+      'accept-ranges': 'bytes',
+      'cache-control': 'no-store',
+    });
+    return fs.createReadStream(file, { start, end }).pipe(res);
+  }
+  res.writeHead(200, {
+    'content-type': 'video/mp4',
+    'content-length': String(total),
+    'accept-ranges': 'bytes',
+    'cache-control': 'no-store',
+  });
+  return fs.createReadStream(file).pipe(res);
+}
+
 
 /**
  * 调 io 的身份头。
@@ -2003,6 +3330,111 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1');
   const p = url.pathname;
   try {
+    // ------------------------------------------------------------ 任务（job） ---
+    // 一次提交 = 一个任务；服务端负责跑到出片。POST /v1/jobs 立刻返回 jobId（<1s），
+    // 实际工作在后台；状态与配方都落盘（jobs/ 与 library/），重启不丢。
+    if (req.method === 'POST' && p === '/v1/jobs') {
+      const body = JSON.parse(await readBody(req) || '{}');
+      const hasInput = Boolean(String(body.prompt || '').trim() || String(body.script || '').trim()
+        || (Array.isArray(body.scenes) && body.scenes.length));
+      if (!hasInput) {
+        return json(res, 400, { ok: false, error: 'INPUT_REQUIRED', message: 'prompt / script / scenes 三选一' });
+      }
+      const job = createJob(body, { req });
+      return json(res, 202, {
+        ok: true,
+        jobId: job.jobId,
+        status: job.status,
+        queuePosition: job.status === 'queued' ? Math.max(1, JOB_QUEUE.indexOf(job.jobId) + 1) : 0,
+      });
+    }
+
+    // 最近 20 个任务（含进度、成片地址、每场状态）。
+    if (req.method === 'GET' && p === '/v1/jobs') {
+      ensureJobs();
+      const jobs = [...JOBS.values()]
+        .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))
+        .slice(0, 20)
+        .map(jobView);
+      return json(res, 200, { ok: true, jobs });
+    }
+
+    if (p.startsWith('/v1/jobs/')) {
+      const rest = p.slice('/v1/jobs/'.length);
+      const isCancel = rest.endsWith('/cancel');
+      const id = decodeURIComponent(isCancel ? rest.slice(0, -'/cancel'.length) : rest);
+      if (isCancel && req.method === 'POST') {
+        const job = getJob(id);
+        if (!job) return json(res, 404, { ok: false, error: 'JOB_NOT_FOUND' });
+        if (job.status === 'queued') {
+          const at = JOB_QUEUE.indexOf(job.jobId);
+          if (at >= 0) JOB_QUEUE.splice(at, 1);
+          failJob(job, 'CANCELLED', '已取消');
+        } else if (job.status === 'running') {
+          // 不硬杀 ffmpeg/manim：只打个标记，渲染层在下一场开始前停，已完成片段全保留。
+          job.cancelRequested = true;
+          job.label = '正在取消（等这一场渲完）';
+          saveJob(job, true);
+          jobLog(job, '收到取消请求，将在这一场结束时停止');
+        }
+        return json(res, 200, { ok: true, jobId: job.jobId, status: job.status });
+      }
+      if (!isCancel && req.method === 'GET') {
+        const job = getJob(id);
+        if (!job) return json(res, 404, { ok: false, error: 'JOB_NOT_FOUND' });
+        return json(res, 200, jobView(job));
+      }
+      return json(res, 404, { ok: false, error: 'not found' });
+    }
+
+    // 直接取片：/v1/video?id=<renderId>，支持 Range（播放器能拖进度条）。
+    if (req.method === 'GET' && p === '/v1/video') {
+      const id = String(url.searchParams.get('id') || '');
+      if (!/^[0-9a-fA-F-]{8,64}$/.test(id)) return json(res, 400, { ok: false, error: 'BAD_ID' });
+      const file = path.join(CFG.outDir, `${id}.mp4`);
+      if (!fs.existsSync(file)) return json(res, 404, { ok: false, error: 'NOT_FOUND' });
+      return serveVideo(req, res, file);
+    }
+
+    // ------------------------------------------------------------ 配方库（library） ---
+    // 每次提交的原样请求 + 最终分镜。刷新/关页面/重启服务都还在，可以一键重跑。
+    if (req.method === 'GET' && p === '/v1/library') {
+      ensureJobs();
+      const items = JS.listRecords(LIBRARY_DIR).slice(0, 50).map((it) => libraryView(it, false));
+      return json(res, 200, { ok: true, items });
+    }
+
+    if (p.startsWith('/v1/library/')) {
+      const rest = p.slice('/v1/library/'.length);
+      const isRerun = rest.endsWith('/rerun');
+      const id = decodeURIComponent(isRerun ? rest.slice(0, -'/rerun'.length) : rest);
+      if (isRerun && req.method === 'POST') {
+        const item = readLibrary(id);
+        if (!item) return json(res, 404, { ok: false, error: 'NOT_FOUND' });
+        // 用保存的 request + 最终 scenes 重新提交：场景都带着 manim 代码/video.prompt，
+        // prepare 不会再问模型；projectId 沿用，片段缓存与旁白缓存全部命中。
+        const request = Object.assign({}, item.request || {});
+        const scenes = Array.isArray(item.scenes) ? item.scenes : [];
+        if (scenes.length) request.scenes = scenes;
+        if (item.projectId) request.projectId = item.projectId;
+        if (item.title && !request.title) request.title = item.title;
+        const job = createJob(request, { req, rerunOf: id });
+        log(`配方 ${id} 重跑 -> 新任务 ${job.jobId}（项目 ${item.projectId || '(新)'}，${scenes.length} 场）`);
+        return json(res, 202, { ok: true, jobId: job.jobId });
+      }
+      if (!isRerun && req.method === 'GET') {
+        const item = readLibrary(id);
+        if (!item) return json(res, 404, { ok: false, error: 'NOT_FOUND' });
+        return json(res, 200, { ok: true, item: libraryView(item, true) });
+      }
+      if (!isRerun && req.method === 'DELETE') {
+        if (!JS.isSafeId(id)) return json(res, 400, { ok: false, error: 'BAD_ID' });
+        const removed = JS.removeJson(libFilePath(id));
+        return json(res, removed ? 200 : 404, removed ? { ok: true } : { ok: false, error: 'NOT_FOUND' });
+      }
+      return json(res, 404, { ok: false, error: 'not found' });
+    }
+
     // ---------------------------------------------------- 项目（长片） ---
     // 项目 = 分镜 + 分段缓存。AI 每次只发改动（patch），不用重发整份分镜；
     // 渲染时能复用的片段直接复用，所以"改一场"只花一场的时间。
@@ -2036,7 +3468,8 @@ const server = http.createServer(async (req, res) => {
         });
       }
       if (Array.isArray(body.scenes) && body.scenes.length) {
-        project.scenes = body.scenes.slice(0, CFG.maxScenes).map((s) => P.normalizeScene(s));
+        project.scenes = body.scenes.slice(0, CFG.maxScenes)
+          .map((s, i) => P.normalizeScene(s, { label: `scene#${i}`, onDegrade: log }));
       }
       P.saveProject(CFG.projectDir, project);
       log(`project saved ${project.id} scenes=${project.scenes.length}`);
@@ -2059,7 +3492,7 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req) || '{}');
       const project = P.loadProject(CFG.projectDir, String(body.id || ''));
       if (!project) return json(res, 404, { ok: false, error: 'NOT_FOUND' });
-      const touched = P.applyPatches(project, body.patches || body.patch || []);
+      const touched = P.applyPatches(project, body.patches || body.patch || [], { onDegrade: log });
       if (project.scenes.length > CFG.maxScenes) project.scenes = project.scenes.slice(0, CFG.maxScenes);
       P.saveProject(CFG.projectDir, project);
       // 告诉调用方"这次会重渲几场"，让 AI 能解释为什么快/慢。
@@ -2080,6 +3513,13 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req) || '{}');
       const project = P.loadProject(CFG.projectDir, String(body.id || ''));
       if (!project) return json(res, 404, { ok: false, error: 'NOT_FOUND' });
+      // 项目文件可能被手改过、或是老版本留下的：渲染前再查一次"标了 aivideo 却没 prompt"。
+      // normalizeScene 在保存时已经降级过一次，这里兜住绕过保存直接改文件的情况。
+      for (let i = 0; i < project.scenes.length; i++) {
+        const s = project.scenes[i];
+        const wantsAi = String(s.kind || '') === 'aivideo' || String(s.tool || '') === 'aivideo';
+        if (wantsAi && !isAiVideoScene(s)) log(`scene#${i} 是 aivideo 但没有 video.prompt，降级文字卡（渲染前检查）`);
+      }
       const scope = ['auto', 'all', 'audio'].includes(body.scope) ? body.scope : 'auto';
       // 显式 style 会**写回项目**：调用方说"这集用 blueprint"就该记住，
       // 而不是下次渲染又悄悄变回人设的决定。
@@ -2092,27 +3532,36 @@ const server = http.createServer(async (req, res) => {
         // 还有场次没渲过，没法只做声音 —— 明确报错，别偷偷改成全量
         return json(res, 409, { ok: false, error: 'CLIPS_MISSING', hint: '先 scope=auto 渲一次画面，再单独重做声音' });
       }
-      let result;
-      try {
-        result = await renderProject(project, { voice: body.voice || project.voice, bgm: body.bgm || project.bgm, style: project.style }, scope);
-      } catch (err) {
-        progressUpdate(project.id, {
-          status: 'failed', phase: 'failed', label: '渲染异常',
-          error: 'RENDER_FAILED', detail: String((err && err.message) || err).slice(0, 300),
-        });
-        throw err;
-      }
-      if (!result.ok) {
-        // 只在还没被标成 failed 时补一笔（VOICE_UNAVAILABLE 已经自己写过了）
-        const rec = progressGet(project.id);
-        if (!rec || rec.status !== 'failed') {
-          progressUpdate(project.id, {
-            status: 'failed', phase: 'failed', label: '渲染失败',
-            error: result.error || '', detail: String(result.hint || result.detail || '').slice(0, 300),
-          });
-        }
-      }
-      return json(res, result.ok ? 200 : renderErrorStatus(result), result);
+      // 内部改成走任务：接口仍然同步返回（面板/插件不用改），但执行路径是任务，
+      // 中途失败会走自愈，进度/成片/失败原因都落盘。
+      const job = createJob({
+        existingProjectId: project.id,
+        projectId: project.id,
+        title: project.title,
+        scope,
+        style: project.style,
+        voice: body.voice || project.voice,
+        bgm: body.bgm || project.bgm,
+      }, { req });
+      log(`/v1/project/render -> job ${job.jobId}（project ${project.id} scope=${scope}）`);
+      const done = await waitJob(job.jobId);
+      if (!done) return json(res, 500, { ok: false, error: 'JOB_LOST' });
+      const ok = done.status === 'done';
+      const result = {
+        ok,
+        renderId: done.jobIdForVideo || '',
+        jobId: done.jobId,
+        file: done.file || '',
+        bytes: Number(done.bytes) || 0,
+        seconds: Number(done.seconds) || 0,
+        reused: Number(done.reused) || 0,
+        rendered: Number(done.rendered) || 0,
+        ms: Number(done.ms) || 0,
+        error: done.error || '',
+        warnings: done.warnings || [],
+        scenes: done.scenes || [],
+      };
+      return json(res, ok ? 200 : renderErrorStatus(result), result);
     }
 
     // ---------------------------------------------------------- 风格预设 ---
@@ -2377,23 +3826,49 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req) || '{}');
       const prompt = String(body.prompt || '').trim();
       if (!prompt) return json(res, 400, { ok: false, error: 'PROMPT_REQUIRED' });
-      const binding = await resolveBinding({ styleId: body.style || '' });
-      const styleInfo = binding.styleInfo;
-      const two = await planTwoStage(prompt, {
-        seconds: body.seconds, req, style: styleInfo.style,
-        toneLines: tonePromptLines(binding),
+      // 内部走任务（和 POST /v1/jobs 同一条管道），但保持旧的同步返回形状：
+      // 插件 make_video 和面板都还在按老契约读 jobId/plan/bytes。
+      const job = createJob({
+        prompt,
+        seconds: body.seconds,
+        style: body.style || '',
+        voice: body.voice,
+        bgm: body.bgm,
         stickerIds: withPlanHints(body, await stickerHints()).stickerIds,
-      });
-      if (!two.ok) return json(res, 200, { ok: false, step: 'plan', error: two.error, raw: two.raw });
-      const plan = normalizePlan(two.json);
-      const result = await renderPlan(plan, { voice: body.voice, bgm: body.bgm, style: styleInfo.id });
-      log(`create ok=${result.ok} scenes=${plan.scenes.length} style=${styleInfo.id} ${result.ok ? `bytes=${result.bytes} ms=${result.ms}` : result.error}`);
-      return json(res, result.ok ? 200 : renderErrorStatus(result), Object.assign({
+      }, { req });
+      log(`/v1/create -> job ${job.jobId}（prompt=${prompt.slice(0, 40)}）`);
+      const done = await waitJob(job.jobId);
+      if (!done) return json(res, 500, { ok: false, error: 'JOB_LOST' });
+      const project = done.projectId ? P.loadProject(CFG.projectDir, done.projectId) : null;
+      const scenes = project ? project.scenes : [];
+      const plan = {
+        title: done.title || (project && project.title) || '',
+        scenes,
+        totalSeconds: Number(done.seconds) || 0,
+      };
+      const binding = await resolveBinding({ styleId: done.style || body.style || '' });
+      const ok = done.status === 'done';
+      const result = {
+        ok,
+        file: done.file || '',
+        jobId: done.jobIdForVideo || '',
+        taskJobId: done.jobId,
+        bytes: Number(done.bytes) || 0,
+        seconds: Number(done.seconds) || 0,
+        ms: Number(done.ms) || 0,
+        narrationCount: scenes.filter((s) => s && s.narration).length,
+        warnings: done.warnings || [],
+        scenes: done.scenes || [],
+        error: done.error || '',
         plan,
-        estimate: estimateRender(plan.scenes),
+        estimate: estimateRender(scenes),
+      };
+      log(`create ok=${ok} scenes=${scenes.length} style=${done.style} ${ok ? `bytes=${result.bytes} ms=${result.ms}` : result.error}`);
+      return json(res, ok ? 200 : renderErrorStatus(result), Object.assign({
         voice: binding.voice,
         tone: binding.tone,
         bindingSummary: binding.summary,
+        style: done.style ? { id: done.style } : undefined,
       }, result));
     }
 
@@ -2411,6 +3886,9 @@ const server = http.createServer(async (req, res) => {
  */
 function start() {
   try { fs.mkdirSync(CFG.bgmDir, { recursive: true }); } catch (err) { log('bgmDir 创建失败: ' + (err && err.message || err)); }
+  // 任务恢复必须赶在 listen 之前：先把上次残留的 running 标 failed，
+  // 再开始接新请求，避免外面轮询到永远跑不完的旧任务。
+  ensureJobs();
   server.listen(CFG.port, HOST, () => {
     log(`studio on http://${HOST}:${CFG.port}  ${CFG.width}x${CFG.height}@${CFG.fps}  ffmpeg=${fs.existsSync(CFG.ffmpeg)}  bgmDir=${CFG.bgmDir}`);
   });
@@ -2421,7 +3899,7 @@ if (require.main === module) start();
 // 只导出纯逻辑与被复用的实现，供本地验证脚本直接调用
 module.exports = {
   planWithNarration, wavDurationMs, parseWav, measureAudioMs, padWavToSeconds, guardAudioTail,
-  normalizePlan, renderPlan, renderProject, start, server, CFG, P, S,
+  normalizePlan, renderPlan, renderProject, start, server, CFG, P, S, JS,
   sceneEngines, resolveStyleFor, styleCfg,
   buildSkeletonPrompt, buildVisualPrompt, buildScriptSplitPrompt, buildAiVideoPrompt,
   // AI 画面（wan3.0-video）：配额是纯函数，单测直接调；wanKeyInfo 只回来源不回密钥
@@ -2430,4 +3908,9 @@ module.exports = {
   splitScript, fillScenes, decideTool, estimateRender, saveDraftProject,
   resolveBinding, fetchPersona, fetchVoiceBinding, tonePromptLines,
   progressGet, progressStart, progressUpdate, parseSpeakFailure,
+  // 任务化 + 配方库：状态机、落盘、重跑
+  JOBS_DIR, LIBRARY_DIR, createJob, getJob, jobView, waitJob, ensureJobs, failJob,
+  readLibrary, libraryView, repairManimScene,
+  // 参考图（上传）：解析 uploadId / 绝对路径、注入 manim、data URL
+  resolveSceneImage, attachSceneImages, ensureManimImage, imageAsDataUrl,
 };

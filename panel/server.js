@@ -284,6 +284,11 @@ function bearer(req) {
 
 /** 面板自己的用户态闸门：没带 token 的请求不往 io/记忆服务转发。 */
 function protectedPath(pathname) {
+  // 任务/历史要登录。唯一例外是 /api/studio/jobs/<id>/video：
+  // <video> 和"下载"链接带不了 Bearer，靠不可猜的 job id 当凭据
+  // （和 /api/studio/video 同一个理由，见下面的说明）。
+  if (pathname.startsWith('/api/studio/jobs')) return !pathname.endsWith('/video');
+  if (pathname.startsWith('/api/studio/library')) return true;
   return pathname === '/api/input' || pathname === '/api/persona' ||
     pathname.startsWith('/api/memory/') || pathname.startsWith('/api/video') ||
     pathname === '/api/tts' || pathname === '/api/asr' ||
@@ -324,6 +329,85 @@ function postJson(base, pathName, obj, headers = {}, timeoutMs = 600000) {
     upstream.write(body);
     upstream.end();
   });
+}
+
+/**
+ * 任务成片取回：<video> 和"下载"链接都带不了 Bearer，job id 就是凭据
+ * （和 /api/studio/video 同一个理由）。
+ *
+ * 先问 studio 这条任务的 videoUrl：
+ *   - 它指向面板自己（/api/...）→ 302 过去，让已有的那条路干活
+ *   - 它指向 studio            → 边收边转给浏览器
+ *   - 什么都没有 / 问不到        → 按 job id 当成片文件名，在成片目录里找
+ * 只跟 studio 自己换片子：videoUrl 是上游给的，不能把面板变成任意 URL 的代理。
+ */
+async function serveStudioJobVideo(req, res, jobId) {
+  const localFile = path.join(STUDIO_DIR, `${jobId}.mp4`);
+  const sendLocal = () => {
+    let stat = null;
+    try { stat = fs.statSync(localFile); } catch { stat = null; }
+    if (!stat) return sendJson(res, 404, { ok: false, error: 'NOT_FOUND' });
+    res.writeHead(200, {
+      'content-type': 'video/mp4',
+      'content-length': stat.size,
+      'accept-ranges': 'none',
+      'cache-control': 'no-store',
+    });
+    if (req.method === 'HEAD') return res.end();
+    return fs.createReadStream(localFile).pipe(res);
+  };
+
+  let target = '';
+  try {
+    const r = await fetch(`${STUDIO_BASE}/v1/jobs/${encodeURIComponent(jobId)}`, {
+      signal: AbortSignal.timeout(8000),
+    });
+    if (r.ok) {
+      const data = await r.json().catch(() => null);
+      const job = (data && (data.job || data)) || {};
+      target = String(job.videoUrl || '');
+    }
+  } catch (err) {
+    /* 问不到就按文件名找：老流程的成片本来就叫 <id>.mp4 */
+  }
+  if (!target) return sendLocal();
+
+  if (target.startsWith('/api/')) {
+    res.writeHead(302, { location: target, 'cache-control': 'no-store' });
+    return res.end();
+  }
+
+  let upstreamUrl = null;
+  try {
+    upstreamUrl = new URL(target, STUDIO_BASE);
+  } catch (err) {
+    upstreamUrl = null;
+  }
+  if (!upstreamUrl || upstreamUrl.origin !== new URL(STUDIO_BASE).origin) return sendLocal();
+
+  const upstream = http.request(upstreamUrl, { method: 'GET', timeout: 60000 }, (reply) => {
+    if ((reply.statusCode || 0) >= 400) {
+      reply.resume();
+      return sendLocal();
+    }
+    const headers = {
+      'content-type': reply.headers['content-type'] || 'video/mp4',
+      'accept-ranges': 'none',
+      'cache-control': 'no-store',
+    };
+    if (reply.headers['content-length']) headers['content-length'] = reply.headers['content-length'];
+    res.writeHead(200, headers);
+    if (req.method === 'HEAD') {
+      reply.resume();
+      return res.end();
+    }
+    reply.pipe(res);
+  });
+  upstream.on('timeout', () => upstream.destroy(new Error('studio video timeout')));
+  upstream.on('error', () => {
+    if (!res.headersSent) sendLocal();
+  });
+  upstream.end();
 }
 
 /** 视频描述 + 用户的话 → 交给 io，让大肥鱼用自己的口气回应。 */
@@ -1130,7 +1214,10 @@ const handler = async (req, res) => {
         voice: body.voice || '',
       }, { authorization: req.headers.authorization || '' }, 900000);
       if (!r.data) return sendJson(res, 502, { ok: false, error: `studio HTTP ${r.status}` });
-      log(`studio scenes ok=${r.data.ok} manim=${(r.data.stats && r.data.stats.manim) || 0}/${scenes.length}`);
+      // scenes 整包转发（不做字段白名单），这里把 aivideo 场数一起记下来：
+      // 排查"选了 AI 生成却出空卡"时，第一眼就能看出 video 是不是在面板这一环丢的。
+      const aiCount = scenes.filter((s) => s && (s.kind === 'aivideo' || s.tool === 'aivideo' || (s.video && s.video.prompt))).length;
+      log(`studio scenes ok=${r.data.ok} manim=${(r.data.stats && r.data.stats.manim) || 0}/${scenes.length} aivideo=${aiCount}/${scenes.length}`);
       return sendJson(res, r.status || 200, r.data);
     }
 
@@ -1149,6 +1236,8 @@ const handler = async (req, res) => {
         voice: body.voice || '',
       }, { authorization: req.headers.authorization || '' }, 60000);
       if (!r.data) return sendJson(res, 502, { ok: false, error: `studio HTTP ${r.status}` });
+      const savedAi = scenes.filter((s) => s && (s.kind === 'aivideo' || s.tool === 'aivideo' || (s.video && s.video.prompt))).length;
+      log(`studio project saved ok=${r.data.ok} scenes=${scenes.length} aivideo=${savedAi}`);
       return sendJson(res, r.status || 200, r.data);
     }
 
@@ -1169,6 +1258,95 @@ const handler = async (req, res) => {
       if (!r.data) return sendJson(res, 502, { ok: false, error: `studio HTTP ${r.status}` });
       log(`studio project render ok=${r.data.ok} job=${r.data.renderId || '-'} ms=${r.data.ms || 0}`);
       return sendJson(res, r.status || 200, r.data);
+    }
+
+    // ---- 视频任务（/v1/jobs）------------------------------------------------
+    // 新流程：面板提交一个任务就返回 jobId，卡片按 GET /v1/jobs/:id 轮询。
+    // studio 还没实现这套接口时它会回 404 —— 这里把 404 原样带回去，
+    // 前端看到 404 就回退老流程（拆分镜 → 建项目 → 渲染），不会白屏。
+    if (url.pathname === '/api/studio/jobs') {
+      if (req.method === 'POST') {
+        const rawJobs = await readBody(req);
+        let body = {};
+        try { body = JSON.parse(rawJobs.toString('utf8')) || {}; } catch { }
+        const scenes = Array.isArray(body.scenes) && body.scenes.length ? body.scenes : null;
+        const prompt = String(body.prompt || '').trim();
+        const script = String(body.script || '').trim();
+        if (!scenes && !prompt && !script) {
+          return sendJson(res, 400, { ok: false, error: '先写一句要做什么' });
+        }
+        const payload = {
+          seconds: Number(body.seconds) || 60,
+          style: body.style || '',
+          voice: body.voice || '',
+        };
+        // 三个入口只带一个：带错的那个会让 studio 选错流程
+        if (scenes) payload.scenes = scenes;
+        else if (script) payload.script = script;
+        else payload.prompt = prompt;
+
+        // 参考图：面板存的是 uploadId，studio 拿不到面板的桶，所以顺手补一条直链。
+        // 两台同机，127.0.0.1:PORT 就是本面板；后端认 image 或 imageUrl 都行，都不认就忽略。
+        const imageBase = `http://127.0.0.1:${PORT}/api/upload/`;
+        const imageOf = (value) => {
+          const id = String(value || '').trim();
+          if (!/^[0-9a-f-]{8,40}$/i.test(id)) return '';
+          return imageBase + encodeURIComponent(id);
+        };
+        if (payload.scenes) {
+          payload.scenes = payload.scenes.map((scene) => {
+            if (!scene || !scene.image) return scene;
+            const url = imageOf(scene.image);
+            return url ? Object.assign({}, scene, { imageUrl: scene.imageUrl || url }) : scene;
+          });
+        }
+        const topImage = imageOf(body.image);
+        if (body.image) payload.image = String(body.image).trim();
+        if (topImage) payload.imageUrl = topImage;
+
+        const r = await postJson(STUDIO_BASE, '/v1/jobs', payload,
+          { authorization: req.headers.authorization || '' }, 180000);
+        if (!r.data) {
+          // 404 要单独标出来：前端靠它决定"回退老流程"还是"报错"
+          if (r.status === 404) return sendJson(res, 404, { ok: false, error: 'JOBS_UNAVAILABLE' });
+          return sendJson(res, r.status || 502, { ok: false, error: `studio HTTP ${r.status}` });
+        }
+        log(`studio jobs new ok=${r.data.ok} job=${r.data.jobId || '-'} kind=${scenes ? 'scenes' : (script ? 'script' : 'prompt')} scenes=${scenes ? scenes.length : 0}`);
+        return sendJson(res, r.status || 200, r.data);
+      }
+      if (req.method === 'GET') {
+        return proxy(req, res, '/v1/jobs' + url.search, null, null, STUDIO_BASE, 'studio');
+      }
+    }
+
+    // 单条任务：卡片每 2 秒问一次（阶段 / 已完成场数 / 已用时间 / 成片地址）
+    const jobDetail = /^\/api\/studio\/jobs\/([A-Za-z0-9_.-]{1,80})$/.exec(url.pathname);
+    if (jobDetail && req.method === 'GET') {
+      return proxy(req, res, `/v1/jobs/${encodeURIComponent(jobDetail[1])}` + url.search,
+        null, null, STUDIO_BASE, 'studio');
+    }
+
+    // 成片流：videoUrl 由面板去问 studio，浏览器只与本面板同源
+    const jobVideo = /^\/api\/studio\/jobs\/([A-Za-z0-9_.-]{1,80})\/video$/.exec(url.pathname);
+    if (jobVideo && (req.method === 'GET' || req.method === 'HEAD')) {
+      return serveStudioJobVideo(req, res, jobVideo[1]);
+    }
+
+    // ---- 历史（/v1/library）：重做 / 载入 / 删除 --------------------------
+    if (url.pathname === '/api/studio/library' && req.method === 'GET') {
+      return proxy(req, res, '/v1/library' + url.search, null, null, STUDIO_BASE, 'studio');
+    }
+
+    const libItem = /^\/api\/studio\/library\/([A-Za-z0-9_.-]{1,80})$/.exec(url.pathname);
+    if (libItem && (req.method === 'GET' || req.method === 'DELETE')) {
+      return proxy(req, res, `/v1/library/${encodeURIComponent(libItem[1])}` + url.search,
+        null, null, STUDIO_BASE, 'studio');
+    }
+
+    const libRerun = /^\/api\/studio\/library\/([A-Za-z0-9_.-]{1,80})\/rerun$/.exec(url.pathname);
+    if (libRerun && req.method === 'POST') {
+      return proxy(req, res, `/v1/library/${encodeURIComponent(libRerun[1])}/rerun`,
+        Buffer.alloc(0), null, STUDIO_BASE, 'studio');
     }
 
     // 渲染进度（浏览器每 1.5 秒问一次）

@@ -27,10 +27,11 @@ const https = require('node:https');
 const http = require('node:http');
 const { spawn } = require('node:child_process');
 
-const HOST = 'https://token-plan.cn-beijing.maas.aliyuncs.com';
+// 标准百炼接口（按量付费）。token-plan 网关额度耗尽后切到这条；host/model 可由调用方覆盖。
+const HOST = 'https://dashscope.aliyuncs.com';
 const SUBMIT_PATH = '/api/v1/services/aigc/video-generation/video-synthesis';
 const TASK_PATH = '/api/v1/tasks/';
-const MODEL = 'wan3.0-video';
+const MODEL = 'wanx2.1-t2v-turbo';
 // 轮询间隔 6 秒：实测 100 秒出片，6 秒一次 ≈ 17 次请求，够快又不至于把网关问烦
 const POLL_MS = 6000;
 // 产物下限：正常 5 秒 720p 是 15MB 以上，小于 100KB 一定是错误页/空壳
@@ -294,6 +295,9 @@ async function generateClip(opts = {}) {
   const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : 480000;
   const ffmpeg = String(opts.ffmpeg || '');
   const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
+  // 首帧参考图（data URL 或公网 URL）。网关对未知字段"接受但可能忽略"，
+  // 是否真的生效由 studio 侧做对照实验验证；这里只负责原样传上去。
+  const firstFrameUrl = String(opts.firstFrameUrl || '').trim();
 
   const fail = (error, extra = {}) => Object.assign({
     ok: false, file: null, taskId: '', ms: Date.now() - startedAt, error: String(error).slice(0, 600),
@@ -321,13 +325,15 @@ async function generateClip(opts = {}) {
     const done = (value) => Object.assign({ taskId, queueMs }, value, { ms: Date.now() - startedAt });
 
     // 1) 提交：x-dashscope-async: enable 是必须的，少了它网关会当同步任务处理
+    const input = { prompt };
+    if (firstFrameUrl) input.first_frame_url = firstFrameUrl;
     const submit = await requestJson('POST', HOST + SUBMIT_PATH, {
       headers: {
         authorization: `Bearer ${key}`,
         'content-type': 'application/json',
         'x-dashscope-async': 'enable',
       },
-      body: { model: MODEL, input: { prompt }, parameters: { size, duration: seconds } },
+      body: { model: MODEL, input, parameters: { size, duration: seconds } },
       timeoutMs: 30000,
     });
     if (!submit.ok) {
@@ -412,6 +418,7 @@ async function generateClip(opts = {}) {
       duration: Number(info.duration.toFixed(2)),
       width: info.width, height: info.height,
       size, seconds, prompt,
+      firstFrame: Boolean(firstFrameUrl),
     });
   }).finally(() => { waiting -= 1; });
 }
