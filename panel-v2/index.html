@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>做视频 · 大肥鱼</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-dot" aria-hidden="true"></span>
+      <span class="brand-name">大肥鱼</span>
+      <span class="muted">做视频</span>
+    </div>
+
+    <nav id="tabs" class="tabs" role="tablist" aria-label="视图">
+      <button class="tab active" type="button" role="tab" data-view="make" aria-selected="true" aria-controls="view-make">做视频</button>
+      <button class="tab" type="button" role="tab" data-view="jobs" aria-selected="false" aria-controls="view-jobs">任务</button>
+      <button class="tab" type="button" role="tab" data-view="settings" aria-selected="false" aria-controls="view-settings">设置</button>
+    </nav>
+
+    <div id="status" class="status connecting" title="视频服务状态">
+      <span class="dot" aria-hidden="true"></span>
+      <span id="statusText">连接中…</span>
+    </div>
+  </header>
+
+  <main class="views">
+    <!-- 做视频：默认视图，一屏完成 -->
+    <section id="view-make" class="view active" role="tabpanel" aria-label="做视频">
+      <form id="makeForm" class="make" novalidate>
+        <textarea id="topicInput" class="big-input" rows="4" maxlength="20000"
+          placeholder="你想做什么视频？也可以贴一段稿子" aria-label="视频主题或稿子"></textarea>
+
+        <div class="make-row">
+          <div class="field">
+            <span class="field-label">时长</span>
+            <div id="secondsSeg" class="seg" role="group" aria-label="视频时长">
+              <button type="button" class="seg-btn" data-sec="30">30 秒</button>
+              <button type="button" class="seg-btn active" data-sec="45" aria-pressed="true">45 秒</button>
+              <button type="button" class="seg-btn" data-sec="60">60 秒</button>
+              <button type="button" class="seg-btn" data-sec="90">90 秒</button>
+            </div>
+          </div>
+          <button type="submit" id="startBtn" class="start">开始做</button>
+        </div>
+        <p id="submitHint" class="hint" aria-live="polite"></p>
+      </form>
+
+      <div id="redoBanner" class="redo-banner hidden">
+        <span id="redoText" class="redo-text"></span>
+        <button type="button" id="redoCancel" class="linkbtn">取消重做</button>
+      </div>
+
+      <!-- 提交后立刻出现的任务卡 -->
+      <div id="currentJob" class="current-job hidden" aria-live="polite"></div>
+
+      <details id="advanced" class="advanced">
+        <summary>
+          <span class="caret" aria-hidden="true"></span>
+          <span>高级</span>
+          <span id="sceneCount" class="count hidden"></span>
+        </summary>
+        <div class="adv-body">
+          <div class="adv-row">
+            <label class="adv-field">风格
+              <select id="styleSel"></select>
+            </label>
+            <label class="adv-field">音色
+              <select id="voiceSel"></select>
+            </label>
+          </div>
+
+          <div class="scenes-head">
+            <span class="field-label">分镜</span>
+            <span class="scenes-hint">留空则由主题自动拆</span>
+            <div class="scenes-actions">
+              <button type="button" id="clearScenesBtn" class="btn sm">清空</button>
+              <button type="button" id="addSceneBtn" class="btn sm">+ 加一场</button>
+            </div>
+          </div>
+          <div class="scenes-wrap">
+            <table id="scenesTable" class="scenes-table">
+              <thead>
+                <tr>
+                  <th scope="col">#</th>
+                  <th scope="col">文字</th>
+                  <th scope="col">秒</th>
+                  <th scope="col">类型</th>
+                  <th scope="col" class="scene-hint">提示</th>
+                  <th scope="col">操作</th>
+                </tr>
+              </thead>
+              <tbody id="scenesBody"></tbody>
+            </table>
+          </div>
+          <p id="scenesEmpty" class="hint">还没有分镜。点「+ 加一场」手工写，或者在任务页点「重做」把旧分镜载进来。</p>
+        </div>
+      </details>
+    </section>
+
+    <!-- 任务：最近 50 条 -->
+    <section id="view-jobs" class="view" role="tabpanel" aria-label="任务">
+      <div id="jobsToolbar" class="jobs-toolbar">
+        <span id="jobsSummary" class="muted">最近 50 条</span>
+        <button type="button" id="refreshJobs" class="btn sm">刷新</button>
+      </div>
+      <div id="jobsList" class="jobs"></div>
+      <div id="jobsEmpty" class="empty hidden">还没有任务。去「做视频」开一条吧。</div>
+    </section>
+
+    <!-- 设置：只读人设 + 两个下拉 -->
+    <section id="view-settings" class="view" role="tabpanel" aria-label="设置">
+      <div class="settings">
+        <div class="card settings-card">
+          <label class="set-row">
+            <span class="set-label">风格</span>
+            <select id="setStyle"></select>
+          </label>
+          <label class="set-row">
+            <span class="set-label">音色</span>
+            <select id="setVoice"></select>
+          </label>
+          <p id="voiceHint" class="hint voice-hint">音色清单会从 speak 异步加载；想换音色也可以在聊天里说「换音色」</p>
+          <p id="personaLine" class="persona">当前人设：大肥鱼（迷糊版） · 白板讲解 · 温柔口语</p>
+          <p id="saveHint" class="hint">改动即时保存在本机</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <template id="sceneRowTpl">
+    <tr class="scene-row">
+      <td class="scene-idx">1</td>
+      <td><input class="scene-text" type="text" data-field="text" placeholder="这一场讲什么" autocomplete="off"></td>
+      <td><input class="scene-sec" type="number" data-field="seconds" min="1" max="15" step="1" value="5" inputmode="numeric"></td>
+      <td>
+        <select class="scene-tool" data-field="tool" aria-label="类型">
+          <option value="auto">自动</option>
+          <option value="manim">manim</option>
+          <option value="text">文字</option>
+        </select>
+      </td>
+      <td class="scene-hint"><input class="scene-hintinput" type="text" data-field="hint" placeholder="画面提示" autocomplete="off"></td>
+      <td class="scene-ops">
+        <button type="button" class="iconbtn" data-act="insert" title="在下方插入一场">插入</button>
+        <button type="button" class="iconbtn danger" data-act="delete" title="删除这场">删</button>
+      </td>
+    </tr>
+  </template>
+
+  <script src="/app.js"></script>
+</body>
+</html>
