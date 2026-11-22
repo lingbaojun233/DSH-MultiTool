@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>DSH-MultiTool · IO 面板</title>
+  <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/style.css">
-  <link rel="stylesheet" href="/video-v2.css">
 </head>
 <body>
   <header class="topbar">
@@ -18,7 +18,6 @@
     <nav id="tabs" class="tabs" role="tablist">
       <button class="tab active" data-view="chat" role="tab" aria-selected="true">聊天</button>
       <button class="tab" data-view="memory" role="tab" aria-selected="false">记忆</button>
-      <button class="tab" data-view="video" role="tab" aria-selected="false">视频创作</button>
       <button class="tab" data-view="persona" role="tab" aria-selected="false">人格</button>
       <button class="tab hidden" data-view="admin" id="tabAdmin" role="tab" aria-selected="false">账号</button>
     </nav>
@@ -86,203 +85,6 @@
       </div>
     </section>
 
-    <!-- 视频创作：panel-v2 的三视图（做视频 / 任务 / 设置），数据全走 /api/v2 -->
-    <section id="view-video" class="view" role="tabpanel">
-      <div class="pane video-v2" id="videoV2Root">
-        <div class="video-v2-head">
-          <nav id="v2Tabs" class="video-v2-tabs" role="tablist" aria-label="视频创作视图">
-            <button class="v2-tab active" type="button" role="tab" data-v2-view="make" aria-selected="true" aria-controls="v2-view-make">做视频</button>
-            <button class="v2-tab" type="button" role="tab" data-v2-view="jobs" aria-selected="false" aria-controls="v2-view-jobs">任务</button>
-            <button class="v2-tab" type="button" role="tab" data-v2-view="settings" aria-selected="false" aria-controls="v2-view-settings">设置</button>
-          </nav>
-          <div id="v2Status" class="v2-status connecting" title="视频服务状态">
-            <span class="v2-dot" aria-hidden="true"></span>
-            <span id="v2StatusText">连接中…</span>
-          </div>
-        </div>
-
-        <!-- 做视频：默认视图，一屏完成 -->
-        <section id="v2-view-make" class="video-v2-view active" role="tabpanel" aria-label="做视频">
-          <form id="v2MakeForm" class="v2-make" novalidate>
-            <!-- 项目：一个主题可以重做多版；默认「+ 新建项目」 -->
-            <div id="v2ProjectRow" class="v2-project-row">
-              <span class="v2-field-label">项目</span>
-              <select id="v2ProjectSel" class="v2-project-sel" aria-label="项目"></select>
-              <span id="v2ProjectHint" class="v2-hint v2-project-hint"></span>
-            </div>
-            <textarea id="v2TopicInput" class="v2-input" rows="4" maxlength="20000"
-              placeholder="你想做什么视频？也可以贴一段稿子" aria-label="视频主题或稿子"></textarea>
-
-            <div class="v2-make-row">
-              <div class="v2-field">
-                <span class="v2-field-label">时长</span>
-                <div id="v2SecondsSeg" class="v2-seg" role="group" aria-label="视频时长">
-                  <button type="button" class="v2-seg-btn" data-sec="30">30 秒</button>
-                  <button type="button" class="v2-seg-btn active" data-sec="45" aria-pressed="true">45 秒</button>
-                  <button type="button" class="v2-seg-btn" data-sec="60">60 秒</button>
-                  <button type="button" class="v2-seg-btn" data-sec="90">90 秒</button>
-                </div>
-              </div>
-              <button type="submit" id="v2StartBtn" class="v2-start">开始做</button>
-            </div>
-            <p id="v2SubmitHint" class="v2-hint" aria-live="polite"></p>
-          </form>
-
-          <div id="v2RedoBanner" class="v2-redo hidden">
-            <span id="v2RedoText" class="v2-redo-text"></span>
-            <button type="button" id="v2RedoCancel" class="v2-linkbtn">取消重做</button>
-          </div>
-
-          <!-- 提交后立刻出现的任务卡 -->
-          <div id="v2CurrentJob" class="v2-current-job hidden" aria-live="polite"></div>
-
-          <details id="v2Advanced" class="v2-advanced">
-            <summary>
-              <span class="v2-caret" aria-hidden="true"></span>
-              <span>高级</span>
-              <span id="v2SceneCount" class="v2-count hidden"></span>
-            </summary>
-            <div class="v2-adv-body">
-              <div class="v2-adv-row">
-                <label class="v2-adv-field">风格
-                  <select id="v2StyleSel"></select>
-                </label>
-                <label class="v2-adv-field">音色
-                  <select id="v2VoiceSel"></select>
-                </label>
-              </div>
-              <p id="v2AdvTunablesHint" class="v2-hint v2-adv-tunables"></p>
-
-              <div class="v2-scenes-head">
-                <span class="v2-field-label">分镜</span>
-                <span class="v2-scenes-hint">留空则由主题自动拆</span>
-                <div class="v2-scenes-actions">
-                  <button type="button" id="v2ClearScenesBtn" class="v2-btn v2-sm">清空</button>
-                  <button type="button" id="v2AddSceneBtn" class="v2-btn v2-sm">+ 加一场</button>
-                </div>
-              </div>
-              <div class="v2-scenes-wrap">
-                <table id="v2ScenesTable" class="v2-scenes-table">
-                  <colgroup>
-                    <col class="v2-col-idx">
-                    <col class="v2-col-title">
-                    <col class="v2-col-narration">
-                    <col class="v2-col-sec">
-                    <col class="v2-col-tool">
-                    <col class="v2-col-hint">
-                    <col class="v2-col-sticker">
-                    <col class="v2-col-ops">
-                  </colgroup>
-                  <thead>
-                    <tr>
-                      <th scope="col">#</th>
-                      <th scope="col">标题</th>
-                      <th scope="col">旁白</th>
-                      <th scope="col">秒</th>
-                      <th scope="col">类型</th>
-                      <th scope="col" class="v2-scene-hint">画什么</th>
-                      <th scope="col">表情</th>
-                      <th scope="col">插入·删</th>
-                    </tr>
-                  </thead>
-                  <tbody id="v2ScenesBody"></tbody>
-                </table>
-              </div>
-              <p id="v2ScenesEmpty" class="v2-hint">还没有分镜。点「+ 加一场」手工写，或者在任务页点「重做」把旧分镜载进来。</p>
-            </div>
-          </details>
-        </section>
-
-        <!-- 任务：项目 → 版本（一个主题一张卡，展开看历史版本） -->
-        <section id="v2-view-jobs" class="video-v2-view" role="tabpanel" aria-label="任务">
-          <div id="v2JobsToolbar" class="v2-jobs-toolbar">
-            <span id="v2JobsSummary" class="v2-muted">还没有项目</span>
-            <button type="button" id="v2RefreshJobs" class="v2-btn v2-sm">刷新</button>
-          </div>
-          <div id="v2JobsList" class="v2-jobs"></div>
-          <div id="v2JobsEmpty" class="v2-empty hidden">还没有任务。去「做视频」开一条吧。</div>
-        </section>
-
-        <!-- 设置：只读人设 + 两个下拉 -->
-        <section id="v2-view-settings" class="video-v2-view" role="tabpanel" aria-label="设置">
-          <div class="v2-settings">
-            <div class="v2-card v2-settings-card">
-              <label class="v2-set-row">
-                <span class="v2-set-label">风格</span>
-                <select id="v2SetStyle"></select>
-              </label>
-              <label class="v2-set-row">
-                <span class="v2-set-label">音色</span>
-                <select id="v2SetVoice"></select>
-              </label>
-              <label class="v2-set-row">
-                <span class="v2-set-label">语速</span>
-                <select id="v2SetSpeed"></select>
-                <span class="v2-set-note">越快越赶，1.0 最自然</span>
-              </label>
-              <label class="v2-set-row">
-                <span class="v2-set-label">音高</span>
-                <select id="v2SetPitch"></select>
-                <span class="v2-set-note">半音：+1 更清亮，0 = 原声</span>
-              </label>
-              <label class="v2-set-row">
-                <span class="v2-set-label">停留</span>
-                <select id="v2SetPadding"></select>
-                <span class="v2-set-note">旁白说完后画面多停一会儿，想慢一点就调大</span>
-              </label>
-              <label class="v2-set-row">
-                <span class="v2-set-label">表情持续</span>
-                <select id="v2SetSticker"></select>
-                <span class="v2-set-note">表情播完一轮的时间（循环播放）</span>
-              </label>
-              <p id="v2VoiceHint" class="v2-hint v2-voice-hint">音色清单会从 speak 异步加载；想换音色也可以在聊天里说「换音色」</p>
-              <p id="v2PersonaLine" class="v2-persona">当前人设：大肥鱼（迷糊版） · 白板讲解 · 温柔口语</p>
-              <p id="v2SaveHint" class="v2-hint">改动即时保存在本机</p>
-            </div>
-          </div>
-        </section>
-
-        <template id="v2SceneRowTpl">
-          <tr class="v2-scene-row">
-            <td class="v2-scene-idx">1</td>
-            <td><input class="v2-scene-text" type="text" data-field="text" placeholder="这一场讲什么" autocomplete="off"></td>
-            <td><textarea class="v2-scene-narration" rows="2" data-field="narration" maxlength="400" placeholder="会念出来；留空则这一场静音"></textarea></td>
-            <td class="v2-scene-sec-cell"><input class="v2-scene-sec" type="number" data-field="seconds" min="1" max="15" step="1" value="5" inputmode="numeric"></td>
-            <td>
-              <select class="v2-scene-tool" data-field="tool" aria-label="类型">
-                <option value="auto">自动</option>
-                <option value="manim">manim</option>
-                <option value="text">文字</option>
-                <option value="sticker">表情卡</option>
-              </select>
-            </td>
-            <td class="v2-scene-hint"><input class="v2-scene-hintinput" type="text" data-field="hint" placeholder="画什么：留空则自动" autocomplete="off"></td>
-            <td class="v2-scene-sticker-cell"></td>
-            <td class="v2-scene-ops">
-              <button type="button" class="v2-iconbtn" data-act="insert" title="在下方插入一场">插入</button>
-              <button type="button" class="v2-iconbtn v2-danger" data-act="delete" title="删除这场">删</button>
-            </td>
-          </tr>
-        </template>
-
-        <!-- 表情选择器：每场 1 个，网格里直接看动图 + 情绪名 + 收藏星 -->
-        <div id="v2StickerModal" class="v2-sticker-modal hidden" role="dialog" aria-modal="true" aria-labelledby="v2StickerTitle">
-          <div class="v2-sticker-dialog">
-            <div class="v2-sticker-head">
-              <span id="v2StickerTitle" class="v2-sticker-title">选一个表情</span>
-              <span id="v2StickerSummary" class="v2-sticker-summary"></span>
-              <input id="v2StickerSearch" class="v2-sticker-search" type="search" placeholder="搜情绪名，例如 开心 / 睡觉" autocomplete="off">
-              <button type="button" id="v2StickerClose" class="v2-iconbtn" title="关闭">✕</button>
-            </div>
-            <div id="v2StickerGrid" class="v2-sticker-grid" role="listbox" aria-label="表情列表"></div>
-            <p id="v2StickerHint" class="v2-sticker-hint"></p>
-          </div>
-        </div>
-
-        <div id="v2Toast" class="v2-toast" role="status" aria-live="polite"></div>
-      </div>
-    </section>
-
     <!-- 人格：宪法 + traits -->
     <section id="view-persona" class="view" role="tabpanel">
       <div class="pane">
@@ -338,7 +140,6 @@
 
   <script src="/vendor/marked.min.js"></script>
   <script src="/vendor/purify.min.js"></script>
-  <script src="/video-v2.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

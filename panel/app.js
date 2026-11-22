@@ -238,7 +238,6 @@ function enterSession(data) {
   loadHistory();
   if (currentUser) inputEl.focus();
   loadAdminPanel();
-  enterVideoV2();
 }
 
 async function logout() {
@@ -1293,30 +1292,23 @@ async function loadMemoryView() {
 }
 
 /**
- * 视频创作 v2 的入口：逻辑和视图都在 /video-v2.js 里（从 panel-v2 抽出来的），
- * 这里只负责在「切到视频 tab」和「登录成功」时叫它初始化一次。
+ * 可用的栏只有四个：聊天 / 记忆 / 人格 / 账号。
+ * 别的名字（旧书签、外部脚本传入）一律当聊天，别切到一个不存在的空白页。
  */
-function enterVideoV2() {
-  if (!window.VideoV2 || typeof window.VideoV2.enter !== 'function') return;
-  try {
-    window.VideoV2.enter();
-  } catch (err) {
-    console.warn('video-v2 初始化失败：', err);
-  }
-}
+const VIEWS = new Set(['chat', 'memory', 'persona', 'admin']);
 
-/** 切栏：聊天 / 记忆 / 视频创作 / 人格 / 账号。 */
+/** 切栏：聊天 / 记忆 / 人格 / 账号（默认聊天）。 */
 function setView(name) {
+  if (!VIEWS.has(name)) name = 'chat';
   document.querySelectorAll('.view').forEach((s) => s.classList.toggle('active', s.id === 'view-' + name));
   document.querySelectorAll('.tab').forEach((t) => {
     const on = t.dataset.view === name;
     t.classList.toggle('active', on);
     t.setAttribute('aria-selected', on ? 'true' : 'false');
   });
-  const titles = { chat: '聊天', memory: '记忆', video: '视频创作', persona: '人格', admin: '账号' };
+  const titles = { chat: '聊天', memory: '记忆', persona: '人格', admin: '账号' };
   if (viewTitle) viewTitle.textContent = titles[name] || '';
   if (name === 'memory') loadMemoryView();
-  if (name === 'video') enterVideoV2();
   if (name === 'persona') loadPersonaView();
   if (name === 'admin') loadAdminPanel();
   if (name === 'chat') inputEl.focus();
@@ -1432,7 +1424,6 @@ async function boot() {
   renderUser();
   hideAuth();
   await loadHistory();
-  enterVideoV2();
   inputEl.focus();
 }
 

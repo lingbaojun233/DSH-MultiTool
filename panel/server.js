@@ -34,8 +34,6 @@ const SPEAK_BASE = process.env.DSH_SPEAK_URL || 'http://127.0.0.1:8770';
 const LISTEN_BASE = process.env.DSH_LISTEN_URL || 'http://127.0.0.1:8771';
 const STUDIO_BASE = process.env.DSH_STUDIO_URL || 'http://127.0.0.1:8772';
 const STICKER_BASE = process.env.DSH_STICKER_URL || 'http://127.0.0.1:8773';
-// 视频创作 v2：新页面的唯一数据源（旧 studio 8772 不再被视频页调用）
-const STUDIO_V2_BASE = (process.env.DSH_STUDIO_V2_URL || 'http://127.0.0.1:8774').replace(/\/+$/, '');
 
 // 浏览器上传的视频落在这里，处理完就删。放在 data\ 下（模块目录以外），
 // 这样一次 push 替换 panel\ 不会把正在传的文件搞坏。
@@ -487,111 +485,6 @@ function proxy(req, res, ioPath, body, onDone, base, label) {
   upstream.end();
 }
 
-// ---- 视频创作 v2 代理：/api/v2/* -> studio-v2 /v1/* ----------------------
-// 视频页全部走这里，旧 studio（8772）的接口不再出现在视频页。
-
-// 逐跳字段不转发；Host 要换成上游的
-const V2_HOP_HEADERS = new Set([
-  'host',
-  'connection',
-  'keep-alive',
-  'proxy-authenticate',
-  'proxy-authorization',
-  'te',
-  'trailer',
-  'transfer-encoding',
-  'upgrade',
-]);
-
-// 回给浏览器时原样抄的响应头：content-encoding 保留（纯字节转发，不解压），
-// accept-ranges / content-range 保留（<video> 拖进度条）。
-const V2_PASS_HEADERS = [
-  'content-type',
-  'content-length',
-  'content-encoding',
-  'content-range',
-  'content-disposition',
-  'accept-ranges',
-  'cache-control',
-  'etag',
-  'last-modified',
-  'vary',
-  'set-cookie',
-  'location',
-];
-
-/** 去掉 ?token（它只给 <video>/下载链接用，不往上游带）。 */
-function v2UpstreamSearch(url) {
-  const params = new URLSearchParams(url.search);
-  params.delete('token');
-  const qs = params.toString();
-  return qs ? `?${qs}` : '';
-}
-
-/**
- * 流式代理：/api/v2/* -> studio-v2 /v1/*。
- * - 不缓冲视频：Range 原样透传，206/Content-Range 原样回给 <video>；
- * - authorization / cookie 透传；
- * - <video> 与「下载字幕」链接带不了请求头：?token=xxx 换成 Authorization，且不转发给上游。
- */
-function proxyV2(req, res, base, upstreamPath, label, timeoutMs) {
-  const target = new URL(base);
-  const headers = {};
-  for (const [key, value] of Object.entries(req.headers)) {
-    if (V2_HOP_HEADERS.has(key)) continue;
-    headers[key] = value;
-  }
-  headers.host = target.host;
-  if (!headers.authorization) {
-    let token = '';
-    try {
-      token = new URL(req.url || '/', `http://${req.headers.host || HOST}`).searchParams.get('token') || '';
-    } catch {
-      token = '';
-    }
-    if (token) headers.authorization = `Bearer ${token}`;
-  }
-
-  const started = Date.now();
-  const upstream = http.request({
-    protocol: target.protocol,
-    hostname: target.hostname,
-    port: target.port || 80,
-    method: req.method,
-    path: upstreamPath,
-    headers,
-  });
-
-  upstream.setTimeout(timeoutMs || 120000, () => {
-    upstream.destroy(new Error('upstream timeout'));
-  });
-
-  upstream.on('response', (up) => {
-    const out = {};
-    for (const name of V2_PASS_HEADERS) {
-      if (up.headers[name] !== undefined) out[name] = up.headers[name];
-    }
-    res.writeHead(up.statusCode || 502, out);
-    log(`${label} ${req.method} ${upstreamPath} → ${up.statusCode} ${Date.now() - started}ms`);
-    up.pipe(res);
-  });
-
-  upstream.on('error', (err) => {
-    log(`${label} ${req.method} ${upstreamPath} ✗ ${err.message}`);
-    if (res.headersSent) {
-      res.destroy();
-      return;
-    }
-    sendJson(res, 502, { ok: false, error: 'UPSTREAM_DOWN', detail: err.message });
-  });
-
-  res.on('close', () => {
-    if (!res.writableEnded) upstream.destroy();
-  });
-
-  req.pipe(upstream);
-}
-
 /** 视频分析结果 → 交给 io（大肥鱼用自己的口气说）→ 写历史 → 返回浏览器 */
 async function completeVideo(req, res, v, label) {
   if (!v.data || !v.data.ok) {
@@ -914,31 +807,6 @@ const handler = async (req, res) => {
       const sub = url.pathname.slice('/api/auth'.length);
       const raw = req.method === 'POST' ? await readBody(req) : null;
       return proxy(req, res, '/v1/auth' + sub + url.search, raw, null, SEPARATOR_BASE, 'separator');
-    }
-
-    // ---- 视频创作 v2：/api/v2/* -> studio-v2 /v1/* -------------------------
-    // 新视频页的唯一数据源。<video> 和「下载字幕」带不了 Bearer，所以视频字节
-    // 允许用不可猜的 job id 当凭据；其它接口仍然要求登录（和旧 studio 一致）。
-    if (url.pathname === '/api/v2' || url.pathname.startsWith('/api/v2/')) {
-      const isMedia = /^\/api\/v2\/video\/[A-Za-z0-9_-]+$/.test(url.pathname);
-      // 只有视频字节这条流允许免 Bearer（job id 不可猜，用途同旧 /api/studio/jobs/:id/video）；
-      // 其它接口一律要登录，避免公网匿名提交生成任务。
-      if (!isMedia && !bearer(req)) {
-        return sendJson(res, 401, { ok: false, code: 'E_UNAUTHORIZED', error: '未登录或会话已过期' });
-      }
-
-      // 音色清单不在 studio-v2 里：转 speak 的 /v1/voices?zh=1，给设置页动态下拉
-      if (url.pathname === '/api/v2/voices' && (req.method === 'GET' || req.method === 'HEAD')) {
-        const params = new URLSearchParams(v2UpstreamSearch(url).replace(/^\?/, ''));
-        if (!params.has('zh')) params.set('zh', '1');
-        const qs = params.toString();
-        return proxyV2(req, res, SPEAK_BASE, `/v1/voices${qs ? `?${qs}` : ''}`, 'speak', 30000);
-      }
-
-      const rest = url.pathname.slice('/api/v2'.length) || '/';
-      const upstreamPath = `/v1${rest}${v2UpstreamSearch(url)}`;
-      const timeout = rest.startsWith('/video/') ? 600000 : 180000;
-      return proxyV2(req, res, STUDIO_V2_BASE, upstreamPath, 'studio-v2', timeout);
     }
 
     // 没登录就不该碰输入/记忆接口：浏览器会弹登录层，这里先挡一道
