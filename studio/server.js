@@ -560,6 +560,44 @@ async function mapLimit(items, limit, worker) {
 }
 
 /**
+ * 场与场之间的渲染并发（manim 一场一个进程，4 核机器上串行会闲置 3 核）。
+ *
+ * 上限硬编码 2 而不是按核数算：每场内部 manim 自己还会 spawn ffmpeg，
+ * 1080p 一场的峰值内存约 300~500MB，4GB / 4 核的机器上 3 路并发就开始换页。
+ * config.renderConcurrency 只能往下调（1=串行）。
+ *
+ * 内存保护：并行前看 os.freemem()，低于 FREE_MIN_MB 就本轮降级为串行。
+ * 阈值可用 config.renderFreeMemMinMb 覆盖（测试/弱机器），别去改常量。
+ */
+const RENDER_CONCURRENCY_MAX = 2;
+const FREE_MIN_MB = 1200;
+
+function effectiveRenderConcurrency() {
+  const want = Math.floor(Number(CFG.renderConcurrency) || 2);
+  const cap = Math.max(1, Math.min(RENDER_CONCURRENCY_MAX, want));
+  const freeMb = Math.round(os.freemem() / 1048576);
+  const needMb = Math.max(1, Math.round(
+    Number(process.env.STUDIO_FREE_MIN_MB) || Number(CFG.renderFreeMemMinMb) || FREE_MIN_MB,
+  ));
+  if (cap <= 1) {
+    return {
+      limit: 1, freeMb, needMb, configured: want,
+      reason: `串行渲染（renderConcurrency=${want}，硬上限 ${RENDER_CONCURRENCY_MAX}）`,
+    };
+  }
+  if (freeMb < needMb) {
+    return {
+      limit: 1, freeMb, needMb, configured: want, degraded: true,
+      reason: `可用内存 ${freeMb}MB < ${needMb}MB，本轮串行渲染`,
+    };
+  }
+  return {
+    limit: cap, freeMb, needMb, configured: want,
+    reason: `渲染并发 ${cap}（可用内存 ${freeMb}MB ≥ ${needMb}MB，4 核留 2 路）`,
+  };
+}
+
+/**
  * 场数建议：按总时长给区间，替代以前写死的「3~80 场」。
  *
  * 60 秒配「3~80 场」时模型会拆 8 场（每场 7.5 秒），一场只闪一下，像 PPT。
@@ -616,9 +654,11 @@ async function askJson(promptText, opts = {}) {
 // 或者只改一句旁白，明明大部分输入一字不差，却要重跑全部。这里按内容哈希复用规划结果。
 //
 // 两层，键都在 lib/plan-cache.js 里：
-//   场级    sha1(normalize(visual_hint) | 风格签名 | 引擎)      → 一段 manim 代码
+//   场级    sha1(normalize(visual_hint) | normalize(标题) | 风格签名 | 引擎) → 一段 manim 代码
 //   骨架级  sha1(normalize(稿子/主题) | 秒数 | 风格签名 | 语气) → 整份分镜数组
-// 严格不命中的情况：换风格（签名不同）、改 visual_hint（键变）、请求带 fresh:true、
+// 场级键里必须有**标题**：manim 代码把标题写死成 Text("…")，只改标题时 hint 没变，
+// 不含标题的键会命中旧代码 —— 成片里就还是旧标题（用户实测的"改了不生效"）。
+// 严格不命中的情况：换风格（签名不同）、改 visual_hint 或标题（键变）、请求带 fresh:true、
 // 条目损坏/过期、缓存里的代码过不了安全闸门（UNSAFE_CODE 之类，删掉重问）。
 
 /** 风格进缓存键的指纹：第一位是风格 id，配色/线宽/字体变了签名也会变。 */
@@ -628,16 +668,26 @@ function styleCacheKey(style) {
 
 /**
  * 这一场"画什么"的缓存材料。
- * 有 visual_hint 就用它（写稿模式每条都有）；没有时用标题+旁白 ——
- * 那时代码本来只依赖这两句，用它们当键才既不改语义又能命中。
+ * 有 visual_hint 就用它（写稿模式每条都有）；没有时用标题 ——
+ * 那时代码本来只依赖这句话，用它当键才既不改语义又能命中。
+ *
+ * **不用旁白**：旁白不进 manim 代码（只走混音/字幕），放进来会让"只改台词"
+ * 也重新生成一次动画。标题则必须算材料 —— 它是写死在代码里的字符串，见 sceneKey。
  */
 function sceneCacheText(scene) {
   const hint = String((scene && scene.visual_hint) || '').trim();
   if (hint) return hint;
-  return [
-    String((scene && scene.text) || '').trim(),
-    String((scene && scene.narration) || '').trim(),
-  ].filter(Boolean).join('｜');
+  return String((scene && scene.text) || '').trim();
+}
+
+/** 这一场进规划缓存的全部材料：hint + 标题 + 风格 + 引擎，和 manimHint 戳同一份算法。 */
+function sceneCodeMaterials(scene, kind, style) {
+  return {
+    hint: sceneCacheText(scene),
+    text: String((scene && scene.text) || ''),
+    style: styleCacheKey(style),
+    kind: String(kind || 'manim'),
+  };
 }
 
 /**
@@ -667,7 +717,7 @@ async function planSceneCode(scene, kind, style, opts = {}) {
   const label = index == null ? 'scene#?' : `scene#${index}`;
   const fresh = opts.fresh === true;
   const keyInput = sceneCacheable(scene, kind)
-    ? { hint: sceneCacheText(scene), style: styleCacheKey(style), kind: String(kind || 'manim') }
+    ? sceneCodeMaterials(scene, kind, style)
     : null;
 
   if (keyInput && !fresh) {
@@ -676,7 +726,7 @@ async function planSceneCode(scene, kind, style, opts = {}) {
       const clean = stripMathDelims(hit.code);
       const bad = Manim ? Manim.checkCode(clean) : 'manim 模块不可用';
       if (!bad) {
-        log(`${label} 命中场级规划缓存（hint 哈希 ${PlanCacheLib.shortHash(hit.key)}）`);
+        log(`${label} 命中场级规划缓存（hint+标题 哈希 ${PlanCacheLib.shortHash(hit.key)}）`);
         return { ok: true, json: { manim: { code: clean, scene: hit.scene || null } }, cacheHit: true };
       }
       // 缓存里是坏代码：只有"代码被拒"这一种情况会走到这里（写之前已经拦过），
@@ -749,6 +799,9 @@ function buildSkeletonPrompt(prompt, total, opts = {}) {
     '- visual 选 manim 的情况：公式、坐标、曲线、精确动画、推导过程',
     `- 一条视频里 aivideo 最多 ${Math.max(0, Number(CFG.maxAiVideo) || 0)} 场（每条生成要 100 秒且占额度），其余用 manim`,
     '- manim：用 Manim 演一段真动画 —— 曲线生长、切线滑动、公式逐项变形、点在轨迹上跑、坐标轴里量出结论。',
+    '- manim 场里出现的文字（写脚本时照做）：中文一律 Text(..., font="Microsoft YaHei")；',
+    '  **标题 font_size ≥ 44 且必须 weight=BOLD**，正文/标注 font_size ≥ 32（不低于 28）——',
+    '  Microsoft YaHei 常规字重很细，标题不加 BOLD、字号又小，成片里会细得看不清。',
     '- text：纯文字卡（渐变底 + 一行大字），只用于开场、转场、下结论；一集最多 1~2 场。',
     '- 不要写 plot / draw / rich：这两条旧路子已停用（写了也会被当成 text，白占一场）。',
     '- 讲"变化过程 / 运动 / 逐渐逼近"的场次必须用 manim，不要拿一张静止的图糊过去。',
@@ -917,7 +970,7 @@ function buildVisualPrompt(scene, kind, style) {
     '- 代码 **≤60 行**，单类，不要 __main__，不要注释掉的旧版本',
     '',
     '## 允许用的东西',
-    '- 文字：Text（中文必须 Text("…", font="Microsoft YaHei")）；公式：MathTex（LaTeX 已装，直接写 r"$\\frac{dy}{dx}$" 这种，不需要 usepackage）',
+    '- 文字：Text；公式：MathTex（LaTeX 已装，直接写 r"$\\frac{dy}{dx}$" 这种，不需要 usepackage）',
     '- 图形：Axes、NumberPlane、Line、Arrow、Dot、Circle、Rectangle、Square、Polygon、SurroundingRectangle、VGroup、NumberLine、axes.plot',
     '- 动作：Write、Create、FadeIn、FadeOut、Transform、ReplacementTransform、GrowArrow、Rotate、Indicate、.animate、VGroup.arrange、self.wait',
     '- 排版：self.play(..., run_time=1.2) 控制节奏；标题用 .to_edge(UP, buff=0.5)',
@@ -925,6 +978,15 @@ function buildVisualPrompt(scene, kind, style) {
       '字幕烧在画面最下沿，东西放低了就被字幕黑底压住。',
     `  最低的元素离画面底边至少 ${reserveUnits} 个单位：要贴底就写 .to_edge(DOWN, buff=${reserveUnits})，` +
       '不要用默认的 .to_edge(DOWN)（默认 buff=0.5 会进字幕带）。',
+    '',
+    '## 文字排版硬约束（字重/字号，必须照做）',
+    '- 中文字体一律 Text("…", font="Microsoft YaHei")：这是服务器上唯一有中文字形的字体，不写会出一排方框。',
+    '- **标题**：font_size ≥ 44，并且**必须写 weight=BOLD**。Microsoft YaHei 的常规字重笔画很细，',
+    '  投影到大屏、再经 ffmpeg 编码之后会糊成一片 —— 标题不加 weight=BOLD 就是不合格。',
+    '- **正文/标注**：font_size ≥ 32（任何文字都不要低于 28）；正文不要比标题还大。',
+    '- 写法示例：`title = Text("两点之间的度量", font="Microsoft YaHei", font_size=52, weight=BOLD).to_edge(UP)`；',
+    '  正文示例：`label = Text("斜率 = 2", font="Microsoft YaHei", font_size=36)`。',
+    '- 一屏里最多一个标题；标题 ≤14 字，长句拆成两行 Text 或用 VGroup 叠放，不要靠缩字号硬塞。',
     '',
     '## 三个必须避开的坑',
     '- **坐标轴不要 include_numbers=True**（刻度数字是 DecimalNumber，内部走 TeX，慢且容易失败）；要数字就用 Text 在轴旁手标',
@@ -1304,9 +1366,10 @@ async function planTwoStage(prompt, opts = {}) {
       s.kind = 'manim';
       // 主题模式写出来的分镜骨架通常没有 visual_hint（提示词里没要求给）。
       // 代码已经生成好了却让「画什么」空着，面板上就是"有 ✓、画什么一片空白" ——
-      // 所以这里回填一句可读摘要，同时把戳打成同一句，重跑时才不会判成代码过期。
+      // 所以这里回填一句可读摘要，再把「标题+描述+风格」算成 m2 戳：
+      // 之后只改标题，戳就对不上，这一场会被判成过期并重新生成。
       fillAutoHint(s, clean, `scene#${si}`);
-      s.manimHint = String(s.visual_hint || '');
+      s.manimHint = manimStampOf(s, style);
       visuals += 1;
       log(`scene#${si} manim 生成 ${(ms / 1000).toFixed(1)} 秒（并发 ${concurrency}）`);
     }
@@ -1388,45 +1451,48 @@ function clampSceneSeconds(value) {
  * 所以能直通的就直通，一个字段都不动。
  */
 /**
- * "画什么"的比较用归一化（只用于判断代码是否过期，不参与缓存键 ——
- * 缓存键由 lib/plan-cache.js 自己归一化，两边口径一致即可）。
+ * manim 代码戳的版本前缀。
+ *
+ * m2 = 「标题也算材料」的算法：sha1(hint | text | style | kind)。
+ * 升级前的戳只有一句「画什么」（m1），没法判断标题改没改过 —— 读到 m1 一律当过期，
+ * 重生成一次就带上了 m2，之后才判断得出来。这是有意的：宁可多花一次生成，
+ * 也不要继续播旧标题（用户实测的"改了不生效"）。
  */
-function hintNorm(value) {
-  return String(value == null ? '' : value).replace(/\s+/g, ' ').trim().toLowerCase();
+const MANIM_STAMP_PREFIX = 'm2:';
+
+/**
+ * 这一场 manim 代码的「内容戳」。
+ *
+ * 调的是规划缓存的**同一个** sceneKey：缓存决定"要不要重新问模型"，
+ * 戳决定"手上这份代码算不算当前标题/描述的"。两边算法必须逐字一致，
+ * 否则会出现"缓存说没变、戳说变了"，或者更糟 —— 两边都以为没变，成片还是旧标题。
+ */
+function manimStampOf(scene, style) {
+  return MANIM_STAMP_PREFIX + PlanCacheLib.sceneKey(sceneCodeMaterials(scene, 'manim', style));
 }
 
 /**
- * 这一场的 manim 代码是不是为**当前**的「画什么」生成的？
+ * 这一场的 manim 代码是不是为**当前**的「画什么 + 标题 + 风格」生成的？
  *
- * 代码生成时会把它依据的 visual_hint 记在**场景级 manimHint** 上（见 fillScenes /
- * stampManimHint）。戳放在场景级而不是 manim 对象里，是为了不污染画面缓存键：
+ * 代码生成时会把这一步的材料算成戳记在**场景级 manimHint** 上（见 fillScenes /
+ * planTwoStage）。戳放在场景级而不是 manim 对象里，是为了不污染画面缓存键：
  * sceneKey 会把 manim 整个序列化，戳塞进去会让老项目第一次重跑就全部重渲。
  *
- * 用户只改「画什么」时，面板会清掉代码；但历史配方、API 调用方、旧版本存档都可能
- * 带着"旧代码 + 新描述"过来 —— 这里必须再拦一道，否则改了描述却继续按上一次的画。
- *
- * 没有戳的旧数据返回 true：升级前的存档无法判断代码是按哪句描述生成的，
- * 保守沿用（重跑时 stampManimHint 会补上戳，之后就判断得出来了）。
+ * 返回 false 的含义是"代码过期，必须重新生成"：
+ *   - 用户改了「画什么」（提示词变了，代码还是旧的）；
+ *   - 用户改了标题（代码里的 Text("旧标题") 还是旧的）← 这条以前漏了，就是用户实测的 bug；
+ *   - 戳是升级前的旧格式/空串（无法判断，只能重生成一次）。
  */
-function manimHintMatches(scene) {
+function manimHintMatches(scene, style) {
   const manim = scene && scene.manim;
   if (!manim || typeof manim.code !== 'string' || !manim.code.trim()) return true;
   // scene.manimHint 是正式字段；manim.hint 只用于兼容短命的中间版本
   const stamp = scene && scene.manimHint != null
     ? scene.manimHint
     : (manim.hint != null ? manim.hint : null);
-  if (stamp == null) return true;
-  return hintNorm(stamp) === hintNorm(scene && scene.visual_hint);
-}
-
-/** 给已有的 manim 代码补一个「按这句画什么生成」的场景级戳（只补缺，不覆盖）。 */
-function stampManimHint(scene) {
-  if (!scene || !scene.manim || typeof scene.manim.code !== 'string' || !scene.manim.code.trim()) return scene;
-  if (scene.manimHint != null) return scene;
-  const fromOldBuild = scene.manim && scene.manim.hint != null ? String(scene.manim.hint) : null;
-  return Object.assign({}, scene, {
-    manimHint: fromOldBuild != null ? fromOldBuild : String(scene.visual_hint || ''),
-  });
+  if (stamp == null) return false;
+  if (!String(stamp).startsWith(MANIM_STAMP_PREFIX)) return false;
+  return String(stamp) === manimStampOf(scene, style);
 }
 
 // ------------------------------------------- 「画什么」回填（写稿模式的补丁）--
@@ -1519,8 +1585,9 @@ function fillAutoHint(scene, code, label) {
  * 空的，面板打开还是空白一片、重做也无从下手。这里只改**返回给调用方的视图**，
  * 不动磁盘上的存档 —— 用户真的改了 hint 才会写新值。
  *
- * 同时补场景级 manimHint 戳：否则调用方（面板）拿着"有 hint、有代码、没戳"的场次
- * 回来重做时，会被判成"代码是按别的描述生成的"而白白重新生成一次。
+ * 为什么不补 manimHint 戳：戳是 m2 哈希，必须由"生成这段代码时的标题/风格"算出来；
+ * 在读接口里凭空补一个，要么恒等于当前材料（于是把旧代码永久钉成"有效"），
+ * 要么恒不相等（每次都重生成）。缺戳就明说"代码可能过期"，让重做那一轮去重生成。
  */
 function withAutoHints(scenes) {
   // 调用方拿它串在"读不到这条"之后（rerun / 详情），空值必须原样透传，别变成 [] 掩盖 404
@@ -1535,23 +1602,22 @@ function withAutoHints(scenes) {
     if (String(s.visual_hint || '').trim()) return s;
     const next = Object.assign({}, s);
     if (!fillAutoHint(next, code, `scene#${i}`)) return s;
-    if (!String(next.manimHint == null ? '' : next.manimHint).trim()) next.manimHint = next.visual_hint;
     changed = true;
     return next;
   });
   return changed ? out : list;
 }
 
-function scenesLookFinal(list) {
+function scenesLookFinal(list, style) {
   const arr = Array.isArray(list) ? list : [];
   if (!arr.length) return false;
   return arr.every((s) => {
     if (!s || typeof s !== 'object') return false;
     const code = s.manim && typeof s.manim.code === 'string' && s.manim.code.trim();
     const video = s.video && typeof s.video.prompt === 'string' && s.video.prompt.trim();
-    // 代码在、但戳对不上当前「画什么」= 代码过期：不能走"直通"，要让 fillScenes
-    // 把这一场重新生成（其余场仍会原样沿用，不会全部重来）。
-    if (code && !manimHintMatches(s)) return false;
+    // 代码在、但戳对不上当前「画什么 + 标题 + 风格」= 代码过期：不能走"直通"，
+    // 要让 fillScenes 把这一场重新生成（其余场仍会原样沿用，不会全部重来）。
+    if (code && !manimHintMatches(s, style)) return false;
     if (code || video) return true;
     const kind = String(s.kind || '').toLowerCase();
     const tool = String(s.tool || '').toLowerCase();
@@ -1695,6 +1761,15 @@ async function fillScenes(inputScenes, opts = {}) {
   // 要发模型的（manim 代码 / aivideo 英文 prompt）排进 jobs，第二阶段并发跑。
   for (let i = 0; i < inputScenes.length; i++) {
     const src = inputScenes[i] || {};
+    // 表情：面板里手动选的表情必须带过去。这里以前是手写字段，stickers 被丢掉 ——
+    // 用户加完表情、点「补全动画」，表情就全没了，渲出来一个都没有。
+    // 现在走 project.js 的同一份白名单，并且**真的丢了要出声**：
+    // 这条日志是"分镜有表情、项目里没有"能定位到补全这一环的唯一证据。
+    const stickerNorm = P.normalizeStickers(src.stickers);
+    if (stickerNorm.dropped.length) {
+      log(`scene#${i} 表情丢弃 ${stickerNorm.dropped.length} 个：`
+        + stickerNorm.dropped.slice(0, 4).map((d) => `${d.id}（${d.reason}）`).join('、'));
+    }
     const base = {
       index: i,
       text: String(src.text || '').slice(0, 60),
@@ -1704,9 +1779,7 @@ async function fillScenes(inputScenes, opts = {}) {
       // 参考图：原引用先带着，prepareJob 会统一解析成绝对路径（attachSceneImages）
       image: src.image ? String(src.image).slice(0, 240) : '',
       imagePath: src.imagePath ? String(src.imagePath).slice(0, 320) : '',
-      // 表情：面板里手动选的表情必须带过去。这里以前是手写字段，stickers 被丢掉 ——
-      // 用户加完表情、点「补全动画」，表情就全没了，渲出来一个都没有。
-      stickers: P.normalizeScene(src).stickers,
+      stickers: stickerNorm.list,
       tool: String(src.tool || '').trim().toLowerCase(),
       kind: 'text',
       // 「画什么」是自动回填的（面板要据此提示）。只有沿用已有代码时才继承；
@@ -1727,7 +1800,7 @@ async function fillScenes(inputScenes, opts = {}) {
     // "画面能复用就复用" 直接失效；更糟的是模型可能把好代码写成坏代码。
     if (decided.tool === 'manim') {
       const given = src.manim && typeof src.manim.code === 'string' ? src.manim.code.trim() : '';
-      if (given && manimHintMatches(src)) {
+      if (given && manimHintMatches(src, style)) {
         base.kind = 'manim';
         base.manim = { code: given.slice(0, 8000), scene: (src.manim && src.manim.scene) || null };
         // 代码是沿用的：上一轮如果标过"这句 hint 是自动生成的"，标记继续有效。
@@ -1735,16 +1808,22 @@ async function fillScenes(inputScenes, opts = {}) {
         // 旧配方/旧项目里"有代码、没画什么"的场次：沿用代码的同时把 hint 补上，
         // 面板重做时才有内容可改（不补的话这张卡片永远是空的）。
         fillAutoHint(base, given, `scene#${i}`);
-        base.manimHint = String(base.visual_hint || '');
+        base.manimHint = manimStampOf(base, style);
         base.status = 'manim';
         manimCount += 1;
         scenes[i] = base;
+        // 明确记一条"没调用模型"：验收"只改标题 → 只有那一场重新生成"时，
+        // 其余场次这里各有一行沿用日志，缺那一场的就是被重生成的 —— 一目了然。
+        log(`scene#${i} 沿用已有 manim 代码（戳匹配 ${String(base.manimHint).slice(0, 6)}…，不调用模型）`);
         continue;
       }
       if (given) {
-        // 旧代码是按上一句「画什么」生成的：继续用就等于"改了也不生效"。
+        // 旧代码是按上一句「画什么」或**上一个标题**生成的：继续用就等于"改了也不生效"。
         // 丢掉它走下面的重新生成；其它场不受影响（各自判断各自的戳）。
-        log(`scene#${i} 「画什么」改过了（代码是按旧描述生成的），丢掉旧 manim 代码重新生成`);
+        // 日志里同时打旧戳和新戳的开头：验收时能直接看出"这一场是被判过期才重生成的"。
+        const oldStamp = String(src.manimHint == null || src.manimHint === '' ? '(空)' : src.manimHint);
+        log(`scene#${i} 代码是按旧标题/旧「画什么」生成的，丢掉旧 manim 代码重新生成`
+          + `（旧戳 ${oldStamp.slice(0, 10)}… → 新戳 ${manimStampOf(base, style).slice(0, 10)}…）`);
       }
     }
 
@@ -1898,7 +1977,9 @@ async function fillScenes(inputScenes, opts = {}) {
     // 写稿模式拆出来的场次没有「画什么」：代码生成成功后回填一句可读摘要，
     // 面板上这张卡片才有内容（用户也能在这句的基础上改，改了就重新生成这一段）。
     fillAutoHint(base, clean, `scene#${i}`);
-    base.manimHint = String(base.visual_hint || '');
+    // 戳 = sha1(画什么 | 标题 | 风格 | 引擎)，和场级缓存键同一个函数。
+    // 只改标题时这里算出来的戳会和存档里那份不同 —— 下次重做就知道该重新生成。
+    base.manimHint = manimStampOf(base, style);
     base.status = 'manim';
     manimCount += 1;
     scenes[i] = base;
@@ -1918,6 +1999,71 @@ async function fillScenes(inputScenes, opts = {}) {
     stats: { total: scenes.length, manim: manimCount, aivideo: aiVideoCount, text: textCount, fallback: fallbackCount, manimRatio: ratio },
     warnings,
   };
+}
+
+/**
+ * 把"代码过期"的场次重新生成（就地改 project.scenes，成功后落盘）。
+ *
+ * 什么时候会过期：用户改了标题 / 改了「画什么」，但项目里存的还是上一次那份 manim 代码。
+ * 面板改标题时**不会**清代码（只有改「画什么」才清），所以这条路必须由服务端兜住，
+ * 否则"重做"只是拿旧代码重渲一遍 —— 用户看到的就是"改了没生效"。
+ *
+ * 只碰 manim 场，且只碰戳对不上的那几场：
+ *   - 旁白改动不影响戳（旁白不进代码）→ 这一场只重渲/重配音，不花模型调用；
+ *   - 单场重新生成失败就保留旧代码并记一条日志（有画面总比整集失败强）。
+ */
+async function refreshStaleManimScenes(project, style, opts = {}) {
+  const list = Array.isArray(project && project.scenes) ? project.scenes : [];
+  const stale = [];
+  for (let i = 0; i < list.length; i++) {
+    const s = list[i];
+    const code = s && s.manim && typeof s.manim.code === 'string' ? s.manim.code.trim() : '';
+    if (!code) continue;
+    if (String(s.kind || '') === 'aivideo') continue;
+    if (manimHintMatches(s, style)) continue;
+    stale.push(i);
+  }
+  if (!stale.length) return { stale: [], regenerated: [], failed: [] };
+
+  log(`代码过期检查：${stale.length}/${list.length} 场的 manim 代码是按旧标题/旧「画什么」生成的`
+    + `（第 ${stale.map((i) => i + 1).join('、')} 场），重新生成这几场`);
+  const results = await mapLimit(stale, effectivePlanConcurrency(), async (i) => {
+    const r = await planSceneCode(list[i], 'manim', style, {
+      ...opts, sceneIndex: i, sessionId: 'studio-scene',
+    });
+    return r;
+  });
+
+  const regenerated = [];
+  const failed = [];
+  for (let k = 0; k < stale.length; k++) {
+    const i = stale[k];
+    const r = results[k] || { ok: false, error: 'WORKER_THROW' };
+    const manimObj = r.ok && r.json && r.json.manim && typeof r.json.manim === 'object' ? r.json.manim : null;
+    const raw = manimObj && typeof manimObj.code === 'string' ? manimObj.code.trim() : '';
+    const clean = raw ? stripMathDelims(raw) : '';
+    const bad = clean ? (Manim ? Manim.checkCode(clean) : 'manim 模块不可用') : 'EMPTY_CODE';
+    if (bad) {
+      failed.push({ index: i, error: String(r.error || bad) });
+      log(`scene#${i} 代码重新生成失败（${String(r.error || bad).slice(0, 120)}），沿用旧代码`);
+      continue;
+    }
+    const s = list[i];
+    s.manim = { code: clean.slice(0, 8000), scene: manimObj.scene || null };
+    s.kind = 'manim';
+    // 回填顺序和 fillScenes 一致：先补「画什么」（只在空的时候），再算戳 ——
+    // 否则戳是按旧 hint 算的，下次又会判成过期、无限重生成。
+    fillAutoHint(s, clean, `scene#${i}`);
+    s.manimHint = manimStampOf(s, style);
+    regenerated.push(i);
+    log(`scene#${i} 代码已按当前标题重新生成（${r.cacheHit ? '命中规划缓存' : '调用模型'}）`);
+  }
+  if (regenerated.length) {
+    try { P.saveProject(CFG.projectDir, project); } catch (err) {
+      log(`项目落盘失败（重新生成的代码本次仍会用，只是下次可能又判过期）：${(err && err.message) || err}`);
+    }
+  }
+  return { stale, regenerated, failed };
 }
 
 /**
@@ -2418,10 +2564,10 @@ function sceneEngines(s) {
  * 已经是目标规格且时长够就只复制，不多花一次编码。
  * Manim 模块缺失时（比如只装了 ffmpeg 的精简部署）退回到本地 ffmpeg 命令，别让 aivideo 白生成。
  */
-async function fitAiVideoClip({ inFile, work, index, seconds, w, h, fps }) {
+async function fitAiVideoClip({ inFile, work, index, seconds, w, h, fps, threads = 0 }) {
   const out = path.join(work, `wan-${index}-norm.mp4`);
   if (Manim && typeof Manim.normalizeClip === 'function') {
-    const norm = await Manim.normalizeClip({ ffmpeg: CFG.ffmpeg, inFile, outFile: out, w, h, fps, seconds });
+    const norm = await Manim.normalizeClip({ ffmpeg: CFG.ffmpeg, inFile, outFile: out, w, h, fps, seconds, threads });
     return norm && norm.ok
       ? { ok: true, file: norm.file, reencoded: Boolean(norm.reencoded) }
       : { ok: false, error: `WAN_NORMALIZE_FAILED: ${(norm && norm.error || '').slice(0, 200)}` };
@@ -2437,6 +2583,7 @@ async function fitAiVideoClip({ inFile, work, index, seconds, w, h, fps }) {
   const r = await R.run(CFG.ffmpeg, [
     '-hide_banner', '-loglevel', 'error', '-y', '-i', inFile,
     '-vf', vf, '-t', String(Number(seconds) || 5),
+    '-threads', String(Math.max(0, Math.floor(Number(threads) || 0))),
     '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', out,
   ], 180000);
   if (r.code !== 0 || !fs.existsSync(out)) {
@@ -2462,7 +2609,7 @@ function wanKeyInfo() {
  * 各引擎的"成功判据"不一样（manim 要 mp4、GDI/pyplot 要 png 再合成片段），
  * 所以统一在这里收口，renderProject 只关心"成没成"。
  */
-async function renderSceneEngine({ eng, s, index, style, work, renderQuality }) {
+async function renderSceneEngine({ eng, s, index, style, work, renderQuality, threads = 0 }) {
   const w = CFG.width;
   const h = CFG.height;
   const fps = CFG.fps;
@@ -2504,6 +2651,7 @@ async function renderSceneEngine({ eng, s, index, style, work, renderQuality }) 
       // 草稿档要的是"少画像素再放大"，不是"交出 540p 成片"。
       w, h, fps, renderW: qp.w, renderH: qp.h, ffmpeg: CFG.ffmpeg,
       timeoutBaseMs: CFG.manimTimeoutBaseMs, timeoutPerSecondMs: CFG.manimTimeoutPerSecondMs,
+      threads,
     });
     if (!mm.ok) {
       // UNSAFE_CODE / NO_LATEX 是策略性拒收，带上 detail 方便排查是哪一行
@@ -2511,6 +2659,10 @@ async function renderSceneEngine({ eng, s, index, style, work, renderQuality }) 
     }
     log(`scene#${index} manim 渲完 ${mm.ms}ms（质量档 ${qp.level}/${qp.quality} ${qp.w}x${qp.h}→${w}x${h}，${mm.reencoded ? '已统一到项目规格' : '原始规格'}）` +
       ` 风格=${styled.style.id} 换色=${styled.applied.colors} 背景=${styled.applied.background} 线宽=${styled.applied.stroke} 字体=${styled.applied.font}` +
+      // 文字兜底统计：Text 一共几处、补了几处 BOLD、抬了几处字号、补了几处中文字体。
+      // 用户嫌"字很细"时，先看这一行就知道是"模型没写"还是"兜底没生效"。
+      ` 文字=${mm.textEnhance ? mm.textEnhance.calls : 0}处(BOLD+${mm.textEnhance ? mm.textEnhance.bold : 0}` +
+      ` 字号+${mm.textEnhance ? mm.textEnhance.sized : 0} 中文字体+${mm.textEnhance ? mm.textEnhance.font : 0})` +
       `${mm.partialFreed ? ` 清缓存 ${Math.round(mm.partialFreed / 1048576)}MB` : ''}`);
     // anim/animBefore 带出去：字幕模块用它报"旁白/场/动画"三个数
     return { ok: true, file: mm.file, applied: styled.applied, anim: aligned.after, animBefore: aligned.before };
@@ -2553,7 +2705,7 @@ async function renderSceneEngine({ eng, s, index, style, work, renderQuality }) 
       return { ok: false, error: clip.error, taskId: clip.taskId, ms: clip.ms };
     }
     // 5/10 秒的产物对到本场秒数：短的克隆末帧补足、长的截断，规格统一到项目宽高
-    const norm = await fitAiVideoClip({ inFile: clip.file, work, index, seconds: s.seconds, w, h, fps });
+    const norm = await fitAiVideoClip({ inFile: clip.file, work, index, seconds: s.seconds, w, h, fps, threads });
     if (!norm.ok) return { ok: false, error: norm.error };
     log(`scene#${index} ai 画面完成 ${clip.ms}ms（task=${clip.taskId} ${clip.width}x${clip.height} ${clip.duration}s ${Math.round(clip.bytes / 1024)}KB${clip.firstFrame ? ' 首帧图已提交' : ''}）` +
       `${norm.reencoded ? ' → 已对齐项目规格' : ''}`);
@@ -2576,7 +2728,7 @@ async function renderSceneEngine({ eng, s, index, style, work, renderQuality }) 
     if (!stills || !stills.ok) return { ok: false, error: `GDI_FAILED: ${(stills && stills.error || '').slice(0, 200)}` };
     const slides = HTMLScene
       ? await HTMLScene.buildSlidesClip({ ffmpeg: CFG.ffmpeg, work, index, pngs: stills.pngs, seconds: s.seconds, fps, w, h })
-      : await R.concatClips({ ffmpeg: CFG.ffmpeg, clips: stills.pngs, out: path.join(work, `slides-${index}.mp4`) });
+      : await R.concatClips({ ffmpeg: CFG.ffmpeg, clips: stills.pngs, out: path.join(work, `slides-${index}.mp4`), threads });
     if (!slides || !slides.ok) return { ok: false, error: `STEP_CLIP_FAILED: ${(slides && slides.error || '').slice(0, 200)}` };
     return { ok: true, file: slides.file, steps: stills.pngs.length };
   }
@@ -2798,13 +2950,15 @@ async function repairManimScene({ scene, index, style, errorText, req }) {
  * 失败不致命：边框只是装饰，异常全部吞掉、返回原片段 —— 不能因为一次 ffmpeg 失败
  * 把整场画面丢掉。返回 { file, framed, ms }，file 是最终该进缓存的片段。
  */
-async function applySceneFrame({ clipFile, engine, scene, index, work }) {
+async function applySceneFrame({ clipFile, engine, scene, index, work, threads = 0 }) {
   if (!Frame || !clipFile) return { file: clipFile, framed: false, ms: 0 };
   try {
+    // 每场一个边框目录：场级并行时两场不会同时写同一张 border-*.png（半截 PNG 会让 overlay 失败）
+    const frameDir = path.join(work, `frame-${index}`);
     const r = await Frame.applyFrame({
       ffmpeg: CFG.ffmpeg,
       videoIn: clipFile,
-      out: path.join(work, `frame-${index}.mp4`),
+      out: path.join(frameDir, 'out.mp4'),
       frame: CFG.frame,
       engine,
       scene,
@@ -2812,6 +2966,7 @@ async function applySceneFrame({ clipFile, engine, scene, index, work }) {
       width: CFG.width,
       height: CFG.height,
       log: (msg) => log(`scene#${index} ${msg}`),
+      threads,
     });
     if (r && r.framed) {
       log(`scene#${index} 装饰边框 ${r.width}px ${String(r.color).toUpperCase()}`
@@ -2997,40 +3152,116 @@ async function renderProject(project, opts = {}, scope = 'auto') {
     // ---- 3) 画面片段：能复用就复用；不能复用就按引擎链自愈 ----
     // 边框配置签名：进缓存判定。改了颜色/宽度/内线/开关就要重渲，否则旧片段会一直用旧边框。
     const frameSig = Frame ? Frame.signature(CFG.frame) : '';
-    const clips = [];
     const timeline = [];      // [{ scene, index }] 真正进了成片的场次（跳过失败的场）
     let reused = 0;
     let rendered = 0;
     const totalScenes = finalPlan.scenes.length;
+
+    // 表情普查：**渲染入口**这一行是排查"表情去哪了"的第一现场。
+    // 分镜/项目里有、这里没有 → 丢在更上游（规划/补全/落盘），别在渲染段里找；
+    // 这里有、成片没有 → 才轮到下面的叠加分支说话。
+    const stickerCountOf = (list) => (Array.isArray(list) ? list : [])
+      .reduce((a, s) => a + (s && Array.isArray(s.stickers) ? s.stickers.length : 0), 0);
+    const stickerDetailOf = (list) => (Array.isArray(list) ? list : [])
+      .map((s, i) => `S${i}:${s && Array.isArray(s.stickers) ? s.stickers.length : 0}`).join(' ');
+    const planStickerTotal = stickerCountOf(finalPlan.scenes);
+    log(`render 入口：${totalScenes} 场，stickers 总数 ${planStickerTotal}（明细 ${stickerDetailOf(finalPlan.scenes) || '无'}）`);
+    // 规划前后对不上 = stickers 在"时长规划/节奏对齐"这一步被吃掉了（repadPlan 等纯函数）
+    const projectStickerTotal = stickerCountOf(project.scenes);
+    if (projectStickerTotal !== planStickerTotal) {
+      log(`render 入口警告：项目里 ${projectStickerTotal} 个表情，规划后只剩 ${planStickerTotal} 个 —— stickers 在时长规划这一步丢了`);
+    }
+    // 本集表情账本：叠加 / 跳过 / 复用（已带表情）各几场，收尾时一行报清楚
+    const stickerStat = { want: 0, applied: 0, skippedScenes: 0, reusedWithStickers: 0, retried: 0 };
+
+    // 3.0 缓存判定先单独跑一遍：命中的场直接复用，**不占并发名额**。
+    // slots 按原下标存结果；最后统一按分镜顺序取 clips —— 并发完成顺序是乱的，
+    // 按完成顺序拼会串场（第 5 场跑到第 2 场的位置）。
+    const slots = new Array(totalScenes).fill(null);
+    const pending = [];
+    let scenesDone = 0;
     for (let i = 0; i < finalPlan.scenes.length; i++) {
       abortCheck();
       const s = finalPlan.scenes[i];
       const key = P.sceneKey(s, sceneCfg);
       const hit = project.cache[key];
       const hasClip = hit && fs.existsSync(hit.clip);
-      // 上一轮表情没叠上（素材目录坏了/转码失败）就别复用那份"没表情"的片段：
-      // 修好之后重渲一次能补上，否则坏结果会被缓存永久钉住。
-      const wantsStickers = Array.isArray(s.stickers) && s.stickers.length > 0;
-      const retryStickers = Boolean(wantsStickers && hit && hit.stickersSkipped);
+      // 这一场想要几个表情（0 = 本来就不该有，不必重渲）
+      const wantStickers = Array.isArray(s.stickers) ? s.stickers.length : 0;
+      stickerStat.want += wantStickers;
+      const appliedInCache = hit ? Number(hit.stickersApplied) || 0 : 0;
+      // 什么情况下"缓存里的片段不能要，必须重渲这一场"：
+      //   1) 上一轮表情没叠上（stickersSkipped）—— 素材目录修好后要能自己补上；
+      //   2) 缓存条目是"表情叠加功能上线之前"写的（没有 stickersApplied 字段）——
+      //      那份片段根本没叠过表情，却也没标记跳过，以前就这么被无声复用了；
+      //   3) 条目里记着叠了 0 个、又没标"跳过"—— 说明那次渲染压根没走叠加分支。
+      // 不重渲的后果是这份"没表情"的片段被缓存永久钉住，表情再也回不来。
+      const stickerStaleReason = (!wantStickers || !hit) ? '' : (
+        hit.stickersSkipped ? '上次表情没叠上'
+          : (hit.stickersApplied == null ? '缓存是老格式、没有表情记录'
+            : (appliedInCache <= 0 ? '缓存里记着 0 个表情' : '')));
+      // scope=audio 的语义是"只重做声音"，不能为了补表情去重渲画面：只记一行提示。
+      const retryStickers = Boolean(stickerStaleReason) && scope !== 'audio';
+      const stickerOnlyInAudio = Boolean(stickerStaleReason) && scope === 'audio';
       // 边框配置变了（换色/改宽度/关掉）：这份片段的边框不是当前配置 → 重渲这一场。
       const frameStale = Frame
         ? Frame.cacheStale(hit, { frame: CFG.frame, sig: frameSig, engine: hit && hit.engine, scene: s })
         : false;
       const canReuse = scope !== 'all' && hasClip && !retryStickers && !frameStale;
-      if (retryStickers) log(`scene#${i} 上次表情没叠上，这次重渲这一场（其它场照旧复用）`);
+      if (retryStickers) {
+        stickerStat.retried += 1;
+        log(`scene#${i} ${stickerStaleReason}，这次重渲这一场补表情（其它场照旧复用）`);
+      }
+      if (stickerOnlyInAudio) log(`scene#${i} ${stickerStaleReason}，但本次是 scope=audio（只重做声音），画面不动；要补表情请用 scope=all`);
       if (frameStale) log(`scene#${i} 边框配置变了，重渲这一场（其它场照旧复用）`);
       if (canReuse) {
-        clips.push(hit.clip);
         // 复用片段时也要把"这一场动画多长"带回来：否则节奏表里动画/系数两列全是 0，
         // 重跑一次就看不出"压缩比有没有到 0.85"（大部分真实使用都是复用）。
         s.animSeconds = Number(hit.animSeconds) || 0;
-        timeline.push({ scene: s, index: i });
+        slots[i] = {
+          index: i,
+          scene: s,
+          clip: hit.clip,
+          sceneResult: { index: i, engine: String(hit.engine || 'cache'), status: 'ok', note: '复用缓存' },
+        };
         reused += 1;
-        sceneResults.push({ index: i, engine: String(hit.engine || 'cache'), status: 'ok', note: '复用缓存' });
-        report({ phase: 'scenes', current: i, done: i + 1, total: totalScenes, engine: 'cache', label: `第 ${i + 1}/${totalScenes} 场复用缓存` });
+        scenesDone += 1;
+        // 命中缓存的场不走叠加分支，不写这一行就等于"这一场的表情无声消失"。
+        if (wantStickers) {
+          stickerStat.reusedWithStickers += 1;
+          log(`scene#${i} 表情跳过（缓存复用，片段已叠 ${appliedInCache} 个${hit.stickersSkipped ? '、上次标记跳过' : ''}）`);
+        }
+        report({ phase: 'scenes', current: i, done: scenesDone, total: totalScenes, engine: 'cache', label: `第 ${i + 1}/${totalScenes} 场复用缓存` });
         continue;
       }
+      pending.push(i);
+    }
 
+    // 3.1 并发决策：config 可配 1/2，硬上限 2；可用内存低于阈值时本轮降级为串行。
+    const conc = effectiveRenderConcurrency();
+    log(conc.reason);
+    // 只有一场要渲时并发没有意义（limit=1，走和以前完全一样的串行路径）
+    const limit = pending.length > 1 ? conc.limit : 1;
+    // 单场编码线程：并行时每场 2 线程（给另一个 manim 留核），串行时 0（ffmpeg 自己吃满）
+    const sceneThreads = limit > 1 ? 2 : 0;
+    if (pending.length) {
+      log(`逐场编码线程：-threads ${sceneThreads}${limit > 1 ? '（每场 2 线程，给其它 manim 留核）' : '（串行，让 ffmpeg 吃满）'}`);
+    }
+
+    /**
+     * 渲一场：引擎链自愈 → 文字卡兜底 → 表情 → 边框 → 落缓存。
+     *
+     * 只写自己 index 的临时文件（manim 的 media-<i>/、frame-<i>/、ov-<i>.mp4…），
+     * 所以两场同时跑不会互相踩。project.cache 的写入是同步段，saveProject 也是
+     * 同步的临时文件+改名，两场同时落盘不会把项目 JSON 写坏。
+     *
+     * 返回 { index, scene, clip, sceneResult, ms }；clip=null 表示这场失败、不进成片。
+     */
+    const renderOneScene = async (i) => {
+      abortCheck();
+      const tScene = Date.now();
+      const s = finalPlan.scenes[i];
+      const key = P.sceneKey(s, sceneCfg);
       // 按"手里有什么素材"排引擎链（sceneEngines），逐个试，谁先成用谁。
       let chain = sceneEngines(s);
       // 成本护栏之外的场次不许再调生成接口：直接把它从链条里摘掉。
@@ -3041,7 +3272,7 @@ async function renderProject(project, opts = {}, scope = 'auto') {
       const firstEng = chain[0] || 'text';
       const originallyText = firstEng === 'text';
       report({
-        phase: 'scenes', current: i, done: i, total: totalScenes,
+        phase: 'scenes', current: i, done: scenesDone, total: totalScenes,
         engine: firstEng, label: `第 ${i + 1}/${totalScenes} 场 ${engineLabel(firstEng)} 渲染中…`,
       });
 
@@ -3055,7 +3286,7 @@ async function renderProject(project, opts = {}, scope = 'auto') {
         const next = chain[ci + 1] || 'text';
         let got = null;
         try {
-          got = await renderSceneEngine({ eng, s, index: i, style, work, renderQuality: qualityLevel });
+          got = await renderSceneEngine({ eng, s, index: i, style, work, renderQuality: qualityLevel, threads: sceneThreads });
         } catch (err) {
           got = { ok: false, error: String((err && err.message) || err) };
         }
@@ -3070,11 +3301,17 @@ async function renderProject(project, opts = {}, scope = 'auto') {
           if (fix.ok) {
             // finalPlan.scene 是副本，得同步回项目，否则下次渲染又拿旧代码
             s.manim = { code: fix.code, scene: fix.scene || (s.manim && s.manim.scene) || null };
-            if (project.scenes[i]) project.scenes[i].manim = s.manim;
+            // 修好的代码仍是"按当前标题/描述生成"的，戳要一起刷新 ——
+            // 否则下次重渲会把它判成过期，白跑一次重新生成。
+            s.manimHint = manimStampOf(s, style);
+            if (project.scenes[i]) {
+              project.scenes[i].manim = s.manim;
+              project.scenes[i].manimHint = s.manimHint;
+            }
             try { P.saveProject(CFG.projectDir, project); } catch { }
             log(`scene#${i} manim 修正代码已返回（${fix.code.length} 字符），重新渲染一次`);
             try {
-              got = await renderSceneEngine({ eng: 'manim', s, index: i, style, work, renderQuality: qualityLevel });
+              got = await renderSceneEngine({ eng: 'manim', s, index: i, style, work, renderQuality: qualityLevel, threads: sceneThreads });
             } catch (err) {
               got = { ok: false, error: String((err && err.message) || err) };
             }
@@ -3133,6 +3370,7 @@ async function renderProject(project, opts = {}, scope = 'auto') {
             edgeLead: Number(CFG.fade) || 0,
             // 淡到风格底色而不是黑：白板这类浅色风格淡到黑会变成一下黑屏闪烁
             edgeColor: pal.bg.c0,
+            threads: sceneThreads,
           });
           if (!clip.ok) throw new Error(`SCENE_CLIP_FAILED: ${(clip.error || '').slice(0, 200)}`);
           clipFile = clip.file;
@@ -3141,11 +3379,12 @@ async function renderProject(project, opts = {}, scope = 'auto') {
         } catch (err) {
           // 连文字卡都出不来（ffmpeg 挂了/磁盘满）：跳过这一场，保住其它场。
           const reason = String((err && err.message) || err).slice(0, 200);
-          sceneResults.push({ index: i, engine: 'none', status: 'failed', note: `画面生成失败：${reason}` });
           warnings.push(`第 ${i + 1} 场没有画面，已跳过：${reason}`);
           log(`scene#${i} 连文字卡都失败，跳过这一场：${reason}`);
-          report({ phase: 'scenes', current: i, done: i + 1, total: totalScenes, label: `第 ${i + 1}/${totalScenes} 场失败，已跳过` });
-          continue;
+          return {
+            index: i, scene: s, clip: null, ms: Date.now() - tScene,
+            sceneResult: { index: i, engine: 'none', status: 'failed', note: `画面生成失败：${reason}` },
+          };
         }
       }
 
@@ -3155,10 +3394,12 @@ async function renderProject(project, opts = {}, scope = 'auto') {
       let stickerApplied = 0;
       let stickerMs = 0;
       let stickerSkipped = false;
-      if (Array.isArray(s.stickers) && s.stickers.length) {
+      const wantedStickers = Array.isArray(s.stickers) ? s.stickers.length : 0;
+      if (wantedStickers) {
         if (!Overlay) {
           stickerSkipped = true;
-          log(`scene#${i} 表情叠加跳过：overlay 模块不可用（用原片段）`);
+          stickerStat.skippedScenes += 1;
+          log(`scene#${i} 跳过表情（stickers=${wantedStickers} 但 Overlay 未加载，用原片段）`);
         } else {
           const ovStarted = Date.now();
           try {
@@ -3169,11 +3410,13 @@ async function renderProject(project, opts = {}, scope = 'auto') {
               // 表情不许压进底部字幕带：按字幕样式算出的安全区高度传下去，
               // 超出就由 overlay 按实际尺寸往内推（y 会被夹小）
               bottomReserve: subtitleReservePx(),
+              threads: sceneThreads,
             });
             stickerMs = Date.now() - ovStarted;
             if (ov && ov.ok && ov.applied > 0) {
               clipFile = ov.file;
               stickerApplied = ov.applied;
+              stickerStat.applied += ov.applied;
               // 日志里带上"播完一轮 + 停末帧"的时长，排查"表情怎么还停在那儿"时一眼能看出来
               const detail = (ov.details || [])
                 .map((d) => `${d.id}@${d.at}s(${d.kind}${d.cached ? '/缓存' : ''},${d.transcodeMs || 0}ms,`
@@ -3186,6 +3429,7 @@ async function renderProject(project, opts = {}, scope = 'auto') {
               }
             } else {
               stickerSkipped = true;
+              stickerStat.skippedScenes += 1;
               // 失败原因要写全：常见的是 stickerDir 指错（文件不存在）或 GIF 转码失败，
               // 只说"跳过了"没法排查，所以把 overlay 的 skipped 明细也带上。
               const why = (Array.isArray(ov && ov.skipped) ? ov.skipped : [])
@@ -3196,13 +3440,18 @@ async function renderProject(project, opts = {}, scope = 'auto') {
           } catch (err) {
             stickerMs = Date.now() - ovStarted;
             stickerSkipped = true;
+            stickerStat.skippedScenes += 1;
             log(`scene#${i} 表情叠加异常：${String((err && err.message) || err).slice(0, 200)}（用原片段，不影响出片）`);
           }
         }
+      } else {
+        // 没有表情也要留一行：以前这里完全沉默，"这场为什么没表情"永远查不出来。
+        // 有它才能一眼分清"本来就 0 个"和"本该有、渲染时没了"。
+        log(`scene#${i} 跳过表情（stickers=0）`);
       }
 
       // 装饰边框（克莱因蓝）：贴边不内缩；AI 满幅画面与图片底不加。接线只这一处，实现见 lib/frame.js。
-      const frame = await applySceneFrame({ clipFile, engine, scene: s, index: i, work });
+      const frame = await applySceneFrame({ clipFile, engine, scene: s, index: i, work, threads: sceneThreads });
       clipFile = frame.file || clipFile;
 
       const dest = path.join(cdir, `clip-${key}.mp4`);
@@ -3228,18 +3477,75 @@ async function renderProject(project, opts = {}, scope = 'auto') {
       };
       // 每渲完一场就落盘：进程被杀时已完成的片段不会丢，重跑直接复用。
       try { P.saveProject(CFG.projectDir, project); } catch { }
-      clips.push(dest);
-      timeline.push({ scene: s, index: i });
       rendered += 1;
-      sceneResults.push({
-        index: i,
-        engine,
-        status: degraded ? 'degraded' : 'ok',
-        // 没降级时也把"加了几个表情"写上：任务卡上一眼能看出这场的表情生效了
-        note: note || (stickerApplied ? `表情 ${stickerApplied} 个` : ''),
-      });
       if (degraded && !note) warnings.push(`第 ${i + 1} 场降级为 ${engineLabel(engine)}`);
-      report({ phase: 'scenes', done: i + 1, total: totalScenes, engine, label: `第 ${i + 1}/${totalScenes} 场 ${engineLabel(engine)} 完成` });
+      return {
+        index: i,
+        scene: s,
+        clip: dest,
+        ms: Date.now() - tScene,
+        sceneResult: {
+          index: i,
+          engine,
+          status: degraded ? 'degraded' : 'ok',
+          // 没降级时也把"加了几个表情"写上：任务卡上一眼能看出这场的表情生效了
+          note: note || (stickerApplied ? `表情 ${stickerApplied} 个` : ''),
+        },
+      };
+    };
+
+    // 3.2 工作池：只对需要渲染的场并发；mapLimit 保证结果按原下标回填。
+    if (pending.length) {
+      const poolStarted = Date.now();
+      let longestMs = 0;
+      const done = await mapLimit(pending, limit, async (i) => {
+        let r;
+        try {
+          r = await renderOneScene(i);
+        } catch (err) {
+          // 单场异常只降级这一场（CANCELLED 在池外再用 abortCheck 抛出去）
+          const reason = String((err && err.message) || err).slice(0, 200);
+          r = {
+            index: i, scene: finalPlan.scenes[i], clip: null, ms: 0,
+            sceneResult: { index: i, engine: 'none', status: 'failed', note: `渲染异常：${reason}` },
+          };
+        }
+        longestMs = Math.max(longestMs, Number(r.ms) || 0);
+        scenesDone += 1;
+        const eng = (r.sceneResult && r.sceneResult.engine) || 'none';
+        report({
+          phase: 'scenes', current: i, done: scenesDone, total: totalScenes, engine: r.sceneResult ? r.sceneResult.engine : '',
+          label: r.clip
+            ? `第 ${i + 1}/${totalScenes} 场 ${engineLabel(eng)} 完成`
+            : `第 ${i + 1}/${totalScenes} 场失败，已跳过`,
+        });
+        return r;
+      });
+      for (const r of done) if (r) slots[r.index] = r;
+      const wallMs = Date.now() - poolStarted;
+      // 验收看的数字：并发 N 场一共花了多少墙钟、最慢那一场多少秒。
+      log(`渲染 ${pending.length} 场（并发 ${limit}）完成：总 ${(wallMs / 1000).toFixed(1)} 秒，最长 ${(longestMs / 1000).toFixed(1)} 秒`);
+    }
+    // 取消是在场次边界生效的：池里正在跑的那一场跑完，剩下的不再开新场。
+    abortCheck();
+
+    // 3.3 按分镜顺序组装：完成顺序 ≠ 分镜顺序，clips/timeline/sceneResults 一律按 index 取。
+    const clips = [];
+    for (let i = 0; i < totalScenes; i++) {
+      const r = slots[i];
+      if (!r) continue;
+      if (r.sceneResult) sceneResults.push(r.sceneResult);
+      if (!r.clip) continue;
+      clips.push(r.clip);
+      timeline.push({ scene: r.scene, index: i });
+    }
+
+    // 表情账本收尾：本集"想要几个 / 真叠了几个 / 几场复用 / 几场跳过"一次说清。
+    // 这条和入口那条一起看，就能判断表情是在"入口之前"还是"叠加这一步"丢的。
+    if (stickerStat.want || stickerStat.applied || stickerStat.retried) {
+      log(`表情汇总：本集计划 ${stickerStat.want} 个，叠加 ${stickerStat.applied} 个，`
+        + `复用已带表情 ${stickerStat.reusedWithStickers} 场，跳过 ${stickerStat.skippedScenes} 场`
+        + (stickerStat.retried ? `，为补表情重渲 ${stickerStat.retried} 场` : ''));
     }
 
     // 一场都没成功：这才是真的没法出片（正常情况下文字卡永远成功）。
@@ -3277,7 +3583,7 @@ async function renderProject(project, opts = {}, scope = 'auto') {
       log(`复用拼接结果 ${path.basename(joined)}`);
     } else {
       joined = path.join(cdir, `joined-${joinedKey}.mp4`);
-      const cat = await R.concatClips({ ffmpeg: CFG.ffmpeg, clips, durations, out: joined, fade: CFG.fade });
+      const cat = await R.concatClips({ ffmpeg: CFG.ffmpeg, clips, durations, out: joined, fade: CFG.fade, threads: 0 });
       if (!cat.ok) return { ok: false, error: `CONCAT_FAILED: ${(cat.error || '').slice(0, 300)}`, scenes: sceneResults, warnings, ms: Date.now() - started, voice: { wanted: narrationWanted, failed: voiceFailed } };
       project.joined = { key: joinedKey, file: joined, at: new Date().toISOString() };
     }
@@ -3309,6 +3615,8 @@ async function renderProject(project, opts = {}, scope = 'auto') {
       ? await Subtitles.finish({
         project, timeline, speeches, fade: CFG.fade, cfg: CFG,
         joined, cdir, style, log,
+        // 字幕烧制是全场一次，串行阶段：-threads 0 让 ffmpeg 吃满
+        threads: 0,
         renderQualityLabel: Rhythm
           ? Rhythm.qualityPlan({ renderQuality: CFG.renderQuality, manimQuality: CFG.manimQuality, w: CFG.width, h: CFG.height, fps: CFG.fps }).level
           : '',
@@ -3332,7 +3640,7 @@ async function renderProject(project, opts = {}, scope = 'auto') {
     report({ phase: 'mix', label: '正在混音' });
     const mixed = await R.mixAudio({
       ffmpeg: CFG.ffmpeg, videoIn: (subRes && subRes.videoIn) || joined, narrations,
-      bgm: pickBgm(opts.bgm || project.bgm), totalSeconds, out: outFile,
+      bgm: pickBgm(opts.bgm || project.bgm), totalSeconds, out: outFile, threads: 0,
     });
     if (!mixed.ok) {
       return { ok: false, error: `AUDIO_FAILED: ${(mixed.error || '').slice(0, 300)}`, scenes: sceneResults, warnings, ms: Date.now() - started, voice: { wanted: narrationWanted, failed: voiceFailed } };
@@ -3919,7 +4227,7 @@ async function prepareJob(job) {
   } else if (fromScenes) {
     // 分镜模式：把每一场补成能渲染的场景。已经补全过的（重跑配方）直接直通，
     // 一个字段都不动 —— 连 seconds 都不重夹，缓存键才不会变。
-    if (scenesLookFinal(body.scenes)) {
+    if (scenesLookFinal(body.scenes, styleObj)) {
       scenes = body.scenes;
       jobLog(job, '分镜已带渲染素材（manim 代码/AI prompt/文字卡），直接使用，不调用模型');
     } else {
@@ -3964,12 +4272,27 @@ async function prepareJob(job) {
 
   if (!Array.isArray(scenes) || !scenes.length) throw jobError('NO_SCENES', '没有分镜');
 
+  // 项目重跑（/v1/project/render，以及 /v1/project/patch 之后的重渲）：项目里带的是
+  // **上一次生成的那份代码**。面板改标题时只改 text、代码原样带回来 —— 少了这一步，
+  // 成片里写的还是旧标题（用户实测的"改了却没生效"）。只重生成戳对不上的那几场。
+  // scope=audio 只重做声音，不该顺手把代码全换一遍（那会连带重渲画面）。
+  if (reuseId && !fromScenes && project && job.scope !== 'audio') {
+    await refreshStaleManimScenes(project, styleObj, { req, fresh, maxAiVideo: job.maxAiVideo });
+  }
+
   // 参考图：解析成 uploads 下的绝对路径。浅拷贝一份再改，保证 library 里的 request
   // 与用户提交的一字不差（图片引用还是原来的 uploadId）。
-  // 顺便给每一场的 manim 代码补「按哪句画什么生成」的戳（旧存档没有，补一次之后
-  // 就能判断"改了描述要不要重生成"；已有戳的不覆盖）。
-  scenes = scenes.map((s) => stampManimHint(Object.assign({}, s)));
+  // 注意这里**不再**给缺戳的场次补戳：戳必须是"生成这段代码时的标题/风格"算出来的，
+  // 事后补一个假的等于把过期代码钉成"有效"。缺戳一律当过期（见 manimHintMatches）。
+  scenes = scenes.map((s) => Object.assign({}, s));
   attachSceneImages(scenes, warnings);
+  // 落盘前普查一次表情：项目 JSON 里没有表情，渲染段再怎么修也修不出来。
+  // 这一行和 renderProject 入口那一行对得上，才能断定表情"丢在落盘之前还是之后"。
+  {
+    const detail = scenes.map((s, i) => `S${i}:${Array.isArray(s && s.stickers) ? s.stickers.length : 0}`).join(' ');
+    const total = scenes.reduce((a, s) => a + (Array.isArray(s && s.stickers) ? s.stickers.length : 0), 0);
+    log(`分镜落盘：${scenes.length} 场，stickers 总数 ${total}（明细 ${detail || '无'}）`);
+  }
 
   if (fromScenes || !reuseId) {
     // 新建或更新同一个项目。重跑时给同一个 projectId，片段缓存/旁白缓存全部复用，
@@ -4830,6 +5153,8 @@ module.exports = {
   resolveSceneImage, attachSceneImages, ensureManimImage, imageAsDataUrl,
   // 规划缓存：实例（统计/清空/测试里改目录）+ 两层键与单场包装
   planCache, PlanCacheLib, styleCacheKey, sceneCacheText, sceneCacheable, planSceneCode,
+  // 代码戳：sha1(画什么 | 标题 | 风格 | 引擎)，和场级缓存键同一个函数（单测直接调）
+  sceneCodeMaterials, manimStampOf, manimHintMatches, refreshStaleManimScenes, MANIM_STAMP_PREFIX,
   // 主题模式的完整规划（骨架 + 逐场），测试脚本直接调，不必起服务
   planTwoStage,
 };

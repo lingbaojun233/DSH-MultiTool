@@ -801,7 +801,7 @@ function forceStyle(style, videoH) {
  *
  * 输出统一重编码（libx264 veryfast / crf 20）：字幕是烧在像素里的，不重编码没法出画面。
  */
-async function burn({ ffmpeg, videoIn, srt, out, videoH, style, timeoutMs, log }) {
+async function burn({ ffmpeg, videoIn, srt, out, videoH, style, timeoutMs, log, threads = 0 }) {
   const work = path.dirname(out);
   const localSrt = path.join(work, 'subs.srt');
   try {
@@ -816,6 +816,8 @@ async function burn({ ffmpeg, videoIn, srt, out, videoH, style, timeoutMs, log }
     '-hide_banner', '-loglevel', 'error', '-y',
     '-i', videoIn,
     '-vf', vf,
+    // 字幕烧制是全场一次：串行阶段，-threads 0 让 ffmpeg 吃满
+    '-threads', String(Math.max(0, Math.floor(Number(threads) || 0))),
     '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
     '-an', out,
   ], timeoutMs || 600000);
@@ -841,7 +843,7 @@ function srtPathFor(cfg, renderId) {
  *   字幕关掉 / 没有任何旁白时 videoIn 为 null，调用方沿用原来的 joined。
  */
 async function finish({
-  project, timeline, speeches, fade, cfg, joined, cdir, style, log, renderQualityLabel,
+  project, timeline, speeches, fade, cfg, joined, cdir, style, log, renderQualityLabel, threads = 0,
 }) {
   const C = cfg || {};
   const resolved = resolveStyle({ project, style, cfg: C });
@@ -867,7 +869,7 @@ async function finish({
   } else {
     const r = await burn({
       ffmpeg: C.ffmpeg, videoIn: joined, srt: built.srt, out: burned,
-      videoH: C.height, style: resolved.style, timeoutMs: C.renderTimeoutMs, log,
+      videoH: C.height, style: resolved.style, timeoutMs: C.renderTimeoutMs, log, threads,
     });
     burnMs = r.ms || 0;
     if (!r.ok) {

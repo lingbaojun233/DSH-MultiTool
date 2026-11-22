@@ -21,6 +21,15 @@ const MOTIONS = new Set(['zoom-in', 'zoom-out', 'pan-left', 'pan-right']);
 const DEFAULT_MOTION = 'zoom-in';
 
 /**
+ * ffmpeg 编码线程数（显式传给每次编码）：
+ *   0 = 让 ffmpeg 自己按核数决定（串行渲染时用，吃满 4 核）
+ *   2 = 场级并行时每场只给 2 线程，剩下的核留给同时跑的 manim
+ */
+function threadArg(threads) {
+  return String(Math.max(0, Math.floor(Number(threads) || 0)));
+}
+
+/**
  * 静帧超采样倍数。文字画在 2 倍画布上，再交给 zoompan 缩到 1080p：
  * 一是运镜裁切时文字边缘不会糊，二是 zoompan 的 x/y 只取整数像素，
  * 在 2 倍画布上算等于输出半个像素的步进，推拉时不会有明显的"一卡一卡"。
@@ -297,7 +306,7 @@ function getStillMotion() {
  * 取整结果会在两个像素之间跳，解码出来就是整幅画在轻微抖动。
  * 不加 zoom 就没有裁切窗口，也就没有取整，帧帧完全一致。
  */
-async function staticClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, edgeFade = 0, edgeLead = 0, edgeColor = null }) {
+async function staticClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, edgeFade = 0, edgeLead = 0, edgeColor = null, threads = 0 }) {
   const out = path.join(work, `clip-${index}.mp4`);
   const frames = Math.max(1, Math.round(seconds * fps));
   // 静帧可能来自 2 倍超采样画布（imageStill）或原始分辨率（gradientStill），统一缩到项目规格
@@ -331,6 +340,7 @@ async function staticClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, e
     '-t', String(seconds),
     '-r', String(fps),
     '-frames:v', String(frames),
+    '-threads', threadArg(threads),
     '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
     out,
   ];
@@ -339,7 +349,7 @@ async function staticClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, e
 }
 
 /** 原慢推路径（老行为，只作对照）：没图的场次也照这个推 */
-async function legacyClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps }) {
+async function legacyClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, threads = 0 }) {
   const out = path.join(work, `clip-${index}.mp4`);
   const frames = Math.max(1, Math.round(seconds * fps));
   // zoompan 的 d 是"每帧持续多少帧"，配合 zoom 表达式做缓慢放大
@@ -355,6 +365,7 @@ async function legacyClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps })
     '-vf', vf,
     '-t', String(seconds),
     '-r', String(fps),
+    '-threads', threadArg(threads),
     '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
     out,
   ], 300000);
@@ -395,7 +406,7 @@ function motionExprs(motion, frames, maxZoom) {
  * x/y 用 (iw-iw/zoom) 这类表达式：zoompan 的坐标是"裁切窗口左上角"，
  * 除以 2 就是居中；平移时让它从 0 线性走到 (iw-iw/zoom)。
  */
-async function imageClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, motion }) {
+async function imageClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, motion, threads = 0 }) {
   const out = path.join(work, `clip-${index}.mp4`);
   const frames = Math.max(1, Math.round(seconds * fps));
   const maxZoom = 1.12;
@@ -414,6 +425,7 @@ async function imageClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, mo
     '-vf', vf,
     '-frames:v', String(frames),
     '-r', String(fps),
+    '-threads', threadArg(threads),
     '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
     out,
   ], 300000);
@@ -428,7 +440,7 @@ async function imageClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, mo
  * 4 个输入像素平均得到，那半个像素的跳变被重采样抹平，看起来就不抖了。
  * 代价是一次 4K 编码，比原速法慢约 1 倍。
  */
-async function supersampleClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, motion }) {
+async function supersampleClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, motion, threads = 0 }) {
   const out = path.join(work, `clip-${index}.mp4`);
   const frames = Math.max(1, Math.round(seconds * fps));
   const W = w * SUPERSAMPLE;
@@ -456,6 +468,7 @@ async function supersampleClip({ ffmpeg, work, index, stillPng, seconds, w, h, f
     '-vf', vf,
     '-frames:v', String(frames),
     '-r', String(fps),
+    '-threads', threadArg(threads),
     '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
     out,
   ], 300000);
@@ -474,9 +487,9 @@ async function supersampleClip({ ffmpeg, work, index, stillPng, seconds, w, h, f
  * edgeLead：转场重叠时长（xfade 的 fade）；淡化会跨过它的中点，避免两个标题重影。
  * edgeColor：淡化到哪种颜色（默认黑；文字卡传风格底色，浅色风格才不会闪黑）。
  */
-async function sceneClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, motion = null, edgeFade = 0, edgeLead = 0, edgeColor = null }) {
+async function sceneClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, motion = null, edgeFade = 0, edgeLead = 0, edgeColor = null, threads = 0 }) {
   if (stillMode === 'none') {
-    return staticClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, edgeFade, edgeLead, edgeColor });
+    return staticClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, edgeFade, edgeLead, edgeColor, threads });
   }
 
   const meta = readStillMeta(work, index);
@@ -484,16 +497,16 @@ async function sceneClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, mo
   const m = motion || (meta && meta.motion) || DEFAULT_MOTION;
 
   if (stillMode === 'supersample') {
-    return supersampleClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, motion: m });
+    return supersampleClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, motion: m, threads });
   }
   if (!hasImage) {
-    return legacyClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps });
+    return legacyClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, threads });
   }
-  return imageClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, motion: m });
+  return imageClip({ ffmpeg, work, index, stillPng, seconds, w, h, fps, motion: m, threads });
 }
 
 /** 多个片段 xfade 串联。ffmpeg 的 xfade 只能两两接，所以要链式叠。 */
-async function concatClips({ ffmpeg, clips, durations, out, fade = 0.4 }) {
+async function concatClips({ ffmpeg, clips, durations, out, fade = 0.4, threads = 0 }) {
   if (clips.length === 1) {
     fs.copyFileSync(clips[0], out);
     return { ok: true, file: out };
@@ -511,6 +524,8 @@ async function concatClips({ ffmpeg, clips, durations, out, fade = 0.4 }) {
     acc = label;
   }
   args.push('-filter_complex', parts.join(';'), '-map', '[vout]');
+  // 拼接是全场一次：串行阶段，显式 -threads 0 让 ffmpeg 按核数吃满
+  args.push('-threads', threadArg(threads));
   args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', out);
   const r = await run(ffmpeg, args, 600000);
   return { ok: r.code === 0 && fs.existsSync(out), file: out, error: r.stderr };
@@ -521,7 +536,7 @@ async function concatClips({ ffmpeg, clips, durations, out, fade = 0.4 }) {
  * narrations: [{ file, at }]（at = 该句在成片里的起始秒）
  * bgm: 可选音频文件，循环并压到很低。
  */
-async function mixAudio({ ffmpeg, videoIn, narrations, bgm, totalSeconds, out }) {
+async function mixAudio({ ffmpeg, videoIn, narrations, bgm, totalSeconds, out, threads = 0 }) {
   const inputs = ['-i', videoIn];
   const filters = [];
   const mixLabels = [];
@@ -548,7 +563,7 @@ async function mixAudio({ ffmpeg, videoIn, narrations, bgm, totalSeconds, out })
   if (!mixLabels.length) {
     // 没声音：照样统一编码一遍，保证输出格式一致
     const r = await run(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y', ...inputs,
-      '-c:v', 'copy', '-t', String(totalSeconds), out], 300000);
+      '-threads', threadArg(threads), '-c:v', 'copy', '-t', String(totalSeconds), out], 300000);
     return { ok: r.code === 0 && fs.existsSync(out), file: out, error: r.stderr };
   }
 
@@ -561,6 +576,7 @@ async function mixAudio({ ffmpeg, videoIn, narrations, bgm, totalSeconds, out })
   const args = ['-hide_banner', '-loglevel', 'error', '-y', ...inputs,
     '-filter_complex', filters.join(';'),
     '-map', '0:v', '-map', '[aout]',
+    '-threads', threadArg(threads),
     '-c:v', 'copy', '-c:a', 'aac', '-b:a', '160k',
     // 不用 -shortest：音轨已经 apad 到片尾，再用 -shortest 只会让"音轨短"变成"成片短"。
     // 时长统一由 -t 控制。

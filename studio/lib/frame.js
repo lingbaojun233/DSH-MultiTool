@@ -162,7 +162,7 @@ async function ensureBorderPng({ ffmpeg, dir, frame, width, height, timeoutMs = 
  *
  * 失败不抛异常：边框只是装饰，宁可无框出片，也不能因为一次 ffmpeg 失败丢掉整场画面。
  */
-async function applyFrame({ ffmpeg, videoIn, out, frame, engine, scene, fps, width, height, timeoutMs = 120000, log }) {
+async function applyFrame({ ffmpeg, videoIn, out, frame, engine, scene, fps, width, height, timeoutMs = 120000, log, threads = 0 }) {
   const say = typeof log === 'function' ? log : () => { };
   const f = normalize(frame);
   const d = decide(f, { engine, scene });
@@ -185,7 +185,9 @@ async function applyFrame({ ffmpeg, videoIn, out, frame, engine, scene, fps, wid
   // 先试 PNG + overlay（每帧只叠一次，最省）；生成失败就退回逐帧 drawbox（慢，但一定有框）
   const png = await ensureBorderPng({ ffmpeg, dir: path.dirname(path.resolve(out)), frame: f, width, height, timeoutMs });
   const base = ['-hide_banner', '-loglevel', 'error', '-y', '-i', videoIn];
-  const enc = ['-an', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p'];
+  // 边框 overlay 也是一次 libx264 编码：场级并行时只给 2 线程，串行时 0=吃满
+  const enc = ['-an', '-threads', String(Math.max(0, Math.floor(Number(threads) || 0))),
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p'];
   if (Number(fps) > 0) enc.push('-r', String(Number(fps)));
   const args = png.ok
     ? [...base, '-i', png.file, '-filter_complex', '[0:v][1:v]overlay=0:0[v]', '-map', '[v]', ...enc, out]

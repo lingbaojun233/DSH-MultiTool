@@ -88,6 +88,161 @@ function guessSceneName(code) {
   return m ? m[1] : null;
 }
 
+// ------------------------------------------------ 文字字重/字号兜底（确定性） --
+
+/**
+ * 为什么要在渲染前改模型写的代码：
+ *   manim 的 `Text` 默认字重是 NORMAL，字号默认 48。模型很爱写 `Text("标题", font_size=32)`
+ *   —— 32 号 + 常规字重，投到大屏、再经 ffmpeg 编码，笔画就糊成一条灰线（用户实测
+ *   "第一分镜字很细"）。提示词里写死约束只能降低概率，不能保证；这里做一次**确定性**改写：
+ *   - 标题类（后面链着 .to_edge(UP) / .to_corner(UL|UR)，或 font_size ≥ 40）：
+ *     没有 weight= 就补 `weight=BOLD`；字号 < 44 抬到 44。
+ *   - 所有 Text：font_size < 28 抬到 28（再小就真的看不清了）。
+ *   - 中文文本没写 font= 时补 font="Microsoft YaHei"（否则 fallback 字体没有中文字形，出方框）。
+ *
+ * 边界（宁可少改，不可改坏）：
+ *   - 已经有 weight= 的一律不动 —— 模型显式写了 NORMAL 就尊重它；
+ *   - 只认 Text / MarkupText，**绝不碰 MathTex**（LaTeX 的字重由数学字体决定，改了就乱套）；
+ *   - 括号配对用逐字符扫描（跳过字符串与 # 注释），不靠正则硬套 —— 多行调用、字符串里带
+ *     逗号/括号都能正确切开。
+ */
+const ENHANCE_TEXT_RE = /\b(Text|MarkupText)\s*\(/g;
+const CJK_RE = /[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]/;
+const ENHANCE_TITLE_MIN = 44;
+const ENHANCE_BODY_MIN = 28;
+
+/** 从 openIdx（指向 '(' 的下标）开始找配对的 ')'；跳过字符串字面量与 # 注释。找不到返回 -1。 */
+function findCallEnd(src, openIdx) {
+  let depth = 0;
+  let quote = '';
+  for (let i = openIdx; i < src.length; i++) {
+    const ch = src[i];
+    if (quote) {
+      if (ch === '\\') { i += 1; continue; }
+      if (ch === quote) quote = '';
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === '#') {
+      const nl = src.indexOf('\n', i);
+      if (nl < 0) return -1;
+      i = nl;
+      continue;
+    }
+    if (ch === '(') depth += 1;
+    else if (ch === ')') {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/** 把一段参数列表按顶层逗号切开（字符串/括号里的逗号不算）。 */
+function splitTopArgs(args) {
+  const parts = [];
+  let depth = 0;
+  let quote = '';
+  let cur = '';
+  for (let i = 0; i < args.length; i++) {
+    const ch = args[i];
+    if (quote) {
+      cur += ch;
+      if (ch === '\\') { cur += args[i + 1] || ''; i += 1; continue; }
+      if (ch === quote) quote = '';
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; cur += ch; continue; }
+    if (ch === '(' || ch === '[' || ch === '{') depth += 1;
+    else if (ch === ')' || ch === ']' || ch === '}') depth -= 1;
+    if (ch === ',' && depth === 0) { parts.push(cur); cur = ''; continue; }
+    cur += ch;
+  }
+  if (cur.trim()) parts.push(cur);
+  return parts;
+}
+
+/** 调用后面的链式方法里有没有"贴到顶部"—— 有就是标题。 */
+function looksLikeTitleChain(chain) {
+  return /\.\s*(?:to_edge|to_corner|move_to|align_to|next_to)\s*\(\s*(?:UP|UL|UR)\b/.test(String(chain || ''));
+}
+
+/**
+ * 改写一段 Text(...) 的参数，返回 { args, bold, sized, font }（都是"改了几处"的计数）。
+ * 所有改动都是追加关键字参数或替换 font_size 的数字，不改动原有参数顺序。
+ */
+function enhanceTextArgs(args, chain) {
+  const parts = splitTopArgs(args);
+  const out = { args, bold: 0, sized: 0, font: 0 };
+  if (!parts.length) return out;
+  let hasWeight = false;
+  let hasFont = false;
+  let sizeIdx = -1;
+  let fontSize = null;
+  let firstString = '';
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i];
+    if (/^\s*weight\s*=/.test(p)) hasWeight = true;
+    if (/^\s*font\s*=/.test(p)) hasFont = true;
+    const fm = p.match(/^\s*font_size\s*=\s*(-?\d+(?:\.\d+)?)\s*$/);
+    if (fm) { sizeIdx = i; fontSize = Number(fm[1]); }
+    if (!firstString) {
+      const sm = p.match(/^\s*[rRbBfFuU]{0,2}("([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)')/);
+      if (sm) firstString = String(sm[2] != null ? sm[2] : sm[3]);
+    }
+  }
+  // 标题判定：字号 ≥40 或链式贴顶部。字号 ≥40 已经接近 manim 默认 48，基本只会是标题。
+  const titleLike = (fontSize != null && fontSize >= 40) || looksLikeTitleChain(chain);
+
+  if (sizeIdx >= 0) {
+    const want = titleLike ? Math.max(ENHANCE_TITLE_MIN, fontSize) : Math.max(ENHANCE_BODY_MIN, fontSize);
+    if (want !== fontSize) {
+      // 用原参数的缩进风格替换数字，保留 `font_size = 44` 这种写法
+      parts[sizeIdx] = parts[sizeIdx].replace(/(-?\d+(?:\.\d+)?)/, String(want));
+      out.sized = 1;
+    }
+  }
+  if (!hasWeight && titleLike) { parts.push(' weight=BOLD'); out.bold = 1; }
+  if (!hasFont && CJK_RE.test(firstString)) { parts.push(' font="Microsoft YaHei"'); out.font = 1; }
+
+  if (out.bold || out.sized || out.font) out.args = parts.join(',');
+  return out;
+}
+
+/**
+ * 对整段 manim 脚本做一次字重/字号兜底。返回 { code, stats }。
+ * stats = { calls, bold, sized, font, minSize }，用于渲染日志里报"改写了几处"。
+ */
+function enhanceTextStyle(code) {
+  const src = String(code == null ? '' : code);
+  const stats = { calls: 0, bold: 0, sized: 0, font: 0, minSize: 0 };
+  let out = '';
+  let cursor = 0;
+  ENHANCE_TEXT_RE.lastIndex = 0;
+  let m;
+  while ((m = ENHANCE_TEXT_RE.exec(src))) {
+    const open = m.index + m[0].length - 1;
+    const close = findCallEnd(src, open);
+    if (close < 0) break; // 括号不配对：剩下的原样保留，不冒险改
+    const args = src.slice(open + 1, close);
+    const chain = src.slice(close + 1, close + 160);
+    const fixed = enhanceTextArgs(args, chain);
+    out += src.slice(cursor, open + 1) + fixed.args;
+    cursor = close;
+    ENHANCE_TEXT_RE.lastIndex = close + 1;
+    stats.calls += 1;
+    stats.bold += fixed.bold;
+    stats.sized += fixed.sized;
+    stats.font += fixed.font;
+    if (fixed.sized) {
+      const fm = fixed.args.match(/font_size\s*=\s*(-?\d+(?:\.\d+)?)/);
+      if (fm) stats.minSize = stats.minSize ? Math.min(stats.minSize, Number(fm[1])) : Number(fm[1]);
+    }
+  }
+  out += src.slice(cursor);
+  return { code: out, stats };
+}
+
 /** 跑一个子进程并把 stdout/stderr 收起来（和 render.js 里的 run 同形，但不跨模块引依赖） */
 function run(cmd, args, timeoutMs, opts = {}) {
   return new Promise((resolve) => {
@@ -135,8 +290,8 @@ function run(cmd, args, timeoutMs, opts = {}) {
  * manim 的目录名就会跟着变成 `1080p30` 之类，写死必然在某个版本上失效。
  * 所以先按约定路径试一遍，再在 media 目录里按修改时间找最新的 out.mp4。
  */
-function findOutput(work, stem) {
-  const base = path.join(work, 'media', 'videos', stem);
+function findOutput(mediaRoot, stem) {
+  const base = path.join(mediaRoot, 'videos', stem);
   const tried = [];
   try {
     for (const q of fs.readdirSync(base)) {
@@ -162,13 +317,18 @@ function findOutput(work, stem) {
       }
     }
   };
-  walk(path.join(work, 'media', 'videos'), 0);
+  walk(path.join(mediaRoot, 'videos'), 0);
   if (best) return best.file;
   return tried[0] || path.join(base, 'out.mp4');
 }
 
-/** 删掉 partial_movie_files：它是按场景切片的中间文件，体积能占到一半，渲完就没用了 */
-function cleanPartials(work) {
+/**
+ * 删掉 partial_movie_files：它是按场景切片的中间文件，体积能占到一半，渲完就没用了。
+ *
+ * 只扫**这一场自己的 media 目录**（media-<index>）。场级并行之后多个 manim 同时在跑，
+ * 以前扫整个 work/media 会在别的场还没渲完时把它的 partial 删掉 —— 轻则重算、重则报错。
+ */
+function cleanPartials(mediaRoot) {
   let freed = 0;
   const walk = (dir, depth) => {
     if (depth > 4) return;
@@ -188,7 +348,7 @@ function cleanPartials(work) {
       }
     }
   };
-  walk(path.join(work, 'media'), 0);
+  walk(mediaRoot, 0);
   return freed;
 }
 
@@ -237,7 +397,7 @@ async function probeVideo(ffmpeg, file) {
  * 长了又会在下一场开始后还在播。所以这里统一：缩放补边 + 补帧到目标时长 + 截断。
  * 已经是目标规格且时长够的，只做复制，不多花一秒。
  */
-async function normalizeClip({ ffmpeg, inFile, outFile, w, h, fps, seconds = 0 }) {
+async function normalizeClip({ ffmpeg, inFile, outFile, w, h, fps, seconds = 0, threads = 0 }) {
   const info = await probeVideo(ffmpeg, inFile);
   const want = Number(seconds) || 0;
   const sameSize = info && info.width === w && info.height === h && Math.abs(info.fps - fps) < 0.6;
@@ -259,6 +419,8 @@ async function normalizeClip({ ffmpeg, inFile, outFile, w, h, fps, seconds = 0 }
   ].join(',');
   const args = ['-hide_banner', '-loglevel', 'error', '-y', '-i', inFile, '-vf', vf];
   if (want) args.push('-t', String(want));
+  // 显式给编码线程：场级并行时 -threads 2 给其它 manim 留核；串行时 0 = ffmpeg 自己吃满
+  args.push('-threads', String(Math.max(0, Math.floor(Number(threads) || 0))));
   args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', outFile);
   const r = await run(ffmpeg, args, 180000);
   if (r.code !== 0 || !fs.existsSync(outFile)) {
@@ -288,7 +450,7 @@ async function renderManim({
   // renderW/renderH = manim **实际渲染**的分辨率；w/h = normalizeClip 的**产出**规格。
   // 草稿档（renderQuality:low）要的是"少画像素、再放大回 1080p"，所以两者必须能分开传。
   renderW = 0, renderH = 0,
-  ffmpeg = null, timeoutBaseMs = 20000, timeoutPerSecondMs = 3000,
+  ffmpeg = null, timeoutBaseMs = 20000, timeoutPerSecondMs = 3000, threads = 0,
 }) {
   const started = Date.now();
   if (!code || typeof code !== 'string' || !code.trim()) {
@@ -298,25 +460,32 @@ async function renderManim({
     return { ok: false, error: 'NO_PYTHON', file: null, ms: 0 };
   }
 
+  // 文字兜底：先按"标题必须粗且大、正文不许太小"改写一遍，再做安全检查 ——
+  // 校验的必须是最终会跑的那份代码（改写只加 weight/font、只调 font_size，不加任何调用）。
+  const enhanced = enhanceTextStyle(code);
+  const finalCode = enhanced.code;
+  const textEnhance = enhanced.stats;
+
   // 安全过滤放在最前面：命中就立刻返回，不落盘、不起进程
-  const hit = checkCode(code);
+  const hit = checkCode(finalCode);
   if (hit) {
     return { ok: false, error: 'UNSAFE_CODE', detail: hit, file: null, ms: Date.now() - started };
   }
   // 无 LaTeX：提前拒收，省一次注定失败的渲染
-  const latex = checkNoLatex(code);
+  const latex = checkNoLatex(finalCode);
   if (latex) {
     return { ok: false, error: 'NO_LATEX', detail: latex, file: null, ms: Date.now() - started };
   }
 
-  const name = SCENE_NAME_RE.test(String(sceneName || '')) ? String(sceneName) : guessSceneName(code);
+  const name = SCENE_NAME_RE.test(String(sceneName || '')) ? String(sceneName) : guessSceneName(finalCode);
   if (!name) return { ok: false, error: 'NO_SCENE_NAME', file: null, ms: Date.now() - started };
 
   const stem = `manim-${index}`;
   const script = path.join(work, `${stem}.py`);
-  const mediaDir = path.join(work, 'media');
+  // 每场一个独立的 media 目录：场级并行时 manim 的临时文件/Tex 缓存/partial 互不干扰
+  const mediaDir = path.join(work, `media-${index}`);
   fs.mkdirSync(work, { recursive: true });
-  fs.writeFileSync(script, String(code), 'utf8');
+  fs.writeFileSync(script, String(finalCode), 'utf8');
 
   const q = String(quality || '-qm');
   const args = ['-m', 'manim', 'render', q, '--disable_caching', '--media_dir', mediaDir];
@@ -351,35 +520,41 @@ async function renderManim({
   });
 
   const ms = Date.now() - started;
-  const out = findOutput(work, stem);
+  const out = findOutput(mediaDir, stem);
   const exists = fs.existsSync(out) && fs.statSync(out).size > 1000;
 
   // 不管成功失败都清一次：失败时磁盘上更可能残留一堆 partial
   let freed = 0;
-  try { freed = cleanPartials(work); } catch { }
+  try { freed = cleanPartials(mediaDir); } catch { }
 
   if (r.timedOut) {
-    return { ok: false, error: `MANIM_TIMEOUT(${budget}ms)`, file: null, ms, partialFreed: freed };
+    return { ok: false, error: `MANIM_TIMEOUT(${budget}ms)`, file: null, ms, partialFreed: freed, textEnhance };
   }
   if (!exists || r.code !== 0) {
     const tail = String(r.err || r.out || '').slice(-600);
-    return { ok: false, error: `MANIM_FAILED(code=${r.code}) ${tail}`, file: null, ms, partialFreed: freed };
+    return { ok: false, error: `MANIM_FAILED(code=${r.code}) ${tail}`, file: null, ms, partialFreed: freed, textEnhance };
   }
 
   // 规格统一：给了目标宽高就保证拼得上
   if (Number(w) > 0 && Number(h) > 0 && ffmpeg) {
     const norm = await normalizeClip({
       ffmpeg, inFile: out, outFile: path.join(work, `manim-${index}-norm.mp4`),
-      w, h, fps: Number(fps) || 30, seconds: Number(seconds) || 0,
+      w, h, fps: Number(fps) || 30, seconds: Number(seconds) || 0, threads,
     });
-    if (!norm.ok) return { ok: false, error: norm.error, file: null, ms: Date.now() - started, partialFreed: freed };
+    if (!norm.ok) {
+      return { ok: false, error: norm.error, file: null, ms: Date.now() - started, partialFreed: freed, textEnhance };
+    }
     return {
       ok: true, file: norm.file, error: null, ms: Date.now() - started,
-      rawFile: out, reencoded: norm.reencoded, sourceInfo: norm.info, partialFreed: freed,
+      rawFile: out, reencoded: norm.reencoded, sourceInfo: norm.info, partialFreed: freed, textEnhance,
     };
   }
 
-  return { ok: true, file: out, error: null, ms, partialFreed: freed };
+  return { ok: true, file: out, error: null, ms, partialFreed: freed, textEnhance };
 }
 
-module.exports = { renderManim, checkCode, checkNoLatex, normalizeClip, probeVideo, guessSceneName };
+module.exports = {
+  renderManim, checkCode, checkNoLatex, normalizeClip, probeVideo, guessSceneName,
+  // 字重/字号兜底（纯函数，单测和后台脚本可以单独调）
+  enhanceTextStyle,
+};

@@ -15,7 +15,7 @@
  *   - 写入走「临时文件 + rename」，进程被杀不会留下半截 JSON。
  *
  * 键的设计（和 server.js 里的调用一一对应）：
- *   scene    = sha1( normalize(hint) + '|' + styleSign + '|' + kind )
+ *   scene    = sha1( normalize(hint) + '|' + normalize(text) + '|' + styleSign + '|' + kind )
  *   skeleton = sha1( normalize(text) + '|' + seconds  + '|' + styleSign + '|' + extra )
  *   normalize = trim + 压缩连续空白成一个空格 + 英文小写
  *   styleSign = S.signature(style)（第一位就是风格 id，配色/线宽/字体变了也会换键）
@@ -42,10 +42,29 @@ function sha1(text) {
   return crypto.createHash('sha1').update(String(text), 'utf8').digest('hex');
 }
 
-/** 场级键。hint 已经是缓存材料（visual_hint，或没有时用标题+旁白拼出来的）。 */
+/**
+ * 场级键：决定"这一段 manim 代码还能不能复用"。
+ *
+ * 为什么要带上 text（这一场的标题）：模型写出来的 manim 脚本里，标题是**写死的字符串**
+ * （Text("标题")）。只把 visual_hint 放进键里时，用户把标题"微积分"改成"导数的几何意义"，
+ * hint 一个字都没变 → 命中缓存 → 返回上一次的代码 → 成片里还是旧标题。
+ * 这就是用户实测到的"改过的东西最后生成出来根本没有修改"。
+ *
+ * 为什么不带 narration：旁白不进 manim 代码（只在混音/字幕里用），
+ * 加进去会让"只改台词"也重跑一次模型（几分钟），纯浪费。
+ *
+ * 注意：server.js 的 manimHint 戳（判断手上这份代码算不算数）调用的也是这个函数 ——
+ * 缓存说"要不要重新问模型"、戳说"这段代码是不是当前标题的"，两边必须是同一个算法，
+ * 否则会出现自相矛盾的状态（缓存命中但戳不匹配、或者反过来继续播旧标题）。
+ */
 function sceneKey(input) {
   const it = input || {};
-  return sha1(`${normalizeText(it.hint)}|${String(it.style == null ? '' : it.style)}|${String(it.kind == null ? '' : it.kind)}`);
+  return sha1([
+    normalizeText(it.hint),
+    normalizeText(it.text),
+    String(it.style == null ? '' : it.style),
+    String(it.kind == null ? '' : it.kind),
+  ].join('|'));
 }
 
 /** 骨架级键。 */
@@ -248,6 +267,8 @@ function createPlanCache(opts = {}) {
     if (typeof it.code !== 'string' || !it.code.trim()) return false;
     return writeEntry('scene', sceneKey(it), {
       hint: String(it.hint == null ? '' : it.hint).slice(0, 2000),
+      // 标题也落一份：键里含 text 之后，靠这条记录才能看出"这段代码是按哪个标题生成的"
+      text: String(it.text == null ? '' : it.text).slice(0, 200),
       style: String(it.style == null ? '' : it.style),
       kind: String(it.kind == null ? '' : it.kind),
       code: it.code,

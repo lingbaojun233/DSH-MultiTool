@@ -200,6 +200,50 @@ function applyPatches(project, patches, opts = {}) {
 }
 
 /**
+ * 表情归一化（全项目**唯一**一份白名单）。
+ *
+ * 返回 { list, dropped }：dropped 是"被丢掉的条目 + 原因"。
+ * 为什么要返回丢弃明细：这里过去是个纯函数，静默过滤 —— 面板/模型给的表情 id 只要
+ * 跟 `<id>.gif` 对不上（带了 .gif 后缀、写成名字、或一场超过 4 个）就会被吃掉，
+ * 于是用户看到的永远是"分镜里明明有表情，渲出来一个都没有，日志里一个字都没有"。
+ * 现在丢弃必须由调用方写进日志，"丢在哪一环"才能被定位。
+ *
+ * 兼容性：id 统一小写、并去掉误带的 `.gif` 后缀 —— 文件名是 `<id>.gif`，
+ * 只认 6~40 位 hex。坐标/时长/缩放仍按原来的范围夹取，改这里会让 sceneKey 变、触发重渲。
+ */
+function normalizeStickers(raw) {
+  const list = Array.isArray(raw) ? raw : [];
+  const out = [];
+  const dropped = [];
+  // 名字/路径类写法一律不接受：只认 hex id，否则 overlay 拼出来的路径会指错文件
+  const idOf = (v) => String(v == null ? '' : v).trim().toLowerCase().replace(/\.gif$/, '');
+  const clampNum = (v, lo, hi, dflt) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return dflt;
+    return Math.min(hi, Math.max(lo, n));
+  };
+  for (const s of list) {
+    if (!s || typeof s !== 'object') { dropped.push({ id: '空', reason: '不是对象' }); continue; }
+    const id = idOf(s.id);
+    if (!/^[0-9a-f]{6,40}$/.test(id)) {
+      dropped.push({ id: id || '空', reason: 'id 不合法（要 6~40 位 hex）' });
+      continue;
+    }
+    if (out.length >= 4) { dropped.push({ id, reason: '单场最多 4 个' }); continue; }
+    out.push({
+      id,
+      at: clampNum(s.at, 0, 1e6, 0),
+      duration: clampNum(s.duration, 0.4, 10, 1.6),
+      x: clampNum(s.x, 0, 1, 0.82),
+      y: clampNum(s.y, 0, 1, 0.22),
+      scale: clampNum(s.scale, 0.08, 0.6, 0.22),
+      fade: clampNum(s.fade, 0, 1, 0.25),
+    });
+  }
+  return { list: out, dropped };
+}
+
+/**
  * 场景归一化。
  *
  * 第二个参数是"降级要出声"的钩子：调用方传 { label, onDegrade }，
@@ -259,20 +303,16 @@ function normalizeScene(raw, opts = {}) {
   if (wantsAi && !video && !manim && onDegrade) {
     onDegrade(`${label} 是 aivideo 但没有 video.prompt，降级文字卡`);
   }
-  // 表情叠加：坐标用 0~1 相对值，渲染器自己换算成像素
-  const stickers = (Array.isArray(raw.stickers) ? raw.stickers : [])
-    .filter((s) => s && /^[0-9a-f]{6,40}$/i.test(String(s.id || '')))
-    .slice(0, 4)
-    .map((s) => ({
-      // 文件名是 sha1 的小写十六进制；模型偶尔写成大写，统一小写才找得到 <id>.gif
-      id: String(s.id).toLowerCase(),
-      at: Math.max(0, Number(s.at) || 0),
-      duration: Math.min(10, Math.max(0.4, Number(s.duration) || 1.6)),
-      x: Math.min(1, Math.max(0, s.x == null ? 0.82 : Number(s.x))),
-      y: Math.min(1, Math.max(0, s.y == null ? 0.22 : Number(s.y))),
-      scale: Math.min(0.6, Math.max(0.08, s.scale == null ? 0.22 : Number(s.scale))),
-      fade: Math.min(1, Math.max(0, s.fade == null ? 0.25 : Number(s.fade))),
-    }));
+  // 表情叠加：坐标用 0~1 相对值，渲染器自己换算成像素。
+  // 白名单在 normalizeStickers 里（唯一一份）；这里只负责"丢了要出声"。
+  const stickerNorm = normalizeStickers(raw.stickers);
+  const stickers = stickerNorm.list;
+  if (stickerNorm.dropped.length && onDegrade) {
+    const detail = stickerNorm.dropped.slice(0, 4)
+      .map((d) => `${d.id}（${d.reason}）`).join('、');
+    onDegrade(`${label} 表情丢弃 ${stickerNorm.dropped.length} 个：${detail}`
+      + (stickerNorm.dropped.length > 4 ? '…' : ''));
+  }
   return {
     kind,
     text: String(raw.text || '').slice(0, 60),
@@ -358,6 +398,7 @@ module.exports = {
   listProjects,
   applyPatches,
   normalizeScene,
+  normalizeStickers,
   sceneKey,
   audioKey,
   planReuse,

@@ -443,6 +443,7 @@ async function overlayStickers({
   timeoutMs = 300000,
   transcode = 'auto',
   fps = 30,
+  threads = 0,
 }) {
   const res = { ok: false, file: null, applied: 0, skipped: [], error: null };
 
@@ -462,7 +463,8 @@ async function overlayStickers({
     Number(bottomReserve) > 0 ? Number(bottomReserve) : (DEFAULT_BOTTOM_RESERVE_PX * H) / 1080,
   ));
   const list = Array.isArray(stickers) ? stickers : [];
-  const cacheDir = path.join(work, 'cache');
+  // 每场一个转码缓存目录：场级并行时两场同时转同一个 GIF 不会抢同一个临时文件/PNG 目录
+  const cacheDir = path.join(work, 'cache', `scene-${Number(index) || 0}`);
   const baseDir = stickerDir ? path.resolve(String(stickerDir)) : null;
   // 探测也要写临时文件到 cache，先建好目录；建不出来后面会以"无法解码"的形式体现
   try { fs.mkdirSync(cacheDir, { recursive: true }); } catch { /* 后面自然会失败 */ }
@@ -691,6 +693,8 @@ async function overlayStickers({
   ];
   // 按主视频时长裁：表情比视频长也不会把成片拉长（这正是 -t 存在的意义）
   if (total != null) args.push('-t', num(total));
+  // 表情叠加也是一次 libx264 编码：并行时 -threads 2 给 manim 留核，串行时 0=吃满
+  args.push('-threads', String(Math.max(0, Math.floor(Number(threads) || 0))));
   args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', out);
 
   const r = await run(ffmpeg, args, timeoutMs);

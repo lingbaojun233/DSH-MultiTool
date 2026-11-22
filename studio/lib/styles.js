@@ -138,6 +138,7 @@ function promptBlock(style) {
     `- 背景：${s.bg}；主元素/曲线：${s.accent}；文字：${s.fg}；次要/网格：${s.muted}；强调（尽量只出现一次）：${s.accent2}`,
     `- 线宽统一 stroke_width=${s.line_width}；${s.glow ? '允许发光/光晕感（主线用亮色、网格用暗色即可）' : '不要发光、不要投影，素色平涂'}`,
     `- 中文一律 Text(..., font="${s.font}")；公式用 MathTex（LaTeX 已装，模板默认就够）`,
+    '- 字重/字号：标题 font_size ≥ 44 且必须 weight=BOLD；正文/标注 font_size ≥ 32 —— 不加 BOLD 的标题在成片里会细得看不清',
     `- 节奏：${s.motion}；机位：${s.camera}`,
   ];
   if (s.grid) lines.push('- 可以画一层很淡的网格（NumberPlane，stroke_opacity=0.15），它是背景不是主角');
