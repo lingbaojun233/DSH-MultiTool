@@ -32,7 +32,9 @@
   "renderFreeMemMinMb": 1200,
   "minSceneSeconds": 2,
   "maxSceneSeconds": 30,
-  "narrationPad": 0.6,
+  "narrationSpeed": 1.0,
+  "scenePadding": 0.6,
+  "stickerDuration": 2.0,
   "animCompressFloor": 0.85,
   "animStretchCeil": 2,
   "defaultStyle": "whiteboard",
@@ -70,7 +72,7 @@
     "defaultScale": 0.3,
     "minScale": 0.1,
     "maxScale": 1,
-    "maxPerScene": 3,
+    "maxPerScene": 1,
     "bottomReservePx": 200
   },
   "plan": {

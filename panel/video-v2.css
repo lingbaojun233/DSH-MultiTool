@@ -29,6 +29,11 @@
   color: var(--v2-text);
 }
 
+/* 视频页比其它栏宽一档：分镜表 8 列要放开，窄屏再横向滚动 */
+.video-v2.pane {
+  max-width: 1240px;
+}
+
 /* ---------- 顶栏：三视图切换 + 视频服务状态 ---------- */
 
 .video-v2 .video-v2-head {
@@ -305,7 +310,7 @@
 
 .video-v2 .v2-advanced {
   width: 100%;
-  max-width: 920px;
+  max-width: 1200px;
   margin: 16px auto 0;
   border: 1px solid var(--v2-border);
   border-radius: var(--v2-radius);
@@ -375,6 +380,12 @@
   gap: 10px;
   font-size: 13px;
   color: var(--v2-muted);
+}
+
+/* 高级区一行汇总：三个可调项的当前值（改在设置页） */
+.video-v2 .v2-adv-tunables {
+  margin: 2px 0 0;
+  font-size: 12px;
 }
 
 .video-v2 select {
@@ -475,10 +486,21 @@
 
 .video-v2 .v2-scenes-table {
   width: 100%;
+  min-width: 1140px;
   border-collapse: collapse;
+  table-layout: fixed;
   font-size: 13px;
-  table-layout: auto;
 }
+
+/* 固定列宽：表格整体比容器宽时由 .v2-scenes-wrap 横向滚动，不挤没「画什么」 */
+.video-v2 .v2-col-idx { width: 34px; }
+.video-v2 .v2-col-title { width: 190px; }
+.video-v2 .v2-col-narration { width: 280px; }
+.video-v2 .v2-col-sec { width: 82px; }
+.video-v2 .v2-col-tool { width: 100px; }
+.video-v2 .v2-col-hint { width: 210px; }
+.video-v2 .v2-col-sticker { width: 160px; }
+.video-v2 .v2-col-ops { width: 96px; }
 
 .video-v2 .v2-scenes-table th {
   text-align: left;
@@ -506,6 +528,7 @@
 }
 
 .video-v2 .v2-scenes-table input,
+.video-v2 .v2-scenes-table textarea,
 .video-v2 .v2-scenes-table select {
   width: 100%;
   min-width: 0;
@@ -519,11 +542,13 @@
 }
 
 .video-v2 .v2-scenes-table input:hover,
+.video-v2 .v2-scenes-table textarea:hover,
 .video-v2 .v2-scenes-table select:hover {
   border-color: var(--v2-border);
 }
 
 .video-v2 .v2-scenes-table input:focus,
+.video-v2 .v2-scenes-table textarea:focus,
 .video-v2 .v2-scenes-table select:focus {
   outline: none;
   border-color: var(--v2-accent);
@@ -535,16 +560,129 @@
   text-align: center;
 }
 
+/* 秒数下面那行小字：告诉用户这个字段真的会改变场时长 */
+.video-v2 .v2-scene-sec-cell {
+  vertical-align: top;
+}
+
+.video-v2 .v2-scene-sec-hint {
+  display: block;
+  max-width: 120px;
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.35;
+  white-space: normal;
+  color: var(--v2-muted);
+}
+
 .video-v2 .v2-scenes-table .v2-scene-text {
-  min-width: 300px;
+  min-width: 0;
+}
+
+.video-v2 .v2-scenes-table .v2-scene-narration {
+  min-width: 0;
+  width: 100%;
+  min-height: 48px;
+  resize: vertical;
+  line-height: 1.45;
+  padding: 6px 8px;
 }
 
 .video-v2 .v2-scenes-table .v2-scene-hintinput {
-  min-width: 160px;
+  min-width: 0;
 }
 
 .video-v2 .v2-scene-tool {
-  min-width: 84px;
+  min-width: 0;
+}
+
+/* 「表情」格：没选是一个虚线按钮，选了是 48×48 动图 + 情绪名 + × */
+.video-v2 .v2-scene-sticker-cell {
+  vertical-align: middle;
+}
+
+.video-v2 .v2-sticker-empty {
+  width: 100%;
+  min-height: 48px;
+  font-size: 12px;
+  color: var(--v2-muted);
+  background: transparent;
+  border: 1px dashed var(--v2-border-strong);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.video-v2 .v2-sticker-empty:hover {
+  color: #dcecff;
+  border-color: var(--v2-accent-line);
+  background: var(--v2-accent-soft);
+}
+
+.video-v2 .v2-sticker-chip {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 2px 4px 2px 2px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  cursor: pointer;
+}
+
+.video-v2 .v2-sticker-chip:hover {
+  border-color: var(--v2-accent-line);
+  background: var(--v2-accent-soft);
+}
+
+.video-v2 .v2-sticker-thumb {
+  flex: none;
+  width: 48px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid var(--v2-border-strong);
+  background: var(--v2-bg-deep);
+}
+
+.video-v2 .v2-sticker-thumb-error {
+  opacity: .25;
+}
+
+.video-v2 .v2-sticker-name {
+  min-width: 0;
+  max-width: 74px;
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--v2-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.video-v2 .v2-sticker-clear {
+  position: absolute;
+  top: -7px;
+  right: -7px;
+  width: 19px;
+  height: 19px;
+  padding: 0;
+  font-size: 13px;
+  line-height: 17px;
+  text-align: center;
+  color: var(--v2-muted);
+  background: var(--v2-panel);
+  border: 1px solid var(--v2-border-strong);
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+.video-v2 .v2-sticker-clear:hover {
+  color: #fff;
+  background: var(--v2-err);
+  border-color: var(--v2-err);
 }
 
 .video-v2 .v2-scene-ops {
@@ -736,6 +874,16 @@
   color: var(--v2-muted);
 }
 
+/* 设置页每行右侧的一句解释：小字，不抢下拉的视线 */
+.video-v2 .v2-set-note {
+  flex: 1;
+  min-width: 0;
+  text-align: right;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--v2-muted);
+}
+
 .video-v2 .v2-settings-card select {
   min-width: 200px;
 }
@@ -753,6 +901,148 @@
 
 .video-v2 .v2-settings-card .v2-hint {
   margin-top: 10px;
+}
+
+/* ---------- 表情选择器（分镜表每场 1 个） ---------- */
+
+.video-v2 .v2-sticker-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(4, 6, 10, .68);
+  backdrop-filter: blur(2px);
+}
+
+.video-v2 .v2-sticker-dialog {
+  display: flex;
+  flex-direction: column;
+  width: min(760px, 100%);
+  max-height: min(84vh, 740px);
+  overflow: hidden;
+  background: var(--v2-panel);
+  border: 1px solid var(--v2-border-strong);
+  border-radius: 14px;
+  box-shadow: var(--v2-shadow);
+}
+
+.video-v2 .v2-sticker-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--v2-border);
+}
+
+.video-v2 .v2-sticker-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--v2-text);
+}
+
+.video-v2 .v2-sticker-summary {
+  font-size: 12px;
+  color: var(--v2-muted);
+  white-space: nowrap;
+}
+
+.video-v2 .v2-sticker-search {
+  flex: 1 1 140px;
+  min-width: 120px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--v2-text);
+  background: var(--v2-panel-2);
+  border: 1px solid var(--v2-border-strong);
+  border-radius: 8px;
+  padding: 7px 10px;
+}
+
+.video-v2 .v2-sticker-search:focus {
+  outline: none;
+  border-color: var(--v2-accent);
+  box-shadow: 0 0 0 2px rgba(79, 140, 255, .16);
+}
+
+.video-v2 .v2-sticker-grid {
+  flex: 1;
+  min-height: 120px;
+  overflow-y: auto;
+  padding: 12px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(88px, 1fr));
+  gap: 8px;
+  align-content: start;
+}
+
+.video-v2 .v2-sticker-item {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  padding: 6px;
+  font: inherit;
+  color: var(--v2-text);
+  background: var(--v2-panel-2);
+  border: 1px solid transparent;
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.video-v2 .v2-sticker-item:hover {
+  border-color: var(--v2-accent-line);
+  background: var(--v2-accent-soft);
+}
+
+.video-v2 .v2-sticker-item.is-selected {
+  border-color: var(--v2-accent);
+  box-shadow: 0 0 0 1px var(--v2-accent) inset;
+}
+
+.video-v2 .v2-sticker-gif {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  object-fit: contain;
+  border-radius: 8px;
+  background: var(--v2-bg-deep);
+}
+
+.video-v2 .v2-sticker-mood {
+  max-width: 100%;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--v2-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.video-v2 .v2-sticker-star {
+  position: absolute;
+  top: 3px;
+  right: 5px;
+  padding: 1px 2px;
+  font-size: 15px;
+  line-height: 1;
+  color: #6f7d92;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, .9);
+}
+
+.video-v2 .v2-sticker-star.on {
+  color: var(--v2-warn);
+}
+
+.video-v2 .v2-sticker-hint {
+  margin: 0;
+  padding: 0 14px 12px;
+  font-size: 12px;
+  color: var(--v2-muted);
 }
 
 /* ---------- 提示条 ---------- */
@@ -840,9 +1130,14 @@
     height: 46px;
   }
 
-  .video-v2 .v2-scenes-table th.v2-scene-hint,
-  .video-v2 .v2-scenes-table td.v2-scene-hint {
-    display: none;
+  /* 窄屏不隐藏「画什么」：表格保持 1180px，由 .v2-scenes-wrap 横向滚动 */
+  .video-v2 .v2-scenes-table {
+    font-size: 12.5px;
+  }
+
+  .video-v2 .v2-scenes-table th,
+  .video-v2 .v2-scenes-table td {
+    padding: 5px 6px;
   }
 
   .video-v2 .v2-adv-row {
@@ -861,6 +1156,12 @@
 
   .video-v2 .v2-set-row {
     flex-wrap: wrap;
+  }
+
+  .video-v2 .v2-set-note {
+    flex: 1 1 100%;
+    text-align: left;
+    padding-left: 0;
   }
 
   .video-v2 .v2-settings-card select {

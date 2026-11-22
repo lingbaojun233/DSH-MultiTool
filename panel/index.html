@@ -145,6 +145,7 @@
                   <select id="v2VoiceSel"></select>
                 </label>
               </div>
+              <p id="v2AdvTunablesHint" class="v2-hint v2-adv-tunables"></p>
 
               <div class="v2-scenes-head">
                 <span class="v2-field-label">分镜</span>
@@ -156,14 +157,26 @@
               </div>
               <div class="v2-scenes-wrap">
                 <table id="v2ScenesTable" class="v2-scenes-table">
+                  <colgroup>
+                    <col class="v2-col-idx">
+                    <col class="v2-col-title">
+                    <col class="v2-col-narration">
+                    <col class="v2-col-sec">
+                    <col class="v2-col-tool">
+                    <col class="v2-col-hint">
+                    <col class="v2-col-sticker">
+                    <col class="v2-col-ops">
+                  </colgroup>
                   <thead>
                     <tr>
                       <th scope="col">#</th>
-                      <th scope="col">文字</th>
+                      <th scope="col">标题</th>
+                      <th scope="col">旁白</th>
                       <th scope="col">秒</th>
                       <th scope="col">类型</th>
-                      <th scope="col" class="v2-scene-hint">提示</th>
-                      <th scope="col">操作</th>
+                      <th scope="col" class="v2-scene-hint">画什么</th>
+                      <th scope="col">表情</th>
+                      <th scope="col">插入·删</th>
                     </tr>
                   </thead>
                   <tbody id="v2ScenesBody"></tbody>
@@ -196,6 +209,21 @@
                 <span class="v2-set-label">音色</span>
                 <select id="v2SetVoice"></select>
               </label>
+              <label class="v2-set-row">
+                <span class="v2-set-label">语速</span>
+                <select id="v2SetSpeed"></select>
+                <span class="v2-set-note">越快越赶，1.0 最自然</span>
+              </label>
+              <label class="v2-set-row">
+                <span class="v2-set-label">停留</span>
+                <select id="v2SetPadding"></select>
+                <span class="v2-set-note">旁白说完后画面多停一会儿，想慢一点就调大</span>
+              </label>
+              <label class="v2-set-row">
+                <span class="v2-set-label">表情持续</span>
+                <select id="v2SetSticker"></select>
+                <span class="v2-set-note">表情播完一轮的时间（循环播放）</span>
+              </label>
               <p id="v2VoiceHint" class="v2-hint v2-voice-hint">音色清单会从 speak 异步加载；想换音色也可以在聊天里说「换音色」</p>
               <p id="v2PersonaLine" class="v2-persona">当前人设：大肥鱼（迷糊版） · 白板讲解 · 温柔口语</p>
               <p id="v2SaveHint" class="v2-hint">改动即时保存在本机</p>
@@ -207,21 +235,38 @@
           <tr class="v2-scene-row">
             <td class="v2-scene-idx">1</td>
             <td><input class="v2-scene-text" type="text" data-field="text" placeholder="这一场讲什么" autocomplete="off"></td>
-            <td><input class="v2-scene-sec" type="number" data-field="seconds" min="1" max="15" step="1" value="5" inputmode="numeric"></td>
+            <td><textarea class="v2-scene-narration" rows="2" data-field="narration" maxlength="400" placeholder="会念出来；留空则这一场静音"></textarea></td>
+            <td class="v2-scene-sec-cell"><input class="v2-scene-sec" type="number" data-field="seconds" min="1" max="15" step="1" value="5" inputmode="numeric"></td>
             <td>
               <select class="v2-scene-tool" data-field="tool" aria-label="类型">
                 <option value="auto">自动</option>
                 <option value="manim">manim</option>
                 <option value="text">文字</option>
+                <option value="sticker">表情卡</option>
               </select>
             </td>
-            <td class="v2-scene-hint"><input class="v2-scene-hintinput" type="text" data-field="hint" placeholder="画面提示" autocomplete="off"></td>
+            <td class="v2-scene-hint"><input class="v2-scene-hintinput" type="text" data-field="hint" placeholder="画什么：留空则自动" autocomplete="off"></td>
+            <td class="v2-scene-sticker-cell"></td>
             <td class="v2-scene-ops">
               <button type="button" class="v2-iconbtn" data-act="insert" title="在下方插入一场">插入</button>
               <button type="button" class="v2-iconbtn v2-danger" data-act="delete" title="删除这场">删</button>
             </td>
           </tr>
         </template>
+
+        <!-- 表情选择器：每场 1 个，网格里直接看动图 + 情绪名 + 收藏星 -->
+        <div id="v2StickerModal" class="v2-sticker-modal hidden" role="dialog" aria-modal="true" aria-labelledby="v2StickerTitle">
+          <div class="v2-sticker-dialog">
+            <div class="v2-sticker-head">
+              <span id="v2StickerTitle" class="v2-sticker-title">选一个表情</span>
+              <span id="v2StickerSummary" class="v2-sticker-summary"></span>
+              <input id="v2StickerSearch" class="v2-sticker-search" type="search" placeholder="搜情绪名，例如 开心 / 睡觉" autocomplete="off">
+              <button type="button" id="v2StickerClose" class="v2-iconbtn" title="关闭">✕</button>
+            </div>
+            <div id="v2StickerGrid" class="v2-sticker-grid" role="listbox" aria-label="表情列表"></div>
+            <p id="v2StickerHint" class="v2-sticker-hint"></p>
+          </div>
+        </div>
 
         <div id="v2Toast" class="v2-toast" role="status" aria-live="polite"></div>
       </div>

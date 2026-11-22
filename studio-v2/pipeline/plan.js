@@ -6,7 +6,8 @@
  *   script → 让模型按原话拆场（旁白必须来自稿子）
  *   scenes → 直接规范化；缺 manim 代码的场再逐场生成
  *
- * 引擎只允许 manim / text。代码生成是"一次只问一场"，失败只降级这一场。
+ * 引擎：manim / text / sticker（表情卡）。表现优先级 manim > sticker > text；
+ * 代码生成是"一次只问一场"，失败只降级这一场。
  *
  * 代码缓存键（cache.js 实现）：text + hint + style + tool。
  * narration 不进键 —— 旁白只走配音/字幕，不进画面。
@@ -149,8 +150,11 @@ function stickerPromptLines(candidates) {
   return [
     '',
     '## 表情包（可选）',
-    '- 只在情绪点（吐槽/惊讶/结论/自嘲）放，整集 1~2 处即可；同一场最多 1 个。',
-    '- 场景里加 stickers：[{"id":"<列表里的 id>","at":1.2,"duration":1.8,"x":0.82,"y":0.12,"scale":0.3}]',
+    '- **每场最多 1 个，整集 1~3 场有表情**；多给的会被裁掉（只留第一个）。',
+    '- 情绪点（吐槽/惊讶/结论/自嘲）用普通场的小表情；介绍自己/情绪表达可以整场只用表情。',
+    '- 表情卡：这一场 `tool:"sticker"` + 1 个 stickers，不画图，正中放一个大表情（占屏约一半）。',
+    // 不写 duration：留给全局 stickerDuration（设置页可调，现在是一轮循环时长的参考）
+    '- 普通场的 stickers：[{"id":"<列表里的 id>","at":1.2,"x":0.82,"y":0.12,"scale":0.3}]',
     '- at 放在中后段；x/y 是 0~1，底部 1/5 是字幕带（y 最大 0.68）；scale 0.25~0.38。',
     `- 可用表情：${list}`,
   ];
@@ -162,10 +166,12 @@ function skeletonPrompt(topic, total, style, candidates) {
     '只输出 JSON，第一个字符必须是 {，不要解释。',
     `给这个主题写分镜：${topic}`,
     `总时长约 ${total} 秒。`,
-    '{"title":"标题","scenes":[{"text":"这一场标题（≤14字）","narration":"旁白（≤30字，口语）","seconds":8,"visual":"manim","hint":"这一场画面画什么（一句话，具体到图形/公式/动作）"}]}',
+    '{"title":"标题","scenes":[{"text":"这一场标题（≤14字）","narration":"旁白（≤30字，口语）","seconds":8,"tool":"manim","visual":"manim","hint":"这一场画面画什么（一句话，具体到图形/公式/动作）"}]}',
     '',
-    '## 引擎只有两种：manim / text',
-    '- visual 只能是 manim 或 text；**至少 3 场 manim**（前 3 场优先 manim），text 只给开场/转场/一句结论，整集最多 1 场。',
+    '## 引擎有三种：manim / text / sticker（表情卡）',
+    '- tool 只能是 manim、text、sticker；**至少 3 场 manim**（前 3 场优先 manim），text 只给开场/转场/一句结论，整集最多 1 场。',
+    '- tool:"sticker" 是表情卡：这一场不画图，底色 + 正中一个表情包循环播；介绍自己/情绪表达类场景优先用它。',
+    '- **第一场如果是"我是谁 / 自我介绍"这种，直接放一个表情包（tool:"sticker"），不要画角色**。',
     '- 讲到公式、坐标、曲线、变化过程、对比大小的场次必须 manim。',
     '- 不要写 plot / draw / html / aivideo：这些引擎已删除，写了也会被改成文字卡。',
     '',
@@ -196,6 +202,7 @@ function scriptPrompt(script, total, style, candidates) {
     '## 拆场',
     '- 一场只讲一个意思；宁可少几场、每场讲透。',
     '- 至少 80% 的场次 manim；text 只给开场/转场/一句结论。',
+    '- tool:"sticker" 是表情卡：整场不画图、正中一个大表情；开场自我介绍 / 纯情绪的一两句优先用它。',
     '- hint 写成"别人照着就能画"的一句话；**不要写画角色/画大肥鱼**。',
     '- 场数不超过 ' + hint.max + '；加起来接近 ' + total + ' 秒。',
     '- 不要 markdown、不要解释。',
@@ -258,8 +265,13 @@ function visualPrompt(scene, style, cfg) {
   return head.concat(body).join('\n');
 }
 
-/** 决定这一场最终用哪个引擎（auto 在这里收口，其它模块不再判断）。 */
+/**
+ * 决定这一场最终用哪个引擎（auto 在这里收口，其它模块不再判断）。
+ * 表情卡要求"tool:'sticker' 且该场有 stickers[0]"；没有表情就降级 text。
+ */
 function decideTool(scene) {
+  const hasSticker = Array.isArray(scene.stickers) && scene.stickers.length > 0;
+  if (scene.tool === 'sticker') return hasSticker ? 'sticker' : 'text';
   if (scene.tool === 'manim' || scene.tool === 'text') return scene.tool;
   if (scene.manim && scene.manim.code) return 'manim';
   if (scene.hint) return 'manim';
@@ -382,7 +394,7 @@ async function plan({ req, cfg, cache, redo, ctx }) {
   let title = '';
 
   if (req.scenes.length) {
-    scenes = req.scenes.map(S.normalizeScene);
+    scenes = req.scenes.map((s, index) => S.normalizeScene(s, { index, log }));
     title = String(scenes[0] && scenes[0].text || '').trim();
   } else {
     const kind = req.script ? 'script' : 'topic';
@@ -416,13 +428,23 @@ async function plan({ req, cfg, cache, redo, ctx }) {
       skeleton = { title, scenes: rawScenes };
     }
     title = String(skeleton.title || title || '').trim();
-    scenes = S.normalizeScenes(skeleton.scenes, cfg.maxScenes);
+    scenes = S.normalizeScenes(skeleton.scenes, cfg.maxScenes, log);
   }
 
   if (!scenes.length) return { ok: false, error: 'NO_SCENES', warnings };
 
-  // auto → 具体引擎（只在这里收口）
-  for (const s of scenes) s.tool = decideTool(s);
+  // auto → 具体引擎（只在这里收口）；表情卡缺表情时降级 text 并写日志
+  for (let i = 0; i < scenes.length; i++) {
+    const s = scenes[i];
+    const want = s.tool;
+    s.tool = decideTool(s);
+    if (want === 'sticker' && s.tool !== 'sticker') {
+      s.status = 'degraded';
+      s.note = '表情卡没有表情，降级文字卡';
+      log(`scene#${i} 表情卡没有表情（stickers 为空），降级文字卡`);
+      warnings.push(`第 ${i + 1} 场：表情卡没有表情，已降级文字卡`);
+    }
+  }
 
   // 30~40 秒的集至少 3 场 manim（任务书验收 A）；模型标成 text 的场这里补足
   const manimCount = scenes.filter((s) => s.tool === 'manim').length;
@@ -501,7 +523,8 @@ async function plan({ req, cfg, cache, redo, ctx }) {
   // 标题：显式分镜没有 title 字段，就用第一场标题（redo 改标题后立刻反映到任务/日志）
   if (!title) title = String(scenes[0].text || '').trim();
   if (redo) title = String(scenes[0].text || title).trim();
-  log(`规划完成：${scenes.length} 场，manim ${scenes.filter((s) => s.tool === 'manim').length} 场，text ${scenes.filter((s) => s.tool === 'text').length} 场，标题「${title}」`);
+  log(`规划完成：${scenes.length} 场，manim ${scenes.filter((s) => s.tool === 'manim').length} 场，`
+    + `sticker ${scenes.filter((s) => s.tool === 'sticker').length} 场，text ${scenes.filter((s) => s.tool === 'text').length} 场，标题「${title}」`);
   return { ok: true, title, scenes, warnings, style };
 }
 

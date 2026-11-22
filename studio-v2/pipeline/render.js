@@ -4,10 +4,10 @@
  *
  * 一场的完整流水线：
  *   配音（串行，先全部备好）
- *   → 画面（manim / 文字卡，场级并发 ≤2）
- *   → 节奏（场时长 = max(旁白+0.6, 自然时长×0.85)）
- *   → 表情（播一轮停末帧）
- *   → 边框（只给 manim/文字卡）
+ *   → 画面（manim / 文字卡 / 表情卡，场级并发 ≤2）
+ *   → 节奏（场时长 = clamp(max(计划秒数, 旁白+停留, 自然时长×0.85), 下限, 上限)）
+ *   → 表情（从 at 起循环到本场结束；表情卡是 at=0 / 居中 / scale 0.55）
+ *   → 边框（只给 manim/文字卡/表情卡）
  *   → 字幕（烧进画面）
  *   → 混音
  * 结果按原下标回填；每场独立临时目录，互不覆盖。
@@ -19,6 +19,7 @@ const M = require('./manim');
 const T = require('./textcard');
 const A = require('./audio');
 const St = require('./stickers');
+const SC = require('./stickercard');
 const F = require('./frame');
 const Sub = require('./subtitles');
 const C = require('./cache');
@@ -60,9 +61,14 @@ function cleanWork(dir) {
 }
 
 function visualKey({ scene, engine, styleKey, cfg }) {
+  const visual = engine === 'manim'
+    ? (scene.manim && scene.manim.code) || ''
+    : engine === 'sticker'
+      ? `sticker:${(scene.stickers && scene.stickers[0] && scene.stickers[0].id) || ''}`
+      : String(scene.text || '');
   return C.sha1(JSON.stringify([
-    'visual-v2', 'enh-3', engine,
-    engine === 'manim' ? (scene.manim && scene.manim.code) || '' : String(scene.text || ''),
+    'visual-v3', 'enh-3', engine,
+    visual,
     String(scene.hint || ''),
     String(scene.text || ''),
     styleKey,
@@ -72,11 +78,33 @@ function visualKey({ scene, engine, styleKey, cfg }) {
   ]), 24);
 }
 
+/**
+ * 表情签名：id/位置/时间 + GIF 文件的 mtime。
+ * mtime 进来是因为 stickerDuration 只做"一轮时长参考"：GIF 换了 → 自然时长变 → speed 变，
+ * 片段缓存必须跟着失效（转码缓存键里已经有 speed）。
+ */
+function stickerSig(scene, cfg) {
+  return (Array.isArray(scene.stickers) ? scene.stickers : []).map((s) => {
+    let mtime = 0;
+    const f = St.resolveFile(s.id, cfg);
+    try { if (f) mtime = Math.round(fs.statSync(f).mtimeMs); } catch { /* 文件不可读就按 0 */ }
+    return [s.id, s.at, s.duration, s.x, s.y, s.scale, mtime];
+  });
+}
+
+function num(v, def) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
+}
+
 function clipKey({ vKey, audioK, scene, style, cfg, frameSig, subSig }) {
   return C.sha1(JSON.stringify([
-    'clip-v2', 'comp-2', vKey, audioK || 'silent',
-    JSON.stringify((scene.stickers || []).map((s) => [s.id, s.at, s.duration, s.x, s.y, s.scale])),
+    // comp-4：表情从"定格末帧"改成"循环到本场结束"，旧片段缓存必须整体失效
+    'clip-v3', 'comp-4', vKey, audioK || 'silent',
+    JSON.stringify(stickerSig(scene, cfg)),
     style.id, frameSig, subSig,
+    // 这两个参数会改变片段本身：停留影响场时长，表情一轮影响循环素材的播放速度
+    num(cfg.scenePadding, 0.6), num(cfg.stickerDuration, 2),
     Number(cfg.width), Number(cfg.height), Number(cfg.fps),
   ]), 24);
 }
@@ -103,8 +131,15 @@ async function composeScene({
   const subOn = Boolean(cfg.subtitles && cfg.subtitles.enabled) && cues.length > 0;
   if (subOn) fs.writeFileSync(srtFile, Sub.toSrt(cues, 0), 'utf8');
 
+  // 表情卡：这一场唯一的表情放大到 0.55、at=0 居中循环；x/y=0.5 在 prepare 的
+  // x*(W-tw) / y*(H-th) 坐标下正好是屏幕正中（底边字幕带不参与，居中不受影响）。
+  const stickerList = engine === 'sticker'
+    ? (Array.isArray(scene.stickers) ? scene.stickers.slice(0, 1).map((s) => ({
+      ...s, at: 0, x: 0.5, y: 0.5, scale: SC.STICKER_CARD_SCALE,
+    })) : [])
+    : scene.stickers;
   const prep = await St.prepare({
-    stickers: scene.stickers,
+    stickers: stickerList,
     sceneSeconds: target,
     cfg,
     cache,
@@ -164,7 +199,12 @@ async function composeScene({
   const args = ['-hide_banner', '-loglevel', 'error', '-y', '-i', rawFile];
   if (audioResult && audioResult.file) args.push('-i', audioResult.file);
   else args.push('-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo');
-  for (const f of prep.inputs) args.push('-c:v', 'libvpx-vp9', '-i', f);
+  // 表情输入永远循环：-stream_loop -1 让 webm 从头接上，配合 overlay 的 enable 从 at 一直播到本场结束
+  for (const f of prep.inputs) {
+    const file = typeof f === 'string' ? f : f.file;
+    if (typeof f === 'object' && f.loop) args.push('-stream_loop', '-1');
+    args.push('-c:v', 'libvpx-vp9', '-i', file);
+  }
   args.push(
     '-filter_complex', filters.join(';'),
     '-map', `[${label}]`, '-map', '[aout]',
@@ -197,12 +237,22 @@ async function composeScene({
  */
 async function renderOne({ scene, index, style, voice, cfg, cache, row, ctx, warn }) {
   const log = (m) => ctx.log(`scene#${index} ${m}`);
-  const engine = scene.tool === 'text' ? 'text' : 'manim';
+  let engine = scene.tool === 'text' ? 'text' : scene.tool === 'sticker' ? 'sticker' : 'manim';
+  let status = 'ready';
+  let note = '';
+  // 表情卡没有表情 → 降级文字卡（plan 阶段已判过一次，这里是直接提交分镜时的兜底）
+  if (engine === 'sticker' && !(Array.isArray(scene.stickers) && scene.stickers.length)) {
+    engine = 'text';
+    status = 'degraded';
+    note = '表情卡没有表情，降级文字卡';
+    log(note);
+    if (warn) warn(`第 ${index + 1} 场：${note}`);
+  }
   const skey = require('./plan').styleKey(style);
   const frameSig = F.signature(cfg.frame);
   const subSig = C.sha1(JSON.stringify([cfg.subtitles]), 12);
   const vKey = visualKey({ scene, engine, styleKey: skey, cfg });
-  const audioK = scene.narration ? A.audioKey(scene.narration, voice) : 'silent';
+  const audioK = scene.narration ? A.audioKey(scene.narration, voice, cfg.narrationSpeed) : 'silent';
   const cKey = clipKey({ vKey, audioK, scene, style, cfg, frameSig, subSig });
 
   // 先看画面片段缓存：命中连 manim/ffmpeg 都不用起
@@ -220,14 +270,26 @@ async function renderOne({ scene, index, style, voice, cfg, cache, row, ctx, war
   fs.mkdirSync(work, { recursive: true });
   const started = Date.now();
   let visual = null;
-  let status = 'ready';
-  let note = '';
 
   if (engine === 'text') {
     log('文字卡渲染中');
     visual = await T.renderTextCard({ scene, style, cfg, work, index, log });
     if (!visual.ok) {
       return { ok: false, error: visual.error, status: 'failed', note: visual.error, engine, ms: Date.now() - started };
+    }
+  } else if (engine === 'sticker') {
+    log(`表情卡渲染中（表情 ${scene.stickers[0].id} 居中循环，不调用 manim）`);
+    visual = await SC.renderStickerCard({ scene, style, cfg, work, index, log });
+    if (!visual.ok) {
+      // 表情卡失败也不整场作废：降级文字卡，记一条警告
+      status = 'degraded';
+      note = `表情卡失败降级文字卡：${String(visual.error || '').slice(0, 160)}`;
+      log(note);
+      if (warn) warn(`第 ${index + 1} 场：${note}`);
+      visual = await T.renderTextCard({ scene, style, cfg, work, index, log });
+      if (!visual.ok) {
+        return { ok: false, error: visual.error, status: 'failed', note, engine: 'text', ms: Date.now() - started };
+      }
     }
   } else {
     const code = scene.manim && scene.manim.code;

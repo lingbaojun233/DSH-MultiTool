@@ -31,6 +31,26 @@
   /* 音色 id 是云端动态的（voc_xxx），清单从 speak 拉；拉不到就只留「跟人设」 */
   const DEFAULT_VOICE_OPTIONS = [{ value: '', label: '跟人设（推荐）' }];
 
+  /* 三个可调项：选项跟 studio-v2 的范围对齐（schema.js 里还会再夹一次） */
+  const SPEED_OPTIONS = [
+    { value: 0.9, label: '0.9' },
+    { value: 1.0, label: '1.0' },
+    { value: 1.1, label: '1.1' },
+    { value: 1.2, label: '1.2' },
+  ];
+  const PADDING_OPTIONS = [
+    { value: 0.3, label: '0.3 秒' },
+    { value: 0.6, label: '0.6 秒' },
+    { value: 1.0, label: '1.0 秒' },
+    { value: 1.5, label: '1.5 秒' },
+  ];
+  const STICKER_OPTIONS = [
+    { value: 1.5, label: '1.5 秒' },
+    { value: 2.0, label: '2.0 秒' },
+    { value: 3.0, label: '3.0 秒' },
+  ];
+  const DEFAULT_PREFS = { narrationSpeed: 1.0, scenePadding: 0.6, stickerDuration: 2.0 };
+
   /* 后端错误码 → 人能读懂的一句话 */
   const ERROR_ZH = {
     VOICE_UNAVAILABLE: '配音服务不可用，已重试',
@@ -93,9 +113,14 @@
   const state = {
     view: 'make',
     seconds: 45,
-    prefs: { style: '', voice: '' },
+    prefs: { style: '', voice: '', ...DEFAULT_PREFS },
     voiceOptions: DEFAULT_VOICE_OPTIONS.slice(),
     voicesLoaded: false,
+    // 表情候选：分镜表每场的表情选择器共用这一份（/api/stickers 拉一次）
+    stickerOptions: [],
+    stickersLoaded: false,
+    stickerModalOpen: false,
+    stickerTarget: -1,
     token: '',
     scenes: [],
     redoFrom: '',
@@ -590,35 +615,320 @@
       manim: null,
       status: '',
       note: '',
+      dirty: true,
     };
   }
 
   function loadScenes(scenes) {
     state.scenes = (Array.isArray(scenes) ? scenes : []).map((scene) => {
       const source = scene && typeof scene === 'object' ? scene : {};
-      const tool = source.tool === 'manim' || source.tool === 'text' ? source.tool : 'auto';
+      const tool = source.tool === 'manim' || source.tool === 'text' || source.tool === 'sticker'
+        ? source.tool
+        : 'auto';
       return {
         text: String(source.text || ''),
         narration: String(source.narration || ''),
         seconds: Math.min(15, Math.max(1, Number(source.seconds) || 5)),
         hint: String(source.hint || ''),
         tool,
-        stickers: Array.isArray(source.stickers) ? source.stickers.slice() : [],
+        // 每场最多 1 个：旧任务里多带的这里也裁掉，面板显示 1/1
+        stickers: Array.isArray(source.stickers) ? source.stickers.slice(0, 1) : [],
         image: String(source.image || ''),
         manim: source.manim && typeof source.manim === 'object' ? source.manim : null,
         status: String(source.status || ''),
         note: String(source.note || ''),
+        // 从旧任务载入的分镜先当作「干净」；用户一改就标脏
+        dirty: Boolean(source.dirty),
       };
     });
     renderScenes();
   }
 
+  /** 一场有没有内容：标题或旁白任一非空就值得提交（只有旁白也能让后端兜底出标题）。 */
+  function sceneHasContent(scene) {
+    return Boolean(scene && (String(scene.text || '').trim() || String(scene.narration || '').trim()));
+  }
+
   function sceneCountBadge() {
-    const n = state.scenes.filter((scene) => String(scene.text || '').trim()).length;
+    const n = state.scenes.filter(sceneHasContent).length;
     els.sceneCount.textContent = `${n} 场`;
     els.sceneCount.classList.toggle('hidden', !n);
     els.scenesEmpty.classList.toggle('hidden', state.scenes.length > 0);
     els.scenesTable.classList.toggle('hidden', state.scenes.length === 0);
+  }
+
+  /** 工具下拉补一项「表情卡」：index.html 里已经有了，这段兜住旧缓存/旧模板。 */
+  function ensureToolOptions(select) {
+    if (!select) return;
+    if (select.querySelector('option[value="sticker"]')) return;
+    const opt = document.createElement('option');
+    opt.value = 'sticker';
+    opt.textContent = '表情卡';
+    select.appendChild(opt);
+  }
+
+  function stickerGifUrl(id) {
+    return `/api/stickers/gif?id=${encodeURIComponent(String(id || ''))}`;
+  }
+
+  /** 情绪名优先；没有就用文件名去掉 .gif；再没有就用 id 前 6 位。 */
+  function stickerMood(item) {
+    const mood = String((item && item.mood) || '').trim();
+    if (mood) return mood;
+    const name = String((item && item.name) || '').trim().replace(/\.gif$/i, '');
+    if (name) return name;
+    return String((item && item.id) || '').slice(0, 6);
+  }
+
+  function stickerById(id) {
+    const wanted = String(id || '').toLowerCase();
+    return state.stickerOptions.find((item) => item.id === wanted) || null;
+  }
+
+  /** 表情候选：面板自带的 /api/stickers（转发 sticker 模块），收藏排前面。 */
+  async function loadStickers() {
+    try {
+      const data = await api('/api/stickers?limit=300');
+      const items = Array.isArray(data.items) ? data.items : [];
+      const seen = new Set();
+      const options = items.map((item) => {
+        const id = String((item && item.id) || '').trim().toLowerCase();
+        return {
+          id,
+          mood: stickerMood(item),
+          name: String((item && item.name) || ''),
+          favorite: Boolean(item && item.favorite),
+        };
+      }).filter((item) => {
+        if (!/^[0-9a-f]{6,40}$/i.test(item.id) || seen.has(item.id)) return false;
+        seen.add(item.id);
+        return true;
+      });
+      // 收藏优先；sort 是稳定排序，同组内保持后端给的顺序
+      options.sort((a, b) => Number(b.favorite) - Number(a.favorite));
+      state.stickerOptions = options;
+      state.stickersLoaded = true;
+    } catch (err) {
+      // 拉不到就保留旧目录，不把用户已选的表情弄丢
+      state.stickersLoaded = state.stickerOptions.length > 0;
+    }
+    if (state.scenes.length) renderScenes();
+    if (state.stickerModalOpen) renderStickerGrid();
+  }
+
+  /** 分镜表「表情」格：没选 = 一个「＋ 表情」；选了 = 48×48 动图缩略图 + 情绪名 + ×。 */
+  function renderStickerCell(cell, scene, index) {
+    if (!cell) return;
+    cell.textContent = '';
+    const chosen = Array.isArray(scene.stickers) && scene.stickers[0] ? scene.stickers[0] : null;
+    if (!chosen) {
+      const add = el('button', 'v2-sticker-empty', '＋ 表情');
+      add.type = 'button';
+      add.title = '选一个表情（每场最多 1 个）';
+      add.addEventListener('click', (event) => {
+        event.preventDefault();
+        openStickerPicker(index);
+      });
+      cell.appendChild(add);
+      return;
+    }
+
+    const id = String(chosen.id || '').toLowerCase();
+    const item = stickerById(id);
+    const mood = item ? item.mood : (String(chosen.mood || '').trim() || id.slice(0, 6));
+    const chip = el('div', 'v2-sticker-chip');
+    chip.setAttribute('role', 'button');
+    chip.tabIndex = 0;
+    chip.title = `当前表情：${mood}；点击换一个`;
+
+    const img = document.createElement('img');
+    img.className = 'v2-sticker-thumb';
+    img.width = 48;
+    img.height = 48;
+    img.loading = 'lazy';
+    img.alt = mood;
+    img.src = stickerGifUrl(id);
+    img.addEventListener('error', () => img.classList.add('v2-sticker-thumb-error'));
+
+    const name = el('span', 'v2-sticker-name', mood);
+    const clear = el('button', 'v2-sticker-clear', '×');
+    clear.type = 'button';
+    clear.title = '清除这个表情';
+
+    const open = (event) => {
+      if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      openStickerPicker(index);
+    };
+    chip.addEventListener('click', open);
+    chip.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') open(event);
+    });
+    clear.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      scene.stickers = [];
+      markSceneDirty(cell.closest('.v2-scene-row'), scene);
+      renderStickerCell(cell, scene, index);
+      toast('表情已清除');
+    });
+
+    chip.appendChild(img);
+    chip.appendChild(name);
+    chip.appendChild(clear);
+    cell.appendChild(chip);
+  }
+
+  function openStickerPicker(index) {
+    const scene = state.scenes[index];
+    if (!scene || !els.stickerModal) return;
+    state.stickerTarget = index;
+    state.stickerModalOpen = true;
+    els.stickerModal.classList.remove('hidden');
+    if (els.stickerSearch) els.stickerSearch.value = '';
+    renderStickerGrid();
+    if (!state.stickersLoaded) loadStickers();
+    window.setTimeout(() => {
+      if (els.stickerSearch) els.stickerSearch.focus();
+    }, 0);
+  }
+
+  function closeStickerPicker() {
+    state.stickerModalOpen = false;
+    state.stickerTarget = -1;
+    if (els.stickerModal) els.stickerModal.classList.add('hidden');
+  }
+
+  /** 选择器网格：每格都是 GIF 动图，下面情绪名，右上角收藏星。 */
+  function renderStickerGrid() {
+    if (!els.stickerGrid) return;
+    const query = String((els.stickerSearch && els.stickerSearch.value) || '').trim().toLowerCase();
+    const all = state.stickerOptions;
+    const target = state.stickerTarget >= 0 ? state.scenes[state.stickerTarget] : null;
+    const selectedId = target && Array.isArray(target.stickers) && target.stickers[0]
+      ? String(target.stickers[0].id || '').toLowerCase()
+      : '';
+
+    els.stickerGrid.textContent = '';
+    if (!all.length) {
+      if (els.stickerHint) {
+        els.stickerHint.textContent = state.stickersLoaded
+          ? '表情清单是空的：sticker 模块可能没起来'
+          : '正在加载表情…';
+      }
+      if (els.stickerSummary) els.stickerSummary.textContent = '';
+      return;
+    }
+
+    const list = query
+      ? all.filter((item) => `${item.mood} ${item.name}`.toLowerCase().includes(query))
+      : all;
+    if (!list.length) {
+      if (els.stickerHint) els.stickerHint.textContent = '没有匹配的表情，换个词试试';
+      if (els.stickerSummary) els.stickerSummary.textContent = `0/${all.length} 个`;
+      return;
+    }
+
+    for (const item of list) {
+      const btn = el('button', 'v2-sticker-item');
+      btn.type = 'button';
+      btn.dataset.id = item.id;
+      btn.title = `${item.mood} · 点击选中`;
+      btn.setAttribute('role', 'option');
+      btn.setAttribute('aria-selected', item.id === selectedId ? 'true' : 'false');
+      btn.classList.toggle('is-selected', item.id === selectedId);
+
+      const img = document.createElement('img');
+      img.className = 'v2-sticker-gif';
+      img.loading = 'lazy';
+      img.alt = item.mood;
+      img.src = stickerGifUrl(item.id);
+
+      const mood = el('span', 'v2-sticker-mood', item.mood);
+      const star = el('span', 'v2-sticker-star', item.favorite ? '★' : '☆');
+      star.classList.toggle('on', item.favorite);
+      star.setAttribute('role', 'button');
+      star.tabIndex = 0;
+      star.title = item.favorite ? '取消收藏' : '收藏这张';
+      star.setAttribute('aria-pressed', item.favorite ? 'true' : 'false');
+      const toggle = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        toggleStickerFavorite(item, star);
+      };
+      star.addEventListener('click', toggle);
+      star.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') toggle(event);
+      });
+
+      btn.appendChild(img);
+      btn.appendChild(mood);
+      btn.appendChild(star);
+      btn.addEventListener('click', (event) => {
+        if (event.target.closest('.v2-sticker-star')) return;
+        chooseSticker(item);
+      });
+      els.stickerGrid.appendChild(btn);
+    }
+
+    if (els.stickerSummary) {
+      els.stickerSummary.textContent = `${list.length}/${all.length} 个 · 收藏 ${all.filter((item) => item.favorite).length}`;
+    }
+    if (els.stickerHint) {
+      els.stickerHint.textContent = '点一张选中；★ 收藏；每场只能有 1 个表情';
+    }
+  }
+
+  async function toggleStickerFavorite(item, star) {
+    if (!item || !item.id) return;
+    const want = !item.favorite;
+    try {
+      if (want) {
+        await api('/api/stickers/favorite', {
+          method: 'POST',
+          body: { id: item.id, name: item.mood },
+        });
+      } else {
+        await api(`/api/stickers/favorite?id=${encodeURIComponent(item.id)}`, { method: 'DELETE' });
+      }
+      item.favorite = want;
+      if (star) {
+        star.textContent = want ? '★' : '☆';
+        star.classList.toggle('on', want);
+        star.title = want ? '取消收藏' : '收藏这张';
+        star.setAttribute('aria-pressed', want ? 'true' : 'false');
+      }
+      if (els.stickerSummary) {
+        els.stickerSummary.textContent = `${state.stickerOptions.length} 个 · 收藏 ${state.stickerOptions.filter((it) => it.favorite).length}`;
+      }
+      if (els.stickerHint) els.stickerHint.textContent = want ? `已收藏「${item.mood}」` : `已取消收藏「${item.mood}」`;
+    } catch (err) {
+      toast(errText(err));
+    }
+  }
+
+  /** 选中：立刻替换这一场的缩略图，并关掉选择器。 */
+  function chooseSticker(item) {
+    const index = state.stickerTarget;
+    const scene = state.scenes[index];
+    if (!scene || !item) return;
+    scene.stickers = [{ id: item.id, at: 1.2, x: 0.82, y: 0.12, scale: 0.3 }];
+    scene.dirty = true;
+    const row = els.scenesBody.querySelector(`.v2-scene-row[data-i="${index}"]`);
+    if (row) {
+      row.dataset.dirty = '1';
+      renderStickerCell(row.querySelector('.v2-scene-sticker-cell'), scene, index);
+    }
+    closeStickerPicker();
+    toast(`已选表情：${item.mood}`);
+  }
+
+  function markSceneDirty(row, scene) {
+    if (!scene) return;
+    scene.dirty = true;
+    if (row) row.dataset.dirty = '1';
   }
 
   function renderScenes() {
@@ -628,15 +938,20 @@
     state.scenes.forEach((scene, index) => {
       const row = tpl.content.firstElementChild.cloneNode(true);
       row.dataset.i = String(index);
+      row.dataset.dirty = scene.dirty ? '1' : '0';
       row.querySelector('.v2-scene-idx').textContent = String(index + 1);
       const text = row.querySelector('[data-field="text"]');
+      const narration = row.querySelector('[data-field="narration"]');
       const seconds = row.querySelector('[data-field="seconds"]');
       const tool = row.querySelector('[data-field="tool"]');
       const hint = row.querySelector('[data-field="hint"]');
       text.value = scene.text;
+      narration.value = scene.narration;
       seconds.value = String(Math.round(scene.seconds));
+      ensureToolOptions(tool);
       tool.value = scene.tool;
       hint.value = scene.hint;
+      renderStickerCell(row.querySelector('.v2-scene-sticker-cell'), scene, index);
       els.scenesBody.appendChild(row);
     });
     sceneCountBadge();
@@ -653,25 +968,35 @@
       const n = Number(target.value);
       scene.seconds = Math.min(15, Math.max(1, Number.isFinite(n) && n > 0 ? n : 5));
     } else if (field === 'tool') {
-      scene.tool = target.value === 'manim' || target.value === 'text' ? target.value : 'auto';
-    } else if (field === 'text' || field === 'hint') {
+      scene.tool = target.value === 'manim' || target.value === 'text' || target.value === 'sticker'
+        ? target.value
+        : 'auto';
+      if (scene.tool === 'sticker' && !(Array.isArray(scene.stickers) && scene.stickers.length)) {
+        toast('表情卡要先选一个表情；没选会降级成文字卡');
+      }
+    } else if (field === 'text' || field === 'hint' || field === 'narration') {
       scene[field] = target.value;
     }
+    markSceneDirty(row, scene);
     sceneCountBadge();
   }
 
   function collectScenes() {
     return state.scenes
-      .filter((scene) => String(scene.text || '').trim())
+      .filter(sceneHasContent)
       .map((scene) => ({
-        text: String(scene.text).trim(),
+        text: String(scene.text || '').trim(),
         narration: String(scene.narration || ''),
         seconds: Math.min(15, Math.max(1, Number(scene.seconds) || 5)),
         hint: String(scene.hint || ''),
-        tool: scene.tool === 'manim' || scene.tool === 'text' ? scene.tool : 'auto',
-        stickers: Array.isArray(scene.stickers) ? scene.stickers : [],
+        tool: scene.tool === 'manim' || scene.tool === 'text' || scene.tool === 'sticker'
+          ? scene.tool
+          : 'auto',
+        stickers: Array.isArray(scene.stickers) ? scene.stickers.slice(0, 1) : [],
         image: String(scene.image || ''),
         manim: scene.manim && typeof scene.manim === 'object' ? scene.manim : null,
+        // 面板自己的脏标记：studio-v2 会忽略未知字段，这里留着方便验收脚本看
+        dirty: Boolean(scene.dirty),
       }));
   }
 
@@ -684,7 +1009,7 @@
 
   function updateModeHint() {
     const text = els.topicInput.value.trim();
-    const sceneCount = state.scenes.filter((scene) => String(scene.text || '').trim()).length;
+    const sceneCount = state.scenes.filter(sceneHasContent).length;
     if (state.redoFrom) {
       showHint(`重做任务 ${state.redoFrom}：提交用下面 ${sceneCount} 场分镜`);
       return;
@@ -727,6 +1052,15 @@
     };
   }
 
+  /** 三个可调项：提交与重做都带上，服务端会再夹一次范围。 */
+  function tunableBody() {
+    return {
+      narrationSpeed: Number(state.prefs.narrationSpeed),
+      scenePadding: Number(state.prefs.scenePadding),
+      stickerDuration: Number(state.prefs.stickerDuration),
+    };
+  }
+
   async function onSubmit(event) {
     event.preventDefault();
     if (state.submitting) return;
@@ -760,6 +1094,9 @@
       path = '/api/v2/jobs';
       kind = isScript(text) ? 'script' : 'topic';
     }
+
+    // 三个可调项不分新建/重做都带：重做时可以只改语速
+    Object.assign(body, tunableBody());
 
     // 「跟人设」就省略，让 studio-v2 按人设补；手工选了才带上
     if (kind !== 'redo') {
@@ -838,6 +1175,7 @@
   /* ---------- 设置 ---------- */
 
   function fillSelect(select, options, value) {
+    if (!select) return;
     select.textContent = '';
     options.forEach((option) => {
       const node = document.createElement('option');
@@ -858,15 +1196,25 @@
     const style = STYLE_OPTIONS.some((option) => option.value === raw.style) ? raw.style : '';
     // 音色 id 由 speak 动态给（voc_xxx），本地只做类型检查，具体是否存在等清单回来再对上
     const voice = typeof raw.voice === 'string' ? raw.voice : '';
-    state.prefs = { style, voice };
+    // 三个可调项：只接受下拉里列出的值，非法/越界回默认
+    const narrationSpeed = pickNumber(raw.narrationSpeed, SPEED_OPTIONS, DEFAULT_PREFS.narrationSpeed);
+    const scenePadding = pickNumber(raw.scenePadding, PADDING_OPTIONS, DEFAULT_PREFS.scenePadding);
+    const stickerDuration = pickNumber(raw.stickerDuration, STICKER_OPTIONS, DEFAULT_PREFS.stickerDuration);
+    state.prefs = { style, voice, narrationSpeed, scenePadding, stickerDuration };
+  }
+
+  /** localStorage 里是任意字符串，只认下拉里的离散值。 */
+  function pickNumber(value, options, fallback) {
+    const n = Number(value);
+    return options.some((option) => option.value === n) ? n : fallback;
   }
 
   function savePrefs() {
     try {
       window.localStorage.setItem(PREFS_KEY, JSON.stringify(state.prefs));
-      els.saveHint.textContent = '已保存到本机';
+      if (els.saveHint) els.saveHint.textContent = '已保存到本机';
     } catch (err) {
-      els.saveHint.textContent = '这个浏览器存不了设置（隐私模式？）';
+      if (els.saveHint) els.saveHint.textContent = '这个浏览器存不了设置（隐私模式？）';
     }
   }
 
@@ -885,6 +1233,19 @@
     fillSelect(els.voiceSel, voiceChoices(), state.prefs.voice);
     fillSelect(els.setStyle, STYLE_OPTIONS, state.prefs.style);
     fillSelect(els.setVoice, voiceChoices(), state.prefs.voice);
+    fillSelect(els.setSpeed, SPEED_OPTIONS, state.prefs.narrationSpeed);
+    fillSelect(els.setPadding, PADDING_OPTIONS, state.prefs.scenePadding);
+    fillSelect(els.setSticker, STICKER_OPTIONS, state.prefs.stickerDuration);
+    updateTunablesHint();
+  }
+
+  /** 高级区一行汇总，让用户不用切回设置页也知道当前节奏参数。 */
+  function updateTunablesHint() {
+    if (!els.advTunablesHint) return;
+    const speed = Number(state.prefs.narrationSpeed).toFixed(1);
+    const padding = Number(state.prefs.scenePadding).toFixed(1);
+    const sticker = Number(state.prefs.stickerDuration).toFixed(1);
+    els.advTunablesHint.textContent = `语速 ${speed}× · 停留 ${padding} 秒 · 表情一轮 ${sticker} 秒（循环播放，在设置页改）`;
   }
 
   function setVoiceHint(text) {
@@ -941,7 +1302,11 @@
     } else {
       stopListPoll();
     }
-    if (name === 'settings') applyPrefs();
+    if (name === 'settings') {
+      // 每次进设置页都确认三行还在：静态 HTML + JS 兜底都走这里
+      mountTunableDom();
+      applyPrefs();
+    }
   }
 
   let toastTimer = 0;
@@ -1027,6 +1392,26 @@
     els.voiceSel.addEventListener('change', () => onPrefChange('voice', els.voiceSel.value));
     els.setStyle.addEventListener('change', () => onPrefChange('style', els.setStyle.value));
     els.setVoice.addEventListener('change', () => onPrefChange('voice', els.setVoice.value));
+    bindTunableRow(els.setSpeed, 'narrationSpeed');
+    bindTunableRow(els.setPadding, 'scenePadding');
+    bindTunableRow(els.setSticker, 'stickerDuration');
+
+    // 表情选择器：点背景 / ✕ / Esc 关闭，搜索框即时过滤
+    if (els.stickerModal) {
+      if (els.stickerClose) els.stickerClose.addEventListener('click', closeStickerPicker);
+      els.stickerModal.addEventListener('click', (event) => {
+        if (event.target === els.stickerModal) closeStickerPicker();
+      });
+      if (els.stickerSearch) {
+        els.stickerSearch.addEventListener('input', renderStickerGrid);
+        els.stickerSearch.addEventListener('keydown', (event) => {
+          if (event.key === 'Escape') closeStickerPicker();
+        });
+      }
+    }
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && state.stickerModalOpen) closeStickerPicker();
+    });
 
     els.redoCancel.addEventListener('click', () => {
       state.redoFrom = '';
@@ -1074,19 +1459,125 @@
       voiceSel: $('#v2VoiceSel'),
       setStyle: $('#v2SetStyle'),
       setVoice: $('#v2SetVoice'),
+      setSpeed: $('#v2SetSpeed'),
+      setPadding: $('#v2SetPadding'),
+      setSticker: $('#v2SetSticker'),
+      advTunablesHint: $('#v2AdvTunablesHint'),
       voiceHint: $('#v2VoiceHint'),
       saveHint: $('#v2SaveHint'),
       jobsList: $('#v2JobsList'),
       jobsEmpty: $('#v2JobsEmpty'),
       jobsSummary: $('#v2JobsSummary'),
       refreshJobs: $('#v2RefreshJobs'),
+      stickerModal: $('#v2StickerModal'),
+      stickerGrid: $('#v2StickerGrid'),
+      stickerSearch: $('#v2StickerSearch'),
+      stickerSummary: $('#v2StickerSummary'),
+      stickerHint: $('#v2StickerHint'),
+      stickerClose: $('#v2StickerClose'),
       toast: $('#v2Toast'),
     };
   }
 
+  /**
+   * 三个可调项：index.html 里已经是静态三行，这里只做兜底——
+   * 合并后的 HTML 要是缺了哪一行（或整张设置卡），切到设置页时补出来，
+   * 不再依赖 init() 是否跑过。幂等，重复调用不会出现第二份。
+   */
+  function mountTunableDom() {
+    let card = $('#v2SetVoice') ? $('#v2SetVoice').closest('.v2-settings-card') : null;
+
+    // 整张设置卡都没有：直接在设置视图里建一张，保证三行有地方放
+    if (!card) {
+      const view = $('#v2-view-settings');
+      if (view) {
+        let host = view.querySelector('.v2-settings');
+        if (!host) {
+          host = el('div', 'v2-settings');
+          view.appendChild(host);
+        }
+        card = el('div', 'v2-card v2-settings-card');
+        host.appendChild(card);
+      }
+    }
+
+    if (card) {
+      const rows = [
+        { id: 'v2SetSpeed', label: '语速', note: '越快越赶，1.0 最自然' },
+        { id: 'v2SetPadding', label: '停留', note: '旁白说完后画面多停一会儿，想慢一点就调大' },
+        { id: 'v2SetSticker', label: '表情持续', note: '表情播完一轮的时间（循环播放）' },
+      ];
+      const voiceRow = $('#v2SetVoice') ? $('#v2SetVoice').closest('.v2-set-row') : null;
+      let anchor = voiceRow ? voiceRow.nextSibling : null;
+      for (const row of rows) {
+        if ($('#' + row.id)) {
+          if (anchor && anchor.parentNode === card) anchor = anchor.nextSibling;
+          continue;
+        }
+        const line = el('label', 'v2-set-row');
+        line.appendChild(el('span', 'v2-set-label', row.label));
+        const select = document.createElement('select');
+        select.id = row.id;
+        line.appendChild(select);
+        line.appendChild(el('span', 'v2-set-note', row.note));
+        card.insertBefore(line, anchor || null);
+        anchor = line.nextSibling;
+      }
+    }
+
+    if (!$('#v2AdvTunablesHint')) {
+      const advRow = $('#v2Advanced .v2-adv-row');
+      if (advRow) {
+        const hint = el('p', 'v2-hint v2-adv-tunables');
+        hint.id = 'v2AdvTunablesHint';
+        advRow.insertAdjacentElement('afterend', hint);
+      }
+    }
+
+    // 分镜表是 <template> 克隆出来的：改模板，每一行都会带上这行小字
+    const tpl = $('#v2SceneRowTpl');
+    const secInput = tpl ? tpl.content.querySelector('.v2-scene-sec') : null;
+    if (secInput && !tpl.content.querySelector('.v2-scene-sec-hint')) {
+      const cell = secInput.parentElement;
+      if (cell) {
+        cell.classList.add('v2-scene-sec-cell');
+        cell.appendChild(el('span', 'v2-scene-sec-hint', '改大会让这一场多停一会儿'));
+      }
+    }
+
+    // 工具下拉兜底补「表情卡」：index.html 已带，但旧缓存里可能没有
+    const tplTool = tpl ? tpl.content.querySelector('[data-field="tool"]') : null;
+    if (tplTool) ensureToolOptions(tplTool);
+
+    refreshTunableEls();
+  }
+
+  /** 重新拿三个下拉的引用（DOM 被重建/兜底创建时用）。 */
+  function refreshTunableEls() {
+    els.setSpeed = $('#v2SetSpeed');
+    els.setPadding = $('#v2SetPadding');
+    els.setSticker = $('#v2SetSticker');
+    els.advTunablesHint = $('#v2AdvTunablesHint');
+    bindTunableRow(els.setSpeed, 'narrationSpeed');
+    bindTunableRow(els.setPadding, 'scenePadding');
+    bindTunableRow(els.setSticker, 'stickerDuration');
+  }
+
+  function bindTunableRow(select, key) {
+    if (!select || select.dataset.tunableBound === '1') return;
+    select.dataset.tunableBound = '1';
+    select.addEventListener('change', () => onPrefChange(key, Number(select.value)));
+  }
+
   function init() {
+    mountTunableDom();
     els = collectEls();
-    const missing = Object.keys(els).filter((key) => !els[key]);
+    // 表情选择器的节点允许缺失（旧缓存页面），不影响其它功能
+    const optional = new Set([
+      'stickerModal', 'stickerGrid', 'stickerSearch', 'stickerSummary', 'stickerHint', 'stickerClose',
+      'advTunablesHint', 'voiceHint', 'saveHint',
+    ]);
+    const missing = Object.keys(els).filter((key) => !els[key] && !optional.has(key));
     if (missing.length) {
       console.warn('video-v2: 缺少 DOM 节点', missing.join(', '));
       return;
@@ -1098,6 +1589,7 @@
     bindEvents();
     renderScenes();
     updateModeHint();
+    loadStickers();
     loadVoices();
 
     // 首屏探一次服务状态；之后只在有任务/任务页时轮询
@@ -1109,11 +1601,16 @@
   /** 旧面板切到视频 tab、或登录成功时调用；重复调用只做刷新。 */
   function enter() {
     syncToken();
+    // 先补设置页三行：这样即使前面的 init 没跑成，切到视频页也看得到
+    mountTunableDom();
     if (!state.initialized) {
       init();
       return;
     }
+    if (!els.setSpeed) refreshTunableEls();
+    applyPrefs();
     if (!state.voicesLoaded) loadVoices();
+    if (!state.stickersLoaded) loadStickers();
     pollJobs();
     if (state.currentJobId && state.timers.poll) pollCurrent();
   }
@@ -1131,6 +1628,23 @@
         scenes: state.scenes.length,
         redoFrom: state.redoFrom,
         polling: Boolean(state.timers.poll),
+        prefs: { ...state.prefs },
+        tunables: {
+          speed: state.prefs.narrationSpeed,
+          padding: state.prefs.scenePadding,
+          sticker: state.prefs.stickerDuration,
+          rows: $$('.v2-set-row').length,
+        },
+        stickerCatalog: state.stickerOptions.length,
+        stickerModalOpen: state.stickerModalOpen,
+        sceneDetails: state.scenes.map((scene) => ({
+          text: scene.text,
+          narration: scene.narration,
+          seconds: scene.seconds,
+          tool: scene.tool,
+          stickers: Array.isArray(scene.stickers) ? scene.stickers.map((s) => String(s.id || '')) : [],
+          dirty: Boolean(scene.dirty),
+        })),
       };
     },
   };

@@ -8,13 +8,26 @@
  *
  * 场景契约（唯一真相）：
  *   { text, narration, seconds, hint, tool, stickers, image, manim, status, note }
+ *
+ * tool：manim（动画）/ text（文字卡）/ sticker（表情卡，不画图只放一个大表情）/ auto。
+ * stickers：每场最多 1 个，多余的在这里裁掉（会写一条日志）。
  */
 
 const crypto = require('node:crypto');
 
-const TOOLS = new Set(['manim', 'text', 'auto']);
+const TOOLS = new Set(['manim', 'text', 'sticker', 'auto']);
 const STATUSES = new Set(['pending', 'ready', 'degraded', 'failed']);
 const STICKER_ID_RE = /^[0-9a-f]{6,40}$/i;
+
+/**
+ * 三个可调参数的定义只在这里：范围 + 默认值。
+ * 请求里缺省时用 def，越界时夹回 [lo, hi]，保证 job 记录里永远是可复现的确定值。
+ */
+const TUNABLES = {
+  narrationSpeed: { lo: 0.85, hi: 1.25, def: 1.0 },
+  scenePadding: { lo: 0, hi: 3, def: 0.6 },
+  stickerDuration: { lo: 1.2, hi: 4, def: 2.0 },
+};
 
 function str(v, max) {
   const s = v == null ? '' : String(v);
@@ -31,15 +44,23 @@ function round2(v) {
   return Math.round(Number(v) * 100) / 100;
 }
 
+/** 可调参数：非法值退回默认，越界夹到范围内。 */
+function tunable(name, v) {
+  const t = TUNABLES[name];
+  return round2(clampNum(v, t.lo, t.hi, t.def));
+}
+
 /** 单个表情的规范化：位置/大小/时间都夹在安全范围内，id 不合法就丢掉。 */
 function normalizeSticker(raw, index) {
   const r = raw && typeof raw === 'object' ? raw : {};
   const id = str(r.id, 40).trim().toLowerCase();
   if (!STICKER_ID_RE.test(id)) return null;
+  // duration 没显式给就留 null：运行时用全局 stickerDuration（场景显式给了以场景为准）
+  const hasDuration = r.duration != null && r.duration !== '' && Number.isFinite(Number(r.duration));
   return {
     id,
     at: round2(clampNum(r.at, 0, 60, 1.2)),
-    duration: round2(clampNum(r.duration, 0.6, 8, 1.8)),
+    duration: hasDuration ? round2(clampNum(r.duration, 0.6, 8, 2)) : null,
     x: round2(clampNum(r.x, 0, 1, 0.82)),
     y: round2(clampNum(r.y, 0, 1, 0.12)),
     scale: round2(clampNum(r.scale, 0.1, 1, 0.3)),
@@ -53,18 +74,27 @@ function normalizeTool(raw, hasCode) {
   if (TOOLS.has(tool)) return tool;
   const kind = str(raw.kind, 12).trim().toLowerCase();
   const visual = str(raw.visual, 12).trim().toLowerCase();
+  if (kind === 'sticker' || visual === 'sticker') return 'sticker';
   if (kind === 'manim' || visual === 'manim') return 'manim';
   if (kind === 'text' || visual === 'text') return 'text';
   if (hasCode) return 'manim';
   return 'auto';
 }
 
+/** 表情上限的日志：schema 里没有 ctx，用调用方给的 logger，没有就 console。 */
+function dropLog(opts, msg) {
+  const o = opts && typeof opts === 'object' ? opts : {};
+  if (typeof o.log === 'function') o.log(msg);
+  else console.warn(`[schema] ${msg}`);
+}
+
 /**
  * 唯一入口：任何来源的分镜都必须先过这里。
  * 返回的每个字段都可序列化，且不会再出现别名。
  */
-function normalizeScene(raw) {
+function normalizeScene(raw, options) {
   const r = raw && typeof raw === 'object' ? raw : {};
+  const opts = options && typeof options === 'object' ? options : {};
 
   let text = str(r.text, 80).trim();
   let narration = str(r.narration, 400).trim();
@@ -82,10 +112,16 @@ function normalizeScene(raw) {
     };
   }
 
-  const rawStickers = Array.isArray(r.stickers) ? r.stickers.slice(0, 3) : [];
-  const stickers = rawStickers
+  const rawStickers = Array.isArray(r.stickers) ? r.stickers.slice(0, 8) : [];
+  const parsedStickers = rawStickers
     .map((s, i) => normalizeSticker(s, i))
     .filter(Boolean);
+  // 每场最多 1 个表情：多余的直接丢，并留一条日志（用户要求）
+  const stickers = parsedStickers.slice(0, 1);
+  if (parsedStickers.length > 1) {
+    const where = Number.isInteger(opts.index) ? `第 ${opts.index + 1} 场` : '某一场';
+    dropLog(opts, `${where}有 ${parsedStickers.length} 个表情，每场最多 1 个，只保留第一个`);
+  }
 
   const image = r.image == null || r.image === '' ? null : str(r.image, 300);
 
@@ -96,19 +132,21 @@ function normalizeScene(raw) {
   return { text, narration, seconds, hint, tool, stickers, image, manim, status, note };
 }
 
-function normalizeScenes(list, maxScenes) {
+function normalizeScenes(list, maxScenes, log) {
   const arr = Array.isArray(list) ? list : [];
   const cap = Math.max(1, Number(maxScenes) || 80);
-  return arr.slice(0, cap).map(normalizeScene).filter((s) => s.text || s.narration || s.hint);
+  return arr.slice(0, cap)
+    .map((s, index) => normalizeScene(s, { index, log }))
+    .filter((s) => s.text || s.narration || s.hint);
 }
 
 /**
  * 任务请求的唯一白名单。三种输入互斥，scenes 优先。
  * 这里只做字段收口，不判断 IO；server.js 再决定 400 还是入队。
  */
-function normalizeRequest(body) {
+function normalizeRequest(body, log) {
   const b = body && typeof body === 'object' ? body : {};
-  const scenes = Array.isArray(b.scenes) ? normalizeScenes(b.scenes) : [];
+  const scenes = Array.isArray(b.scenes) ? normalizeScenes(b.scenes, undefined, log) : [];
   return {
     topic: str(b.topic, 2000).trim(),
     script: str(b.script, 20000).trim(),
@@ -117,6 +155,10 @@ function normalizeRequest(body) {
     style: str(b.style, 60).trim(),
     voice: b.voice == null ? '' : str(b.voice, 80).trim(),
     fresh: b.fresh === true,
+    // 三个可调项：缺省、越界都在这里收口，下游只读规范化后的值
+    narrationSpeed: tunable('narrationSpeed', b.narrationSpeed),
+    scenePadding: tunable('scenePadding', b.scenePadding),
+    stickerDuration: tunable('stickerDuration', b.stickerDuration),
   };
 }
 
@@ -152,6 +194,12 @@ function newJob(request) {
     warnings: [],
     error: null,
     scenes: [],
+    // 三个可调项单独留一份快照：复现一条成片时不用再翻 request
+    params: {
+      narrationSpeed: request.narrationSpeed,
+      scenePadding: request.scenePadding,
+      stickerDuration: request.stickerDuration,
+    },
     request,
   };
 }
@@ -159,6 +207,7 @@ function newJob(request) {
 module.exports = {
   TOOLS,
   STATUSES,
+  TUNABLES,
   normalizeScene,
   normalizeScenes,
   normalizeRequest,
@@ -167,4 +216,5 @@ module.exports = {
   nowIso,
   clampNum,
   round2,
+  tunable,
 };

@@ -3,10 +3,11 @@
  * server.js -- studio-v2 路由 + 任务队列。
  *
  * 唯一契约（5 个口）：
- *   POST /v1/jobs            {topic?|script?|scenes?, seconds?, style?, voice?, fresh?} -> {ok, jobId}
- *   GET  /v1/jobs/:id        任务状态（实时进度）
+ *   POST /v1/jobs            {topic?|script?|scenes?, seconds?, style?, voice?, fresh?,
+ *                             narrationSpeed?=1.0, scenePadding?=0.6, stickerDuration?=2.0} -> {ok, jobId}
+ *   GET  /v1/jobs/:id        任务状态（实时进度；含 params 回显）
  *   GET  /v1/jobs            最近 50
- *   POST /v1/jobs/:id/redo   {scenes} -> {ok, jobId}
+ *   POST /v1/jobs/:id/redo   {scenes, narrationSpeed?, scenePadding?, stickerDuration?} -> {ok, jobId}
  *   GET  /v1/video/:id       mp4 字节；?srt=1 返回 srt
  *   GET  /v1/health          {ok, manim, ffmpeg}
  *
@@ -44,6 +45,21 @@ const CACHE = new Cache(CFG.cacheDir);
 const STARTED_AT = Date.now();
 const PORT = Number(CFG.port) || 8774;
 
+/**
+ * 每个任务一份 cfg：全局配置 + 请求里的三个可调项。
+ * 下游（plan/render/audio/stickers）只读这一份，不各自去翻 request。
+ */
+function jobConfig(request) {
+  const req = request || {};
+  const pad = Number(req.scenePadding);
+  return {
+    ...CFG,
+    narrationSpeed: Number(req.narrationSpeed) || 1,
+    scenePadding: Number.isFinite(pad) ? pad : 0.6,
+    stickerDuration: Number(req.stickerDuration) || 2,
+  };
+}
+
 function log(msg) {
   const line = `[${new Date().toISOString()}] [v2] ${String(msg)}`;
   console.log(line);
@@ -72,6 +88,7 @@ function persist(job) {
 }
 
 function publicJob(job) {
+  const req = job.request || {};
   return {
     ok: true,
     id: job.id,
@@ -88,6 +105,12 @@ function publicJob(job) {
     srtUrl: job.srtUrl || '',
     warnings: Array.isArray(job.warnings) ? job.warnings : [],
     error: job.error || null,
+    // 三个可调项回显给面板/复现脚本；老任务没有 params 时按 request 兜底
+    params: job.params || {
+      narrationSpeed: req.narrationSpeed,
+      scenePadding: req.scenePadding,
+      stickerDuration: req.stickerDuration,
+    },
     scenes: Array.isArray(job.scenes) ? job.scenes : [],
   };
 }
@@ -156,11 +179,13 @@ async function pump() {
 // ------------------------------------------------------------------ 跑任务 ----
 async function runJob(job) {
   job.startedAt = Date.now();
+  const cfg = jobConfig(job.request);
   update(job, {
     status: 'running', phase: 'plan', label: '规划分镜', done: 0,
     total: job.request.scenes.length || 0, startedAt: job.startedAt, error: null,
   });
-  jobLog(job, `开始：${job.request.scenes.length ? `分镜 ${job.request.scenes.length} 场` : job.request.script ? '稿子模式' : '主题模式'}`);
+  jobLog(job, `开始：${job.request.scenes.length ? `分镜 ${job.request.scenes.length} 场` : job.request.script ? '稿子模式' : '主题模式'}`
+    + `，语速 ${cfg.narrationSpeed}×，停留 ${cfg.scenePadding}s，表情一轮 ${cfg.stickerDuration}s`);
 
   const ctx = {
     log: (m) => jobLog(job, m),
@@ -169,7 +194,7 @@ async function runJob(job) {
   };
 
   const planned = await Plan.plan({
-    req: job.request, cfg: CFG, cache: CACHE, redo: Boolean(job.redoOf), ctx,
+    req: job.request, cfg, cache: CACHE, redo: Boolean(job.redoOf), ctx,
   });
   if (!planned.ok) throw new Error(planned.error || 'PLAN_FAILED');
   for (const w of planned.warnings || []) if (!job.warnings.includes(w)) job.warnings.push(w);
@@ -183,7 +208,7 @@ async function runJob(job) {
 
   const rendered = await Render.renderScenes({
     scenes: job.scenes, style: planned.style, voice: job.request.voice,
-    cfg: CFG, cache: CACHE, job, ctx,
+    cfg, cache: CACHE, job, ctx,
     onProgress: (p) => {
       update(job, {
         phase: p.phase, label: p.label, done: p.done, total: p.total,
@@ -206,7 +231,7 @@ async function runJob(job) {
   const outFile = path.join(CFG.outDir, `${job.id}.mp4`);
   const srtFile = path.join(CFG.outDir, `${job.id}.srt`);
   const concat = await Render.concatScenes({
-    entries: rendered.entries, outFile, cfg: CFG,
+    entries: rendered.entries, outFile, cfg,
     log: (m) => jobLog(job, m),
   });
   if (!concat.ok) throw new Error(concat.error || 'CONCAT_FAILED');
@@ -336,7 +361,7 @@ const server = http.createServer(async (req, res) => {
       } catch (err) {
         return json(res, 400, { ok: false, error: 'BAD_JSON', detail: String((err && err.message) || err) });
       }
-      const request = S.normalizeRequest(body);
+      const request = S.normalizeRequest(body, (m) => log(m));
       const hasInput = Boolean(request.topic || request.script || request.scenes.length);
       if (!hasInput) return json(res, 400, { ok: false, error: 'INPUT_REQUIRED', message: 'topic / script / scenes 三选一' });
       const job = S.newJob(request);
@@ -344,7 +369,8 @@ const server = http.createServer(async (req, res) => {
       job.total = request.scenes.length;
       JOBS.set(job.id, job);
       persist(job);
-      jobLog(job, `提交：${request.scenes.length ? `${request.scenes.length} 场分镜` : request.script ? '稿子' : `主题「${request.topic.slice(0, 30)}」`}，${request.seconds}s，voice="${request.voice}"`);
+      jobLog(job, `提交：${request.scenes.length ? `${request.scenes.length} 场分镜` : request.script ? '稿子' : `主题「${request.topic.slice(0, 30)}」`}，${request.seconds}s，voice="${request.voice}"，`
+        + `语速 ${request.narrationSpeed}×，停留 ${request.scenePadding}s，表情一轮 ${request.stickerDuration}s`);
       enqueue(job);
       return json(res, 200, { ok: true, jobId: job.id });
     }
@@ -384,23 +410,29 @@ const server = http.createServer(async (req, res) => {
       } catch (err) {
         return json(res, 400, { ok: false, error: 'BAD_JSON', detail: String((err && err.message) || err) });
       }
-      const scenes = S.normalizeScenes(body.scenes, CFG.maxScenes);
+      const scenes = S.normalizeScenes(body.scenes, CFG.maxScenes, (m) => log(`[${prev.id}] ${m}`));
       if (!scenes.length) return json(res, 400, { ok: false, error: 'SCENES_REQUIRED' });
       const base = prev.request || {};
-      const request = {
-        topic: '', script: '', scenes,
+      // 三个可调项：body 显式给了就用 body（重做时可以改语速），否则沿用上一条任务
+      const pick = (name) => (body[name] == null ? base[name] : body[name]);
+      const request = S.normalizeRequest({
+        scenes,
         seconds: Number(base.seconds) || 30,
         style: String(base.style || ''),
         voice: base.voice == null ? '' : String(base.voice),
+        narrationSpeed: pick('narrationSpeed'),
+        scenePadding: pick('scenePadding'),
+        stickerDuration: pick('stickerDuration'),
         fresh: false,
-      };
+      }, (m) => log(`[redo] ${m}`));
       const job = S.newJob(request);
       job.redoOf = prev.id;
       job.title = String(scenes[0].text || '');
       job.total = scenes.length;
       JOBS.set(job.id, job);
       persist(job);
-      jobLog(job, `重做：基于 ${prev.id}，${scenes.length} 场，标题「${job.title}」`);
+      jobLog(job, `重做：基于 ${prev.id}，${scenes.length} 场，标题「${job.title}」，`
+        + `语速 ${request.narrationSpeed}×，停留 ${request.scenePadding}s，表情一轮 ${request.stickerDuration}s`);
       enqueue(job);
       return json(res, 200, { ok: true, jobId: job.id });
     }
