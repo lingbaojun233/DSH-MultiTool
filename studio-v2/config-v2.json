@@ -35,11 +35,17 @@
   "narrationSpeed": 1.0,
   "scenePadding": 0.6,
   "stickerDuration": 2.0,
+  "voicePitch": 1.0,
   "animCompressFloor": 0.85,
   "animStretchCeil": 2,
   "defaultStyle": "whiteboard",
   "defaultVoice": "",
   "defaultUserId": 1,
+  "canvas": {
+    "bg": "#FFFFFF",
+    "fg": "#1A1A1A",
+    "muted": "#6B7280"
+  },
   "subtitles": {
     "enabled": true,
     "fontName": "Microsoft YaHei",
@@ -83,44 +89,44 @@
     "whiteboard": {
       "id": "whiteboard",
       "name": "白板讲解",
-      "bg": "#f7f5ef",
-      "fg": "#23262c",
-      "accent": "#2a5cb3",
-      "muted": "#8a8f99",
-      "accent2": "#d97757",
+      "bg": "#FFFFFF",
+      "fg": "#1A1A1A",
+      "accent": "#002FA7",
+      "muted": "#6B7280",
+      "accent2": "#D97757",
       "line_width": 4,
       "glow": false,
       "font": "Microsoft YaHei",
       "motion": "relaxed",
-      "notes": "暖白板 + 单色墨。深墨画结构与字，蓝画过程/测量，橙只点最重要的东西。"
+      "notes": "纯白底 + 深墨字。深墨画结构与字，克莱因蓝画过程/测量（也是外边框色），橙只点最重要的东西。底色永远纯白，不要深底浅字。"
     },
     "blueprint": {
       "id": "blueprint",
       "name": "工程蓝图",
-      "bg": "#18336b",
-      "fg": "#e7f0f9",
-      "accent": "#e7f0f9",
-      "muted": "#6e93c4",
-      "accent2": "#c8363a",
+      "bg": "#FFFFFF",
+      "fg": "#1A1A1A",
+      "accent": "#002FA7",
+      "muted": "#5B6B85",
+      "accent2": "#C8363A",
       "line_width": 2,
       "glow": false,
       "font": "Microsoft YaHei",
       "motion": "precise",
-      "notes": "蓝底白线，像晒图纸：只有蓝与白，红色印章全片只准用一次，用来盖结论。"
+      "notes": "纯白工程稿：深墨画结构，克莱因蓝画尺寸/过程，红色印章全片只准用一次，用来盖结论。底色永远纯白。"
     },
     "oscilloscope-math": {
       "id": "oscilloscope-math",
       "name": "示波器数学",
-      "bg": "#010402",
-      "fg": "#8dffb0",
-      "accent": "#4dff88",
-      "muted": "#3f7a58",
-      "accent2": "#ffb547",
+      "bg": "#FFFFFF",
+      "fg": "#1A1A1A",
+      "accent": "#1B7F5A",
+      "muted": "#6B8F72",
+      "accent2": "#B26A00",
       "line_width": 3,
-      "glow": true,
+      "glow": false,
       "font": "Microsoft YaHei",
       "motion": "slow",
-      "notes": "磷光屏黑底 + 电子束绿，白热点只给最新画出的点，琥珀只给测量游标。"
+      "notes": "白底示波器：深墨画曲线，电气绿画电子束，琥珀只给测量游标。底色永远纯白。"
     }
   }
 }

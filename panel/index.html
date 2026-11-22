@@ -104,6 +104,12 @@
         <!-- 做视频：默认视图，一屏完成 -->
         <section id="v2-view-make" class="video-v2-view active" role="tabpanel" aria-label="做视频">
           <form id="v2MakeForm" class="v2-make" novalidate>
+            <!-- 项目：一个主题可以重做多版；默认「+ 新建项目」 -->
+            <div id="v2ProjectRow" class="v2-project-row">
+              <span class="v2-field-label">项目</span>
+              <select id="v2ProjectSel" class="v2-project-sel" aria-label="项目"></select>
+              <span id="v2ProjectHint" class="v2-hint v2-project-hint"></span>
+            </div>
             <textarea id="v2TopicInput" class="v2-input" rows="4" maxlength="20000"
               placeholder="你想做什么视频？也可以贴一段稿子" aria-label="视频主题或稿子"></textarea>
 
@@ -187,10 +193,10 @@
           </details>
         </section>
 
-        <!-- 任务：最近 50 条 -->
+        <!-- 任务：项目 → 版本（一个主题一张卡，展开看历史版本） -->
         <section id="v2-view-jobs" class="video-v2-view" role="tabpanel" aria-label="任务">
           <div id="v2JobsToolbar" class="v2-jobs-toolbar">
-            <span id="v2JobsSummary" class="v2-muted">最近 50 条</span>
+            <span id="v2JobsSummary" class="v2-muted">还没有项目</span>
             <button type="button" id="v2RefreshJobs" class="v2-btn v2-sm">刷新</button>
           </div>
           <div id="v2JobsList" class="v2-jobs"></div>
@@ -213,6 +219,11 @@
                 <span class="v2-set-label">语速</span>
                 <select id="v2SetSpeed"></select>
                 <span class="v2-set-note">越快越赶，1.0 最自然</span>
+              </label>
+              <label class="v2-set-row">
+                <span class="v2-set-label">音高</span>
+                <select id="v2SetPitch"></select>
+                <span class="v2-set-note">半音：+1 更清亮，0 = 原声</span>
               </label>
               <label class="v2-set-row">
                 <span class="v2-set-label">停留</span>

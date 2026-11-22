@@ -3,13 +3,23 @@
  * server.js -- studio-v2 路由 + 任务队列。
  *
  * 唯一契约（5 个口）：
- *   POST /v1/jobs            {topic?|script?|scenes?, seconds?, style?, voice?, fresh?,
- *                             narrationSpeed?=1.0, scenePadding?=0.6, stickerDuration?=2.0} -> {ok, jobId}
- *   GET  /v1/jobs/:id        任务状态（实时进度；含 params 回显）
+ *   POST /v1/jobs            {topic?|script?|scenes?, seconds?, style?, voice?, fresh?, projectId?,
+ *                             narrationSpeed?=1.0, scenePadding?=0.6, stickerDuration?=2.0,
+ *                             voicePitch?=1.0} -> {ok, jobId, projectId, version}
+ *   GET  /v1/jobs/:id        任务状态（实时进度；含 params / projectId / version 回显）
  *   GET  /v1/jobs            最近 50
- *   POST /v1/jobs/:id/redo   {scenes, narrationSpeed?, scenePadding?, stickerDuration?} -> {ok, jobId}
+ *   POST /v1/jobs/:id/redo   {scenes, narrationSpeed?, scenePadding?, stickerDuration?, voicePitch?}
+ *                            -> {ok, jobId, projectId, version}
  *   GET  /v1/video/:id       mp4 字节；?srt=1 返回 srt
  *   GET  /v1/health          {ok, manim, ffmpeg}
+ *
+ * 项目（主题）层：一个视频主题可以重做多次，每个 job 是它的一版。
+ *   POST   /v1/projects          {title?} -> {ok, projectId}
+ *   GET    /v1/projects          -> {ok, projects:[...], ungrouped:[...]}
+ *   GET    /v1/projects/:id      -> {ok, project, jobs:[...按版本升序]}
+ *   POST   /v1/projects/:id      改名 {title} -> {ok, project}
+ *   DELETE /v1/projects/:id      连带删掉它的 job 记录与 mp4 -> {ok, jobIds, freedBytes}
+ * 没给 projectId 的提交会自动建一个项目；重做沿用原任务的项目。
  *
  * v2 自己不要鉴权（面板转发鉴权）；任务并发 1，排队；状态落 data-v2/jobs/。
  */
@@ -19,6 +29,7 @@ const http = require('node:http');
 const { URL } = require('node:url');
 const S = require('./schema');
 const { Cache, ensureDir, readJson, writeJsonAtomic } = require('./pipeline/cache');
+const { Projects } = require('./projects');
 const Plan = require('./pipeline/plan');
 const Render = require('./pipeline/render');
 const Sub = require('./pipeline/subtitles');
@@ -33,10 +44,11 @@ function loadConfig() {
   cfg.dataDir = path.isAbsolute(cfg.dataDir) ? cfg.dataDir : path.join(ROOT, cfg.dataDir);
   cfg.outDir = path.join(cfg.dataDir, 'out');
   cfg.jobsDir = path.join(cfg.dataDir, 'jobs');
+  cfg.projectsDir = path.join(cfg.dataDir, 'projects');
   cfg.workDir = path.join(cfg.dataDir, 'work');
   cfg.cacheDir = path.join(cfg.dataDir, 'cache');
   cfg.logFile = path.join(cfg.dataDir, 'server.log');
-  for (const d of [cfg.dataDir, cfg.outDir, cfg.jobsDir, cfg.workDir, cfg.cacheDir]) ensureDir(d);
+  for (const d of [cfg.dataDir, cfg.outDir, cfg.jobsDir, cfg.projectsDir, cfg.workDir, cfg.cacheDir]) ensureDir(d);
   return cfg;
 }
 
@@ -45,18 +57,30 @@ const CACHE = new Cache(CFG.cacheDir);
 const STARTED_AT = Date.now();
 const PORT = Number(CFG.port) || 8774;
 
+/** 项目 → 版本：只碰 data-v2/projects 和 job 上自己的两个字段。 */
+const PROJECTS = new Projects({
+  projectsDir: CFG.projectsDir,
+  jobsDir: CFG.jobsDir,
+  outDir: CFG.outDir,
+  workDir: CFG.workDir,
+  log: (msg) => log(msg),
+});
+
 /**
- * 每个任务一份 cfg：全局配置 + 请求里的三个可调项。
+ * 每个任务一份 cfg：全局配置 + 请求里的四个可调项。
  * 下游（plan/render/audio/stickers）只读这一份，不各自去翻 request。
+ * 注意 voicePitch 合法值里有 0（原声），不能用 `||` 兜底，会把 0 吃掉。
  */
 function jobConfig(request) {
   const req = request || {};
   const pad = Number(req.scenePadding);
+  const pitch = Number(req.voicePitch);
   return {
     ...CFG,
     narrationSpeed: Number(req.narrationSpeed) || 1,
     scenePadding: Number.isFinite(pad) ? pad : 0.6,
     stickerDuration: Number(req.stickerDuration) || 2,
+    voicePitch: Number.isFinite(pitch) ? pitch : 1,
   };
 }
 
@@ -68,6 +92,13 @@ function log(msg) {
 
 function jobLog(job, msg) {
   log(`[${job.id}] ${msg}`);
+}
+
+/** 日志里的音高：+1.0 / 0.0 / -1.5，正数带 + 号，一眼看出升降。 */
+function pitchText(v) {
+  const n = Number(v);
+  const safe = Number.isFinite(n) ? n : 0;
+  return `${safe > 0 ? '+' : ''}${safe.toFixed(1)}`;
 }
 
 // ---------------------------------------------------------------- 任务状态 ----
@@ -87,6 +118,14 @@ function persist(job) {
   }
 }
 
+/** 任务所属项目名；没有项目的旧任务回落到「未分组」。 */
+function projectTitleOf(job) {
+  const pid = String((job && job.projectId) || '');
+  if (!pid) return '未分组';
+  const project = PROJECTS.get(pid);
+  return project ? (project.title || '未命名视频') : '';
+}
+
 function publicJob(job) {
   const req = job.request || {};
   return {
@@ -101,15 +140,21 @@ function publicJob(job) {
     elapsedMs: job.startedAt ? (job.finishedAt || Date.now()) - job.startedAt : Date.now() - job.createdAt,
     ms: job.ms || 0,
     bytes: job.bytes || 0,
+    // 项目层：旧任务没有这两个字段，回落到「未分组」/0
+    projectId: job.projectId || '',
+    projectTitle: projectTitleOf(job),
+    version: Number(job.version) || 0,
+    seconds: Number(req.seconds) || 0,
     videoUrl: job.videoUrl || '',
     srtUrl: job.srtUrl || '',
     warnings: Array.isArray(job.warnings) ? job.warnings : [],
     error: job.error || null,
-    // 三个可调项回显给面板/复现脚本；老任务没有 params 时按 request 兜底
+    // 四个可调项回显给面板/复现脚本；老任务没有 params 时按 request 兜底
     params: job.params || {
       narrationSpeed: req.narrationSpeed,
       scenePadding: req.scenePadding,
       stickerDuration: req.stickerDuration,
+      voicePitch: req.voicePitch,
     },
     scenes: Array.isArray(job.scenes) ? job.scenes : [],
   };
@@ -185,7 +230,8 @@ async function runJob(job) {
     total: job.request.scenes.length || 0, startedAt: job.startedAt, error: null,
   });
   jobLog(job, `开始：${job.request.scenes.length ? `分镜 ${job.request.scenes.length} 场` : job.request.script ? '稿子模式' : '主题模式'}`
-    + `，语速 ${cfg.narrationSpeed}×，停留 ${cfg.scenePadding}s，表情一轮 ${cfg.stickerDuration}s`);
+    + `，语速 ${cfg.narrationSpeed}×，停留 ${cfg.scenePadding}s，表情一轮 ${cfg.stickerDuration}s，`
+    + `音高 ${pitchText(cfg.voicePitch)} 半音`);
 
   const ctx = {
     log: (m) => jobLog(job, m),
@@ -343,7 +389,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
         'access-control-allow-origin': '*',
-        'access-control-allow-methods': 'GET,POST,OPTIONS',
+        'access-control-allow-methods': 'GET,POST,DELETE,OPTIONS',
         'access-control-allow-headers': 'content-type,authorization',
         'access-control-max-age': '600',
       });
@@ -352,6 +398,71 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && p === '/v1/health') {
       return json(res, 200, await health());
+    }
+
+    // ------------------------------------------------------------ 项目（主题）----
+    // 一个项目 = 一个视频主题，可以重做很多版；任务页按项目分组显示。
+    if (p === '/v1/projects' && req.method === 'POST') {
+      let body;
+      try {
+        body = parseBody(await readBody(req));
+      } catch (err) {
+        return json(res, 400, { ok: false, error: 'BAD_JSON', detail: String((err && err.message) || err) });
+      }
+      const project = PROJECTS.create(String((body && body.title) == null ? '' : body.title), '');
+      return json(res, 200, {
+        ok: true,
+        projectId: project.id,
+        project: {
+          id: project.id, title: project.title || '未命名视频',
+          createdAt: project.createdAt, updatedAt: project.updatedAt,
+        },
+      });
+    }
+
+    if (p === '/v1/projects' && req.method === 'GET') {
+      const { projects, ungrouped } = PROJECTS.listAll();
+      return json(res, 200, { ok: true, projects, ungrouped, ungroupedCount: ungrouped.length });
+    }
+
+    const projectMatch = /^\/v1\/projects\/([A-Za-z0-9_-]+)$/.exec(p);
+    if (projectMatch && req.method === 'GET') {
+      const detail = PROJECTS.detail(projectMatch[1]);
+      if (!detail) return json(res, 404, { ok: false, error: 'PROJECT_NOT_FOUND' });
+      return json(res, 200, { ok: true, project: detail.project, jobs: detail.jobs });
+    }
+
+    // 改名：沿用同一个 id，只换标题（面板「改名」按钮）
+    if (projectMatch && req.method === 'POST') {
+      let body;
+      try {
+        body = parseBody(await readBody(req));
+      } catch (err) {
+        return json(res, 400, { ok: false, error: 'BAD_JSON', detail: String((err && err.message) || err) });
+      }
+      const title = String((body && body.title) == null ? '' : body.title).trim();
+      if (!title) return json(res, 400, { ok: false, error: 'TITLE_REQUIRED', message: '项目名不能为空' });
+      const project = PROJECTS.rename(projectMatch[1], title);
+      if (!project) return json(res, 404, { ok: false, error: 'PROJECT_NOT_FOUND' });
+      return json(res, 200, { ok: true, project });
+    }
+
+    if (projectMatch && req.method === 'DELETE') {
+      try {
+        const removed = PROJECTS.remove(projectMatch[1]);
+        if (!removed) return json(res, 404, { ok: false, error: 'PROJECT_NOT_FOUND' });
+        // 内存里可能还留着已删任务的记录：一并丢掉，避免 GET /v1/jobs/:id 又读出来
+        for (const id of removed.jobIds) JOBS.delete(id);
+        return json(res, 200, { ok: true, ...removed });
+      } catch (err) {
+        if (err && err.code === 'PROJECT_BUSY') {
+          return json(res, 409, {
+            ok: false, error: 'PROJECT_BUSY', message: '这个项目还有版本在跑，等它完成再删',
+            active: err.active || [],
+          });
+        }
+        throw err;
+      }
     }
 
     if (req.method === 'POST' && p === '/v1/jobs') {
@@ -367,12 +478,19 @@ const server = http.createServer(async (req, res) => {
       const job = S.newJob(request);
       job.title = request.scenes.length ? String(request.scenes[0].text || '') : '';
       job.total = request.scenes.length;
+      // 项目层：带了 projectId 就挂到那个项目；没带就自动建一个（标题从主题/首句猜）
+      const attached = PROJECTS.attach(job, body && body.projectId, request);
       JOBS.set(job.id, job);
       persist(job);
       jobLog(job, `提交：${request.scenes.length ? `${request.scenes.length} 场分镜` : request.script ? '稿子' : `主题「${request.topic.slice(0, 30)}」`}，${request.seconds}s，voice="${request.voice}"，`
-        + `语速 ${request.narrationSpeed}×，停留 ${request.scenePadding}s，表情一轮 ${request.stickerDuration}s`);
+        + `项目「${attached.projectTitle}」v${attached.version}，`
+        + `语速 ${request.narrationSpeed}×，停留 ${request.scenePadding}s，表情一轮 ${request.stickerDuration}s，`
+        + `音高 ${pitchText(request.voicePitch)} 半音`);
       enqueue(job);
-      return json(res, 200, { ok: true, jobId: job.id });
+      return json(res, 200, {
+        ok: true, jobId: job.id,
+        projectId: attached.projectId, version: attached.version, projectTitle: attached.projectTitle,
+      });
     }
 
     if (req.method === 'GET' && p === '/v1/jobs') {
@@ -385,10 +503,15 @@ const server = http.createServer(async (req, res) => {
         jobs.push({
           id: rec.id, status: rec.status, title: rec.title || '', phase: rec.phase || '',
           createdAt: rec.createdAt || 0, elapsedMs: rec.ms || 0, bytes: rec.bytes || 0,
+          seconds: Number(rec.request && rec.request.seconds) || 0,
           videoUrl: rec.videoUrl || '', srtUrl: rec.srtUrl || '',
           error: rec.error || null,
+          // 项目层：没有 projectId 的旧任务留在「未分组」
+          projectId: rec.projectId || '', version: Number(rec.version) || 0,
         });
       }
+      // 补 projectTitle 和旧任务的版本号兜底
+      PROJECTS.annotate(jobs);
       jobs.sort((a, b) => b.createdAt - a.createdAt);
       return json(res, 200, { ok: true, jobs: jobs.slice(0, 50) });
     }
@@ -413,7 +536,7 @@ const server = http.createServer(async (req, res) => {
       const scenes = S.normalizeScenes(body.scenes, CFG.maxScenes, (m) => log(`[${prev.id}] ${m}`));
       if (!scenes.length) return json(res, 400, { ok: false, error: 'SCENES_REQUIRED' });
       const base = prev.request || {};
-      // 三个可调项：body 显式给了就用 body（重做时可以改语速），否则沿用上一条任务
+      // 四个可调项：body 显式给了就用 body（重做时可以改语速/音高），否则沿用上一条任务
       const pick = (name) => (body[name] == null ? base[name] : body[name]);
       const request = S.normalizeRequest({
         scenes,
@@ -423,18 +546,30 @@ const server = http.createServer(async (req, res) => {
         narrationSpeed: pick('narrationSpeed'),
         scenePadding: pick('scenePadding'),
         stickerDuration: pick('stickerDuration'),
+        voicePitch: pick('voicePitch'),
         fresh: false,
       }, (m) => log(`[redo] ${m}`));
       const job = S.newJob(request);
       job.redoOf = prev.id;
       job.title = String(scenes[0].text || '');
       job.total = scenes.length;
+      // 重做沿用原任务的项目（不新建项目）：新版本接在同一个主题下面。
+      // 原任务是「未分组」的旧数据时也保持未分组，不偷偷给它造一个项目。
+      const prevProjectId = String(prev.projectId || '');
+      const attached = prevProjectId ? PROJECTS.attach(job, prevProjectId, request) : null;
       JOBS.set(job.id, job);
       persist(job);
       jobLog(job, `重做：基于 ${prev.id}，${scenes.length} 场，标题「${job.title}」，`
-        + `语速 ${request.narrationSpeed}×，停留 ${request.scenePadding}s，表情一轮 ${request.stickerDuration}s`);
+        + (attached ? `项目「${attached.projectTitle}」v${attached.version}，` : '（未分组），')
+        + `语速 ${request.narrationSpeed}×，停留 ${request.scenePadding}s，表情一轮 ${request.stickerDuration}s，`
+        + `音高 ${pitchText(request.voicePitch)} 半音`);
       enqueue(job);
-      return json(res, 200, { ok: true, jobId: job.id });
+      return json(res, 200, {
+        ok: true, jobId: job.id,
+        projectId: attached ? attached.projectId : '',
+        version: attached ? attached.version : 0,
+        projectTitle: attached ? attached.projectTitle : '未分组',
+      });
     }
 
     const videoMatch = /^\/v1\/video\/([A-Za-z0-9_-]+)$/.exec(p);

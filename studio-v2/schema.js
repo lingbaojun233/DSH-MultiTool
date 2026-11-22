@@ -7,10 +7,13 @@
  *   - 其它模块只读规范化之后的字段，不再各自写白名单。
  *
  * 场景契约（唯一真相）：
- *   { text, narration, seconds, hint, tool, stickers, image, manim, status, note }
+ *   { text, narration, seconds, hint, tool, stickers, image, manim, status, note,
+ *     titleRepeat, titlePrev }
  *
  * tool：manim（动画）/ text（文字卡）/ sticker（表情卡，不画图只放一个大表情）/ auto。
  * stickers：每场最多 1 个，多余的在这里裁掉（会写一条日志）。
+ * titleRepeat：标题与上一场相同（去空白/标点后逐字相等）→ 这一场不画标题、不做标题动画。
+ * titlePrev：上一场的标题原文，给渲染阶段的兜底匹配用（模型可能只写了标题的一部分）。
  */
 
 const crypto = require('node:crypto');
@@ -20,13 +23,17 @@ const STATUSES = new Set(['pending', 'ready', 'degraded', 'failed']);
 const STICKER_ID_RE = /^[0-9a-f]{6,40}$/i;
 
 /**
- * 三个可调参数的定义只在这里：范围 + 默认值。
+ * 四个可调参数的定义只在这里：范围 + 默认值。
  * 请求里缺省时用 def，越界时夹回 [lo, hi]，保证 job 记录里永远是可复现的确定值。
+ *
+ * voicePitch 是半音（不是比例）：+1 = 升高一个半音，0 = 原声（跳过重采样）。
+ * 默认 +1：大肥鱼这个音色低半度听着更清楚，面板里也标成推荐项。
  */
 const TUNABLES = {
   narrationSpeed: { lo: 0.85, hi: 1.25, def: 1.0 },
   scenePadding: { lo: 0, hi: 3, def: 0.6 },
   stickerDuration: { lo: 1.2, hi: 4, def: 2.0 },
+  voicePitch: { lo: -6, hi: 6, def: 1.0 },
 };
 
 function str(v, max) {
@@ -88,6 +95,29 @@ function dropLog(opts, msg) {
   else console.warn(`[schema] ${msg}`);
 }
 
+/** 标题归一化：去空白与标点、忽略大小写，用来判断"和上一场是不是同一个标题"。 */
+function normTitle(v) {
+  return String(v == null ? '' : v)
+    .replace(/[\s，。！？、；：,.!?;:'"「」『』（）()\-—·…~～]/g, '')
+    .toLowerCase();
+}
+
+/**
+ * 逐场标 titleRepeat：与紧邻上一场的 text 去标点后相同即为 true。
+ * 只认确定性结果（模型给什么都覆盖），normalizeScenes 末尾统一调用。
+ */
+function markTitleRepeat(scenes) {
+  const arr = Array.isArray(scenes) ? scenes : [];
+  for (let i = 0; i < arr.length; i++) {
+    const cur = normTitle(arr[i] && arr[i].text);
+    const prevText = i > 0 ? String((arr[i - 1] && arr[i - 1].text) || '') : '';
+    const prev = normTitle(prevText);
+    arr[i].titlePrev = prevText;
+    arr[i].titleRepeat = Boolean(prev && cur && prev === cur);
+  }
+  return arr;
+}
+
 /**
  * 唯一入口：任何来源的分镜都必须先过这里。
  * 返回的每个字段都可序列化，且不会再出现别名。
@@ -109,6 +139,8 @@ function normalizeScene(raw, options) {
     manim = {
       code: str(r.manim.code, 16000),
       scene: str(r.manim.scene, 80).trim() || null,
+      // locked = 用户手改并锁定的代码：不再查缓存、不重新生成、失败不降级
+      locked: r.manim.locked === true,
     };
   }
 
@@ -128,16 +160,22 @@ function normalizeScene(raw, options) {
   const tool = normalizeTool(r, Boolean(manim));
   const status = STATUSES.has(str(r.status, 16)) ? str(r.status, 16) : 'pending';
   const note = str(r.note, 300).trim();
+  // titleRepeat 一次规范化只做占位：真正的判定要跨场，由 markTitleRepeat 统一回填
+  const titlePrev = str(r.titlePrev, 80).trim();
 
-  return { text, narration, seconds, hint, tool, stickers, image, manim, status, note };
+  return {
+    text, narration, seconds, hint, tool, stickers, image, manim, status, note,
+    titleRepeat: false, titlePrev,
+  };
 }
 
 function normalizeScenes(list, maxScenes, log) {
   const arr = Array.isArray(list) ? list : [];
   const cap = Math.max(1, Number(maxScenes) || 80);
-  return arr.slice(0, cap)
+  const scenes = arr.slice(0, cap)
     .map((s, index) => normalizeScene(s, { index, log }))
     .filter((s) => s.text || s.narration || s.hint);
+  return markTitleRepeat(scenes);
 }
 
 /**
@@ -159,6 +197,8 @@ function normalizeRequest(body, log) {
     narrationSpeed: tunable('narrationSpeed', b.narrationSpeed),
     scenePadding: tunable('scenePadding', b.scenePadding),
     stickerDuration: tunable('stickerDuration', b.stickerDuration),
+    // 第四个可调项：音高（半音），0 = 原声
+    voicePitch: tunable('voicePitch', b.voicePitch),
   };
 }
 
@@ -194,11 +234,12 @@ function newJob(request) {
     warnings: [],
     error: null,
     scenes: [],
-    // 三个可调项单独留一份快照：复现一条成片时不用再翻 request
+    // 四个可调项单独留一份快照：复现一条成片时不用再翻 request
     params: {
       narrationSpeed: request.narrationSpeed,
       scenePadding: request.scenePadding,
       stickerDuration: request.stickerDuration,
+      voicePitch: request.voicePitch,
     },
     request,
   };
@@ -211,6 +252,8 @@ module.exports = {
   normalizeScene,
   normalizeScenes,
   normalizeRequest,
+  normTitle,
+  markTitleRepeat,
   newJob,
   newJobId,
   nowIso,

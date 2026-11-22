@@ -67,10 +67,13 @@ function visualKey({ scene, engine, styleKey, cfg }) {
       ? `sticker:${(scene.stickers && scene.stickers[0] && scene.stickers[0].id) || ''}`
       : String(scene.text || '');
   return C.sha1(JSON.stringify([
-    'visual-v3', 'enh-3', engine,
+    // enh-5：白底 + 布局助手 + 标题去重都改变了成片，旧片段缓存必须整体失效
+    'visual-v4', 'enh-5', engine,
     visual,
     String(scene.hint || ''),
     String(scene.text || ''),
+    // 标题是否重复决定这一场有没有标题，必须进键（两场同标题时不能命中上一场的片段）
+    scene.titleRepeat ? 'title-repeat' : 'title-show',
     styleKey,
     Number(scene.seconds) || 0,
     String(scene.image || ''),
@@ -99,8 +102,8 @@ function num(v, def) {
 
 function clipKey({ vKey, audioK, scene, style, cfg, frameSig, subSig }) {
   return C.sha1(JSON.stringify([
-    // comp-4：表情从"定格末帧"改成"循环到本场结束"，旧片段缓存必须整体失效
-    'clip-v3', 'comp-4', vKey, audioK || 'silent',
+    // clip-v4：白底配色 + 标题去重（comp-5）改变了片段内容，旧片段缓存整体失效
+    'clip-v4', 'comp-5', vKey, audioK || 'silent',
     JSON.stringify(stickerSig(scene, cfg)),
     style.id, frameSig, subSig,
     // 这两个参数会改变片段本身：停留影响场时长，表情一轮影响循环素材的播放速度
@@ -252,7 +255,8 @@ async function renderOne({ scene, index, style, voice, cfg, cache, row, ctx, war
   const frameSig = F.signature(cfg.frame);
   const subSig = C.sha1(JSON.stringify([cfg.subtitles]), 12);
   const vKey = visualKey({ scene, engine, styleKey: skey, cfg });
-  const audioK = scene.narration ? A.audioKey(scene.narration, voice, cfg.narrationSpeed) : 'silent';
+  // 音频键必须和 ensureSpeech 算的一致（含音高），否则改 voicePitch 会命中旧片段
+  const audioK = scene.narration ? A.audioKey(scene.narration, voice, cfg.narrationSpeed, cfg.voicePitch) : 'silent';
   const cKey = clipKey({ vKey, audioK, scene, style, cfg, frameSig, subSig });
 
   // 先看画面片段缓存：命中连 manim/ffmpeg 都不用起
@@ -293,6 +297,8 @@ async function renderOne({ scene, index, style, voice, cfg, cache, row, ctx, war
     }
   } else {
     const code = scene.manim && scene.manim.code;
+    // 手改代码：渲染失败时既不贴错误让模型改（会改掉用户的结构），也不降级文字卡
+    const lockedCode = Boolean(scene.manim && scene.manim.locked && code);
     if (!code) {
       status = 'degraded';
       note = 'manim 没有代码，降级文字卡';
@@ -301,15 +307,28 @@ async function renderOne({ scene, index, style, voice, cfg, cache, row, ctx, war
       visual = await T.renderTextCard({ scene, style, cfg, work, index, log });
       if (!visual.ok) return { ok: false, error: visual.error, status: 'failed', note, engine: 'text', ms: Date.now() - started };
     } else {
-      const enhanced = M.enhanceCode(code, scene, style);
+      const enhanced = M.enhanceCode(code, scene, style, cfg, { locked: lockedCode });
       if (enhanced.notes.length) log(`代码增强：${enhanced.notes.join('，')}`);
+      if (scene.titleRepeat && !lockedCode) log('标题与上一场相同，跳过标题动画');
+      // 静态 lint（第二层）：只记警告，不阻塞渲染
+      const lint = M.lintManim(enhanced.code, scene);
+      if (lint.fatal) log(`布局 lint 无法解析代码（${lint.fatal}），继续渲染`);
+      for (const w of lint.warnings) {
+        log(`布局 lint：${w}`);
+        if (warn) warn(`第 ${index + 1} 场布局：${w}`);
+      }
       const budgetSeconds = Math.max(Number(scene.seconds) || 4, Number(row.audioDuration) + 0.6);
       log('manim 渲染中');
       let mr = await M.renderManim({
         cfg, work, index, code: enhanced.code, sceneName: scene.manim.scene,
         seconds: budgetSeconds, log,
       });
-      if (!mr.ok && ctx.repair) {
+      // 第三层：渲染时的几何自检（LAYOUT_OVERLAP）——只报告，不降级
+      if (mr.ok && Array.isArray(mr.layout) && mr.layout.length) {
+        log(`布局自检：${mr.layout.length} 处文字压线`);
+        if (warn) warn(`第 ${index + 1} 场布局自检：${mr.layout.length} 处文字压线（${mr.layout.slice(0, 3).join('；')}）`);
+      }
+      if (!mr.ok && ctx.repair && !lockedCode) {
         log(`manim 失败（${mr.error}）：${String(mr.detail || '').slice(-400)}`);
         log('贴错误让模型修一次');
         const fixed = await ctx.repair({
@@ -317,7 +336,7 @@ async function renderOne({ scene, index, style, voice, cfg, cache, row, ctx, war
         });
         if (fixed) {
           const one = await M.renderManim({
-            cfg, work, index, code: M.enhanceCode(fixed.code, scene, style).code,
+            cfg, work, index, code: M.enhanceCode(fixed.code, scene, style, cfg).code,
             sceneName: fixed.scene, seconds: budgetSeconds, log,
           });
           if (one.ok) {
@@ -330,6 +349,22 @@ async function renderOne({ scene, index, style, voice, cfg, cache, row, ctx, war
         }
       }
       if (!mr.ok) {
+        if (lockedCode) {
+          // 手改代码失败：整条任务失败，把 stderr 尾部原样留给用户看，不降级
+          const rawTail = String(mr.detail || mr.error || '').slice(-1200);
+          const noteText = `手改代码渲染失败（${mr.error}）：${rawTail}`;
+          log(`手改代码渲染失败，不降级、不自愈：${String(mr.detail || mr.error || '').slice(-300)}`);
+          if (warn) warn(`第 ${index + 1} 场手改代码渲染失败（${mr.error}）`);
+          return {
+            ok: false,
+            error: `手改代码渲染失败（第 ${index + 1} 场，${mr.error}）`,
+            status: 'failed',
+            note: noteText.slice(0, 2400),
+            engine,
+            lockedFailed: true,
+            ms: Date.now() - started,
+          };
+        }
         status = 'degraded';
         note = `manim 失败降级文字卡：${String(mr.error || '').slice(0, 160)}`;
         log(note);
@@ -392,7 +427,8 @@ async function renderOne({ scene, index, style, voice, cfg, cache, row, ctx, war
  */
 async function renderScenes({ scenes, style, voice, cfg, cache, job, ctx, onProgress }) {
   const warnings = Array.isArray(job.warnings) ? job.warnings : [];
-  const warn = (m) => { warnings.push(m); };
+  // 同一条警告（plan 阶段的 lint 与这里的 lint 可能重复）只留一份
+  const warn = (m) => { if (!warnings.includes(m)) warnings.push(m); };
   const total = scenes.length;
   const workDir = path.join(ctx.workDir, job.id);
   fs.mkdirSync(workDir, { recursive: true });
@@ -444,7 +480,8 @@ async function renderScenes({ scenes, style, voice, cfg, cache, job, ctx, onProg
     if (onProgress) onProgress({ phase: 'render', done, total, label: `已完成 ${done}/${total} 场` });
     if (!r.ok) {
       row.scene.status = 'failed';
-      row.scene.note = String(r.error || '渲染失败').slice(0, 300);
+      // 手改代码失败：note 里放 stderr 尾部，面板/任务页直接看得到错在哪一行
+      row.scene.note = String(r.note || r.error || '渲染失败').slice(0, 2400);
       ctx.log(`scene#${i} 渲染失败：${r.error}`);
       warn(`第 ${i + 1} 场渲染失败：${String(r.error || '').slice(0, 160)}`);
       return { index: i, ok: false, ...r };
@@ -456,6 +493,16 @@ async function renderScenes({ scenes, style, voice, cfg, cache, job, ctx, onProg
   });
 
   const out = entries.filter((e) => e && e.ok).sort((a, b) => a.index - b.index);
+  // 手改代码挂了：整条任务算失败（用户改的代码，失败就该让他看到错，不跳过、不降级）
+  const lockedFail = entries.find((e) => e && !e.ok && e.lockedFailed);
+  if (lockedFail) {
+    return {
+      ok: false,
+      error: String(lockedFail.error || 'LOCKED_CODE_FAILED'),
+      warnings,
+      entries: [],
+    };
+  }
   if (!out.length) {
     return { ok: false, error: 'ALL_SCENES_FAILED', warnings, entries: [] };
   }

@@ -1,12 +1,13 @@
 'use strict';
 /**
- * stickercard.js -- 表情卡：不画图、不调 manim，只给一段风格底，表情居中循环。
+ * stickercard.js -- 表情卡：不画图、不调 manim，只给一段纯白底，表情居中循环。
  *
  * 分工：
- *   本文件只产出"纯色/淡渐变底"的视频片段（自然时长 = 场景计划秒数）；
+ *   本文件只产出"纯白底"的视频片段（自然时长 = 场景计划秒数）；
  *   大表情由 render.js 的 composeScene 走 stickers.js 叠加：
  *   at=0、x=y=0.5、scale=0.55（占屏约一半）、从 0 循环到本场结束、只淡入不淡出。
  *
+ * 底色不再走"底色→强调色"的渐变：白底 + 蓝边框是整集唯一的配色主语。
  * 这样表情卡和普通场共用同一套循环播放/字幕/边框/混音链路，不会出现两套表情实现。
  */
 const fs = require('node:fs');
@@ -26,7 +27,7 @@ function ffColor(hex, fallback) {
 }
 
 /**
- * 渲一段表情卡底片：淡渐变底视频，自然时长 = 计划秒数。
+ * 渲一段表情卡底片：纯白底视频，自然时长 = 计划秒数。
  * 返回 { ok, file, naturalSeconds, engine:'sticker' }。
  */
 async function renderStickerCard({ scene, style, cfg, work, index, log }) {
@@ -47,11 +48,9 @@ async function renderStickerCard({ scene, style, cfg, work, index, log }) {
   const seconds = Math.max(1, Number(scene.seconds) || 4);
   const out = path.join(work, `stickercard-${index}.mp4`);
 
-  // 底色：风格背景 → 强调色 35%（和文字卡同一套渐变终点，整集看起来是一家人）
-  const c0 = ffColor(style && style.bg, '101A33');
-  const c1 = ffColor(T.gradientEnd(style), '2A5CB3');
-
-  const src = `gradients=s=${W}x${H}:c0=${c0}:c1=${c1}:d=${seconds.toFixed(3)}:speed=0.01`;
+  // 底色：纯白（cfg.canvas.bg）；蓝色只出现在外边框，不再铺满整屏
+  const bg = ffColor(T.canvasHex(style, cfg), 'FFFFFF');
+  const src = `color=c=${bg}:s=${W}x${H}:r=${fps}:d=${seconds.toFixed(3)}`;
   const r = await M.run(cfg.ffmpeg, [
     '-hide_banner', '-loglevel', 'error', '-y',
     '-f', 'lavfi', '-i', src,
@@ -66,7 +65,7 @@ async function renderStickerCard({ scene, style, cfg, work, index, log }) {
     return { ok: false, error: `STICKER_CARD_RENDER_FAILED: ${String(r.err || '').slice(-300)}`, ms };
   }
   if (log) {
-    log(`表情卡底片完成 ${seconds}s（渐变 ${c0}→${c1}，表情 ${st.id} 将由合成阶段按 ${STICKER_CARD_SCALE} 居中循环）`);
+    log(`表情卡底片完成 ${seconds}s（纯白底 ${bg}，表情 ${st.id} 将由合成阶段按 ${STICKER_CARD_SCALE} 居中循环）`);
   }
   return { ok: true, file: out, naturalSeconds: seconds, engine: 'sticker', ms, stickerId: st.id };
 }

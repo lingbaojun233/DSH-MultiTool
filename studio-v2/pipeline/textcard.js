@@ -1,7 +1,9 @@
 'use strict';
 /**
- * textcard.js -- 文字卡：ffmpeg 渐变底 + 居中大字。
+ * textcard.js -- 文字卡：纯白底 + 居中深色大字。
  *
+ * 底色固定走 cfg.canvas.bg（#FFFFFF），不再做"底色→强调色"的渐变：
+ * 蓝色只留给外边框，画面里出现大面积蓝底会显得脏。
  * 只负责"一张静帧 + 一段静视频"；配音、字幕、边框由 render.js 统一加，
  * 这样 manim 和文字卡走同一条后期链路，不会出现"文字卡没字幕/没框"。
  */
@@ -21,11 +23,23 @@ function rgbToHex(rgb) {
   return `#${rgb.map((v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0')).join('')}`;
 }
 
-/** 背景渐变的第二色：背景色向强调色靠 35%，保证同风格但看得出层次。 */
+/** 背景渐变的第二色：保留给旧调用方/统计，不再用于文字卡（底已经是纯白）。 */
 function gradientEnd(style) {
   const a = hexToRgb(style && style.bg);
   const b = hexToRgb(style && (style.accent || style.fg));
   return rgbToHex(a.map((v, i) => v * 0.65 + b[i] * 0.35));
+}
+
+/** 画布底色：cfg.canvas.bg 优先（纯白），风格 bg 只作兜底。 */
+function canvasHex(style, cfg) {
+  const fromCfg = cfg && cfg.canvas && cfg.canvas.bg;
+  return String(fromCfg || (style && style.bg) || '#FFFFFF');
+}
+
+/** 墨色：cfg.canvas.fg 优先（#1A1A1A）。 */
+function inkHex(style, cfg) {
+  const fromCfg = cfg && cfg.canvas && cfg.canvas.fg;
+  return String(fromCfg || (style && style.fg) || '#1A1A1A');
 }
 
 function ffPath(p) {
@@ -66,7 +80,7 @@ function resolveImage(ref, cfg) {
   return null;
 }
 
-/** 生成文字卡静帧：有图用图（压暗），没图用风格渐变。 */
+/** 生成文字卡静帧：有图用图（压暗 + 白字），没图就纯白底 + 深墨字。 */
 async function makeStill({ scene, style, cfg, work, index, log }) {
   const W = Number(cfg.width) || 1920;
   const H = Number(cfg.height) || 1080;
@@ -77,7 +91,9 @@ async function makeStill({ scene, style, cfg, work, index, log }) {
 
   const fontPx = Math.max(48, Math.round(H * (Number(cfg.textCard && cfg.textCard.fontSizeRatio) || 0.085)));
   const font = String(cfg.font || 'C:\\Windows\\Fonts\\msyh.ttc');
-  const color = (style && (style.fg || style.accent)) || '#FFFFFF';
+  const img = resolveImage(scene.image, cfg);
+  // 纯白底 → 深墨字；底图模式仍然是白字（照片/插画上深字看不清）
+  const color = img ? '#FFFFFF' : inkHex(style, cfg);
   const draw = [
     `drawtext=fontfile='${ffPath(font)}':textfile='${ffPath(txt)}'`,
     `fontcolor=${color.replace(/^#/, '0x')}`,
@@ -85,12 +101,11 @@ async function makeStill({ scene, style, cfg, work, index, log }) {
     'line_spacing=18',
     'x=(w-text_w)/2',
     'y=(h-text_h)/2',
-    'shadowcolor=black@0.35',
-    'shadowx=4',
-    'shadowy=4',
+    img ? 'shadowcolor=black@0.55' : 'shadowcolor=black@0.16',
+    img ? 'shadowx=4' : 'shadowx=2',
+    img ? 'shadowy=4' : 'shadowy=2',
   ].join(':');
 
-  const img = resolveImage(scene.image, cfg);
   const args = ['-hide_banner', '-loglevel', 'error', '-y'];
   let vf;
   if (img) {
@@ -103,10 +118,8 @@ async function makeStill({ scene, style, cfg, work, index, log }) {
       draw,
     ].join(',');
   } else {
-    const end = gradientEnd(style);
-    const c0 = String((style && style.bg) || '#101a33').replace(/^#/, '0x');
-    const c1 = String(end).replace(/^#/, '0x');
-    args.push('-f', 'lavfi', '-i', `gradients=s=${W}x${H}:c0=${c0}:c1=${c1}:d=1:speed=0.01`);
+    const bg = canvasHex(style, cfg).replace(/^#/, '0x');
+    args.push('-f', 'lavfi', '-i', `color=c=${bg}:s=${W}x${H}:r=${Number(cfg.fps) || 30}:d=1`);
     vf = draw;
   }
   args.push('-vf', vf, '-frames:v', '1', png);
@@ -115,7 +128,7 @@ async function makeStill({ scene, style, cfg, work, index, log }) {
   if (r.code !== 0 || !fs.existsSync(png)) {
     return { ok: false, error: `TEXTCARD_STILL_FAILED: ${String(r.err || '').slice(-300)}` };
   }
-  if (log) log(`文字卡静帧完成${img ? `（底图 ${path.basename(img)}）` : '（渐变底）'}`);
+  if (log) log(`文字卡静帧完成${img ? `（底图 ${path.basename(img)}）` : '（纯白底）'}`);
   return { ok: true, png, image: img };
 }
 
@@ -148,4 +161,4 @@ async function renderTextCard({ scene, style, cfg, work, index, log }) {
   return { ok: true, file: out, naturalSeconds: seconds, engine: 'text', ms, image: still.image };
 }
 
-module.exports = { renderTextCard, makeStill, resolveImage, wrapText, gradientEnd };
+module.exports = { renderTextCard, makeStill, resolveImage, wrapText, gradientEnd, canvasHex, inkHex };

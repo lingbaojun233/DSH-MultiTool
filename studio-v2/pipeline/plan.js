@@ -138,9 +138,10 @@ function stylePrompt(style) {
   const s = style || {};
   return [
     `## 视觉风格：${s.name || s.id || '白板讲解'}`,
-    `- 背景 ${s.bg}；主色 ${s.accent}；字色 ${s.fg}；次要色 ${s.muted}；强调色 ${s.accent2}`,
+    `- 背景 ${s.bg}（画布恒为纯白）；主色 ${s.accent}；字色 ${s.fg}；次要色 ${s.muted}；强调色 ${s.accent2}`,
     `- 线宽 ${s.line_width || 3}；${s.notes || ''}`,
     '- 颜色只从这五个里选，不要自己加色；不要设背景色（渲染器注入）。',
+    '- **底色永远是纯白**：字、线、公式都用深墨色（#1A1A1A 一类），不要白字、不要深色底、不要整屏铺色块。',
   ].join('\n');
 }
 
@@ -180,6 +181,7 @@ function skeletonPrompt(topic, total, style, candidates) {
     '- 一场只讲一个意思；宁可少几场、每场讲透，不要一场只闪 3 秒。',
     '- narration 是给人听的：口语、一句一个意思，下一场接上一场。',
     '- hint 要写成"别人照着就能画"的一句话：画什么图形、标什么量、做什么动作。',
+    '- **相邻两场的 text 不要写成同一个标题**；同一个主题讲两场时，第二场换一个角度命名（如"积分（切条）"）。',
     '- **hint 里不要写"画一条鲸鱼 / 画大肥鱼本人 / 画一个角色"**：角色由表情包承担。',
     '- 不要出现 markdown、不要解释你的做法。',
     '',
@@ -197,7 +199,7 @@ function scriptPrompt(script, total, style, candidates) {
     '',
     '## 原话优先（最重要）',
     '- narration 必须是稿子里**出现过的话**：可以删字、截断、调顺序，但不要换说法、不要润色。',
-    '- text 从这句原话里抽短标题，≤14 字，不要另起一句。',
+    '- text 从这句原话里抽短标题，≤14 字，不要另起一句；相邻两场不要用完全相同的标题。',
     '',
     '## 拆场',
     '- 一场只讲一个意思；宁可少几场、每场讲透。',
@@ -218,6 +220,7 @@ function scriptPrompt(script, total, style, candidates) {
 /** 单场 manim 代码提示词：只画必须精确的示意图/公式，不画角色。 */
 function visualPrompt(scene, style, cfg) {
   const hint = String(scene.hint || '').trim();
+  const repeat = Boolean(scene.titleRepeat);
   const reservePx = Number(cfg.subtitles && cfg.subtitles.reservedPx) || 200;
   const unitPx = (Number(cfg.height) || 1080) / 8;
   const reserveUnits = Math.ceil((reservePx / unitPx) * 10) / 10;
@@ -229,6 +232,15 @@ function visualPrompt(scene, style, cfg) {
     '输出形状：{"manim":{"scene":"ClassName","code":"from manim import *\\nclass ClassName(Scene):\\n    def construct(self):\\n        ..."}}',
     '',
   ];
+  if (repeat) {
+    head.push(
+      '## 标题：这一场不画（硬性）',
+      `本场标题「${scene.text}」与上一场完全相同，所以**这一场不要出现标题**：`,
+      '- 不要构造标题 Text，不要写 Write(标题) 的动画；直接从图形/坐标轴开始；',
+      '- 画面顶部留空，不要用别的字补位，也不要重复上场的标题；',
+      '',
+    );
+  }
   if (hint) {
     head.push(
       '## 用户指定的画面（最高优先级，必须照着画）',
@@ -239,20 +251,32 @@ function visualPrompt(scene, style, cfg) {
       '',
     );
   }
+  const titleLine = repeat
+    ? '- **不要画标题**：本场标题与上一场相同，代码里不许出现标题 Text，也不许有标题动画'
+    : '- **标题必须醒目**：标题 Text 写 font_size=52（不得低于 44）、weight=BOLD，放在顶部 .to_edge(UP, buff=0.5)';
   const body = [
     '## 脚本硬约束（违反会被拒收，直接降级成文字卡）',
-    '- 只写 `from manim import *` + 一个 `class <英文类名>(Scene):` 和 `def construct(self):`；manim.scene 必须与类名逐字一致',
-    '- import 只允许 manim 和 numpy；其它一律不许',
+    '- 只写 `from manim import *` + 一个 `class <英文类名>(Scene 或 SafeScene):` 和 `def construct(self):`；manim.scene 必须与类名逐字一致',
+    '- import 只允许 manim、numpy、dsh_manim_kit；其它一律不许',
     '- **禁止**：读写文件、网络、subprocess、open()、eval()、exec()、__import__、Scene.embed',
     '- 代码 ≤60 行，单类，不要 __main__',
     '',
     '## 允许用的东西',
     '- 文字：Text（中文必须 Text("…", font="Microsoft YaHei")）；公式：MathTex（LaTeX 已装）',
-    '- **标题必须醒目**：标题 Text 写 font_size=52（不得低于 44）、weight=BOLD，放在顶部 .to_edge(UP, buff=0.5)',
+    titleLine,
     '- **正文也要能看清**：正文 Text 的 font_size 不低于 32；不要用默认字号摆一大段小字',
     '- 图形：Axes、NumberPlane、Line、Arrow、Dot、Circle、Rectangle、Polygon、SurroundingRectangle、VGroup、NumberLine、axes.plot',
     '- 动作：Write、Create、FadeIn、Transform、ReplacementTransform、GrowArrow、Rotate、Indicate、.animate、VGroup.arrange、self.wait',
     `- **底部 ${reservePx}px（约 ${reserveUnits} 个坐标单位）是字幕带，不许放任何内容**；要贴底写 .to_edge(DOWN, buff=${reserveUnits})`,
+    '',
+    M.KIT_PROMPT,
+    '',
+    '## 排版铁律（渲染器会静态 lint，违反会被记为警告）',
+    '- 所有数学标注（Δy、Δx、f(x)、坐标轴标签、数值）必须用 near(mob, target, 方向, buff=0.28) 或 .next_to(..., buff>=0.28) 摆放；**禁止**对标注用 .move_to([x,y,0]) 绝对定位',
+    '- 竖线旁边的标注（Δy 这类）用 label_on_line(lab_dy, dy, RIGHT, buff=0.3)，放在线的中点一侧，不要放在线的端点，也不要横穿轴线',
+    '- 横线旁边的标注（Δx 这类）用 label_on_line(lab_dx, dx, UP, buff=0.3) 或 .next_to(dx, DOWN, buff=0.3)',
+    '- 已经注入 near / label_at / label_on_line / place_label 四个助手，直接用，不要自己再定义',
+    '- 标题和图形之间至少留 0.4 个坐标单位的空白；图形整体下移，不要顶到标题；标注不要压坐标轴、曲线、箭头',
     '',
     '## 必须避开的坑',
     '- 坐标轴不要 include_numbers=True；不要用 DecimalNumber / Integer，要数字用 Text 手标',
@@ -280,13 +304,21 @@ function decideTool(scene) {
   return 'manim';
 }
 
-async function generateCode({ scene, style, cfg, cache, ctx, index }) {
-  const materials = {
+/**
+ * 场级代码缓存的材料：cache.js 的键只认 text/hint/style/tool，
+ * 所以"本场不画标题"这个变体混进 hint（不进旁白，不影响成片内容）。
+ */
+function codeMaterials(scene, style) {
+  return {
     text: scene.text,
-    hint: scene.hint,
+    hint: `${scene.hint || ''}${scene.titleRepeat ? '\n#title-repeat' : ''}`,
     style: styleKey(style),
     tool: 'manim',
   };
+}
+
+async function generateCode({ scene, style, cfg, cache, ctx, index }) {
+  const materials = codeMaterials(scene, style);
   const hit = cache.getCode(materials);
   if (hit) {
     logOr(ctx, `scene#${index} 命中场级代码缓存（${hit.key}）`);
@@ -323,6 +355,7 @@ async function repairManim({ scene, style, code, detail, cfg, ctx, index }) {
     '只输出 JSON，第一个字符必须是 {，不要解释。',
     '下面这段 manim 代码渲染失败了，请修好它。只改坏的地方，不要换主题。',
     `标题：「${scene.text}」`,
+    scene.titleRepeat ? '本场标题与上一场相同：不要出现标题 Text，也不要标题动画。' : '',
     '',
     '## 报错尾部',
     String(detail || '').slice(-700),
@@ -334,6 +367,7 @@ async function repairManim({ scene, style, code, detail, cfg, ctx, index }) {
     '{"manim":{"scene":"ClassName","code":"from manim import *\\n..."}}',
     '',
     '硬约束：import 只允许 manim/numpy；禁止文件/网络/subprocess/open/eval/exec；中文 Text 用 font="Microsoft YaHei"；标题 font_size>=44 且 weight=BOLD；MathTex 参数不要包 $。',
+    '排版：数学标注一律用 near(标注, 目标, 方向, buff=0.28) 或 .next_to(..., buff>=0.28)，禁止 .move_to([x,y,0]) 绝对定位；竖线标注用 label_on_line(lab, line, RIGHT, buff=0.3)。',
     '',
     stylePrompt(style),
   ].join('\n');
@@ -395,6 +429,7 @@ async function plan({ req, cfg, cache, redo, ctx }) {
 
   if (req.scenes.length) {
     scenes = req.scenes.map((s, index) => S.normalizeScene(s, { index, log }));
+    S.markTitleRepeat(scenes);
     title = String(scenes[0] && scenes[0].text || '').trim();
   } else {
     const kind = req.script ? 'script' : 'topic';
@@ -471,10 +506,24 @@ async function plan({ req, cfg, cache, redo, ctx }) {
       s.note = s.note || '文字卡';
       continue;
     }
+    // 面板里手改并锁定的代码（manim.locked）：不查缓存、不调模型，原样用。
+    // 安全检查照做 —— 但被拒收时也不偷偷换成模型代码，交给渲染阶段把错误报给用户。
+    if (s.manim && s.manim.locked && s.manim.code && s.manim.code.trim()) {
+      const unsafe = M.checkCode(M.stripMathDelims(s.manim.code));
+      if (unsafe) {
+        s.status = 'failed';
+        s.note = `手改代码被安全闸门拒收：${unsafe}`;
+        warnings.push(`第 ${i + 1} 场：${s.note}`);
+        log(`scene#${i} ${s.note}`);
+      } else {
+        s.status = 'ready';
+        s.note = '手改代码（已锁定）';
+        log(`scene#${i} 手改代码已锁定，原样使用（${String(s.manim.code).split(/\r?\n/).length} 行）`);
+      }
+      continue;
+    }
     if (redo && s.manim && s.manim.code) {
-      const cached = cache.getCode({
-        text: s.text, hint: s.hint, style: styleKey(style), tool: 'manim',
-      });
+      const cached = cache.getCode(codeMaterials(s, style));
       if (cached && cached.code === s.manim.code) {
         log(`scene#${i} 旧代码与当前缓存一致，沿用`);
       } else if (cached && !codeMatchesText(s.manim.code, s.text)) {
@@ -518,6 +567,20 @@ async function plan({ req, cfg, cache, redo, ctx }) {
       warnings.push(`第 ${i + 1} 场：${s.note}`);
       log(`scene#${i} manim 失败，降级为文字卡：${(r && r.error) || 'UNKNOWN'}`);
     }
+  }
+
+  // 标题去重 + 布局 lint：两个都在"代码已定稿"之后做，结果直接进任务 warnings。
+  for (let i = 0; i < scenes.length; i++) {
+    const s = scenes[i];
+    if (s.titleRepeat) log(`scene#${i} 标题与上一场相同，跳过标题动画（「${s.text}」）`);
+    if (s.tool !== 'manim' || !s.manim || !s.manim.code) continue;
+    const lint = M.lintManim(s.manim.code, s);
+    if (lint.fatal) log(`scene#${i} 布局 lint 解析失败（${lint.fatal}），跳过静态检查`);
+    for (const w of lint.warnings) {
+      log(`scene#${i} 布局 lint：${w}`);
+      warnings.push(`第 ${i + 1} 场布局：${w}`);
+    }
+    if (lint.more) log(`scene#${i} 布局 lint 还有 ${lint.more} 条同类警告未列出`);
   }
 
   // 标题：显式分镜没有 title 字段，就用第一场标题（redo 改标题后立刻反映到任务/日志）

@@ -7,6 +7,11 @@
  *   - 串行调用（speak 内部也是并发 1），单句超时 150s
  *   - 非 audio/* 一律算失败：strict 模式下这代表 TTS 不可用，整集要 failed
  *
+ * 拿到 wav 之后有两条"可选加工"，都是临时文件接力，跳过时只改名：
+ *   1) 变调 voicePitch（半音，默认 +1）：asetrate + atempo，时长不变；0 完全跳过
+ *   2) 变速 narrationSpeed：atempo，1.0 完全跳过
+ * 两步的日志都会带上 scene#N 前缀（由 render.js 的 logger 加）。
+ *
  * 节奏（任务书公式）：
  *   场时长 = clamp(max(计划秒数, 旁白时长 + 每场停留, 动画自然时长 × 0.85),
  *                  minSceneSeconds, maxSceneSeconds)
@@ -22,10 +27,27 @@ const C = require('./cache');
 const SPEED_MIN = 0.85;
 const SPEED_MAX = 1.25;
 
+/** 音高范围（半音）：0 = 原声，正数升调，负数降调。 */
+const PITCH_MIN = -6;
+const PITCH_MAX = 6;
+
 function clampSpeed(v) {
   const n = Number(v);
   if (!Number.isFinite(n)) return 1;
   return Math.min(SPEED_MAX, Math.max(SPEED_MIN, n));
+}
+
+function clampPitch(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 1;
+  return Math.min(PITCH_MAX, Math.max(PITCH_MIN, n));
+}
+
+/** 日志里的音高：+1.0 / 0.0 / -1.5。 */
+function pitchText(v) {
+  const n = Number(v);
+  const safe = Number.isFinite(n) ? n : 0;
+  return `${safe > 0 ? '+' : ''}${safe.toFixed(1)}`;
 }
 
 function parseFailure(body, status) {
@@ -33,6 +55,60 @@ function parseFailure(body, status) {
   try { info = JSON.parse(body); } catch { /* 非 JSON */ }
   const detail = info ? String(info.error || info.message || info.detail || '') : String(body || '').slice(0, 300);
   return { status, speakError: detail || `HTTP_${status}`, raw: String(body || '').slice(0, 500) };
+}
+
+/**
+ * 采样率从输入实测（机器上只有 ffmpeg，没有 ffprobe，沿用 manim.js 的 stderr 解析思路）。
+ * 探测不到返回 0，调用方用 22050（speak 现在的输出）兜底，绝不写死成某个 tts 的采样率。
+ */
+async function probeSampleRate(ffmpeg, file) {
+  if (!ffmpeg || !fs.existsSync(file)) return 0;
+  const r = await M.run(ffmpeg, ['-hide_banner', '-i', file], 20000);
+  const m = /Audio:[^\n]*?(\d{3,6})\s*Hz/i.exec(String(r.err || ''));
+  return m ? Number(m[1]) : 0;
+}
+
+/**
+ * 变调（半音）：asetrate 改播放采样率 = 同时升调和变快，再用 atempo=1/f 把时长拉回来，
+ * 净效果是"只升调、不变长"。f = 2^(semitones/12)。
+ *
+ * - semitones=0 直接改名走人，完全不起 ffmpeg（不重编码）
+ * - 失败降级为原音 + 写日志：变调是锦上添花，不能让整集挂掉
+ * 默认值取实时采样率实测值，避免把 22050/24000 写死。
+ */
+async function applyPitch({ cfg, src, dest, semitones, log }) {
+  const st = clampPitch(semitones);
+  if (Math.abs(st) < 0.005) {
+    fs.renameSync(src, dest);
+    return { ok: true, skipped: true, semitones: 0 };
+  }
+  const probed = await probeSampleRate(cfg.ffmpeg, src);
+  const base = probed > 0 ? probed : 22050;
+  const f = Math.pow(2, st / 12);
+  const rate = Math.round(base * f);
+  const atempo = 1 / f;
+  const tmp = `${dest}.pitch-${process.pid}-${Date.now()}.wav`;
+  const r = await M.run(cfg.ffmpeg, [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-i', src,
+    '-filter:a', `asetrate=${rate},aresample=${base},atempo=${atempo.toFixed(4)}`,
+    '-vn', '-c:a', 'pcm_s16le',
+    tmp,
+  ], 180000);
+  if (r.code !== 0 || !fs.existsSync(tmp) || fs.statSync(tmp).size < 1000) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* 忽略 */ }
+    // 降级：原音照常往下走，只是这一集没有升调
+    try { fs.renameSync(src, dest); } catch { /* 已经挪过去就算了 */ }
+    if (log) {
+      log(`音高 ${pitchText(st)} 半音失败，降级为原音：`
+        + `asetrate=${rate}, atempo=${atempo.toFixed(4)}（${String(r.err || '').slice(-200)}）`);
+    }
+    return { ok: false, degraded: true, semitones: 0, sampledRate: base, rate, atempo };
+  }
+  fs.renameSync(tmp, dest);
+  try { fs.rmSync(src, { force: true }); } catch { /* 忽略 */ }
+  if (log) log(`音高 ${pitchText(st)} 半音（asetrate ${rate}, atempo ${atempo.toFixed(4)}）`);
+  return { ok: true, skipped: false, semitones: st, sampledRate: base, rate, atempo };
 }
 
 /**
@@ -108,13 +184,21 @@ async function speakToFile({ text, voice, speed, cfg, file, log }) {
     }
     const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
     fs.writeFileSync(tmp, buf);
-    const sp = await applySpeed({ cfg, src: tmp, dest: file, speed, log });
+    // 先变调、再变速：两步都是"临时文件 → 正式文件"的接力，
+    // 任一步跳过就只是改名，不额外重编码。
+    const pitched = `${file}.pitched-${process.pid}-${Date.now()}.wav`;
+    const pt = await applyPitch({ cfg, src: tmp, dest: pitched, semitones: cfg.voicePitch, log });
+    const sp = await applySpeed({ cfg, src: pitched, dest: file, speed, log });
     if (!sp.ok) {
       return { ok: false, status: res.status, ms: Date.now() - started, error: `VOICE_UNAVAILABLE: ${sp.error}` };
     }
     const ms = Date.now() - started;
     if (log) log(`配音完成 ${(ms / 1000).toFixed(1)}s（${buf.length} 字节）`);
-    return { ok: true, file, ms, cached: false, bytes: buf.length, speed: clampSpeed(speed) };
+    return {
+      ok: true, file, ms, cached: false, bytes: buf.length, speed: clampSpeed(speed),
+      pitch: clampPitch(cfg.voicePitch), pitchApplied: pt.ok && !pt.skipped,
+      pitchDegraded: Boolean(pt && pt.degraded), pitchRate: pt.rate || 0, pitchAtempo: pt.atempo || 0,
+    };
   } catch (err) {
     const msg = String((err && err.message) || err);
     if (log) log(`speak 调用异常：${msg}`);
@@ -127,10 +211,14 @@ async function speakToFile({ text, voice, speed, cfg, file, log }) {
   }
 }
 
-/** 旁白音频的缓存键：和"文本 + 音色 + 语速"有关，和画面/标题无关。 */
-function audioKey(text, voice, speed) {
+/**
+ * 旁白音频的缓存键：和"文本 + 音色 + 语速 + 音高"有关，和画面/标题无关。
+ * 音高必须进键：否则把 voicePitch 从 0 改成 1 会命中旧音频，听起来像"没生效"。
+ */
+function audioKey(text, voice, speed, pitch) {
   const spd = clampSpeed(speed).toFixed(2);
-  return C.sha1(`audio-v2|${String(voice || '')}|${spd}|${String(text || '')}`, 24);
+  const pit = clampPitch(pitch).toFixed(2);
+  return C.sha1(`audio-v2|${String(voice || '')}|${spd}|${pit}|${String(text || '')}`, 24);
 }
 
 /**
@@ -141,17 +229,18 @@ async function ensureSpeech({ scene, voice, cfg, cache, log }) {
   const text = String(scene.narration || '').trim();
   if (!text) return { ok: true, file: null, cached: false, duration: 0, ms: 0 };
   const speed = clampSpeed(cfg.narrationSpeed);
-  const k = audioKey(text, voice, speed);
+  const pitch = clampPitch(cfg.voicePitch);
+  const k = audioKey(text, voice, speed, pitch);
   const file = cache.audioFile(k);
   const before = fs.existsSync(file);
   const r = await speakToFile({ text, voice, speed, cfg, file, log });
   if (!r.ok) return { ...r, duration: 0, key: k };
   const info = r.file ? await M.probeMedia(cfg.ffmpeg, r.file) : null;
   const duration = info && info.duration > 0 ? info.duration : Math.max(1, text.length / 4.2);
-  if (log) log(`旁白 ${duration.toFixed(2)}s（语速 ${speed.toFixed(2)}×）`);
+  if (log) log(`旁白 ${duration.toFixed(2)}s（语速 ${speed.toFixed(2)}×，音高 ${pitchText(pitch)} 半音）`);
   return {
     ok: true, file: r.file, key: k, cached: before || r.cached || false,
-    duration, ms: r.ms || 0,
+    duration, ms: r.ms || 0, pitch, pitchDegraded: Boolean(r.pitchDegraded),
   };
 }
 
@@ -173,4 +262,7 @@ function sceneSeconds({ planned, narrationSeconds, naturalSeconds, cfg }) {
   return Math.round(target * 100) / 100;
 }
 
-module.exports = { ensureSpeech, sceneSeconds, audioKey, speakToFile, clampSpeed };
+module.exports = {
+  ensureSpeech, sceneSeconds, audioKey, speakToFile,
+  clampSpeed, clampPitch, applyPitch, probeSampleRate,
+};

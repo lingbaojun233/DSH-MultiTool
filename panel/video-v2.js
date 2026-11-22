@@ -4,12 +4,19 @@
  * 挂到旧面板视频 tab 的容器 #videoV2Root 上。
  *
  * 数据只走 /api/v2/*（旧面板 server.js 代理到 studio-v2 8774）：
- *   GET  /api/v2/jobs             最近 50 条
+ *   GET  /api/v2/jobs             最近 50 条（每条带 projectId / projectTitle / version）
  *   GET  /api/v2/jobs/:id         单条任务（2 秒轮询）
- *   POST /api/v2/jobs             新任务
- *   POST /api/v2/jobs/:id/redo    按改过的分镜重做
+ *   POST /api/v2/jobs             新任务（可选 projectId）
+ *   POST /api/v2/jobs/:id/redo    按改过的分镜重做（沿用原任务的项目）
  *   GET  /api/v2/video/:id        mp4 / ?srt=1
  *   GET  /api/v2/voices?zh=1      音色清单（面板转 speak）
+ *
+ * 项目（一个主题）→ 版本（job）两层：
+ *   GET    /api/v2/projects        项目列表（含未分组的旧任务）
+ *   POST   /api/v2/projects        新建项目
+ *   GET    /api/v2/projects/:id    项目详情 + 它的所有版本
+ *   POST   /api/v2/projects/:id    改名
+ *   DELETE /api/v2/projects/:id    删项目（连带它的版本和 mp4）
  *
  * 不碰旧 studio（8772）的任何接口。类名统一 v2- 前缀，避免和旧面板全局样式打架。
  */
@@ -31,12 +38,20 @@
   /* 音色 id 是云端动态的（voc_xxx），清单从 speak 拉；拉不到就只留「跟人设」 */
   const DEFAULT_VOICE_OPTIONS = [{ value: '', label: '跟人设（推荐）' }];
 
-  /* 三个可调项：选项跟 studio-v2 的范围对齐（schema.js 里还会再夹一次） */
+  /* 四个可调项：选项跟 studio-v2 的范围对齐（schema.js 里还会再夹一次） */
   const SPEED_OPTIONS = [
     { value: 0.9, label: '0.9' },
     { value: 1.0, label: '1.0' },
     { value: 1.1, label: '1.1' },
     { value: 1.2, label: '1.2' },
+  ];
+  /* 音高：半音，0 = 原声（后端会完全跳过重采样），默认 +1 */
+  const PITCH_OPTIONS = [
+    { value: 0, label: '原声' },
+    { value: 0.5, label: '+0.5' },
+    { value: 1.0, label: '+1（推荐）' },
+    { value: 1.5, label: '+1.5' },
+    { value: 2.0, label: '+2' },
   ];
   const PADDING_OPTIONS = [
     { value: 0.3, label: '0.3 秒' },
@@ -49,7 +64,7 @@
     { value: 2.0, label: '2.0 秒' },
     { value: 3.0, label: '3.0 秒' },
   ];
-  const DEFAULT_PREFS = { narrationSpeed: 1.0, scenePadding: 0.6, stickerDuration: 2.0 };
+  const DEFAULT_PREFS = { narrationSpeed: 1.0, voicePitch: 1.0, scenePadding: 0.6, stickerDuration: 2.0 };
 
   /* 后端错误码 → 人能读懂的一句话 */
   const ERROR_ZH = {
@@ -124,9 +139,19 @@
     token: '',
     scenes: [],
     redoFrom: '',
+    // 重做时沿用原任务的项目：下拉显示它并锁住（服务端也会沿用）
+    redoProjectId: '',
+    redoProjectTitle: '',
+    // 做视频页选中的项目：'' = 「+ 新建项目」（提交时先建一个）
+    projectId: '',
+    // 任务页的数据：项目摘要 + 未分组旧任务
+    projects: [],
+    ungrouped: [],
+    // null = 还没渲染过下拉；空字符串是「零个项目」的合法签名，两者不能混
+    projectSig: null,
+    projectCards: new Map(),
     jobs: new Map(),
     currentJobId: '',
-    cards: new Map(),
     current: null,
     currentId: '',
     submitting: false,
@@ -443,35 +468,509 @@
     node.player.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }
 
-  /* ---------- 任务页 ---------- */
+  /* ---------- 任务页：项目 → 版本 ---------- */
 
-  function renderJobs(jobs) {
-    const list = (Array.isArray(jobs) ? jobs : []).slice(0, JOBS_LIMIT);
-    const keep = new Set(list.map((job) => job.id));
+  function formatAgo(ts) {
+    const at = Number(ts) || 0;
+    if (!at) return '';
+    const diff = Date.now() - at;
+    if (diff < 60000) return '刚刚';
+    if (diff < 3600000) return `${Math.floor(diff / 60000)} 分钟前`;
+    if (diff < 86400000) return `${Math.floor(diff / 3600000)} 小时前`;
+    const date = new Date(at);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${date.getMonth() + 1}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  }
 
-    for (const [id, node] of state.cards) {
-      if (!keep.has(id)) {
+  function statusIcon(status) {
+    if (status === 'done') return '✓';
+    if (status === 'failed') return '✕';
+    if (status === 'canceled') return '–';
+    return '…';
+  }
+
+  /** 一条版本的一句话：✓ v3 完成 · 58 秒 · 2 分钟前 */
+  function versionLine(job, options) {
+    const opts = options || {};
+    const version = Number(job.version) || 0;
+    const status = String(job.status || 'queued').toLowerCase();
+    const parts = [];
+    if (version && !opts.ungrouped) parts.push(`v${version} ${job.redoOf ? '重做' : '首次'}`);
+    else if (opts.ungrouped) parts.push(String(job.title || '旧任务').slice(0, 24));
+    parts.push(STATUS_ZH[status] || status);
+    if (isActive(job)) {
+      const phase = PHASE_ZH[String(job.phase || '')];
+      if (phase) parts.push(phase);
+    }
+    const seconds = Number(job.seconds);
+    if (seconds) parts.push(`${seconds} 秒`);
+    const ago = formatAgo(job.createdAt);
+    if (ago) parts.push(ago);
+    if (status === 'failed' && job.error) parts.push(errorLine(job));
+    return `${statusIcon(status)} ${parts.join(' · ')}`;
+  }
+
+  /** 明细接口拿不到时，用 GET /jobs 的列表兜底分组（老服务端也能看项目卡）。 */
+  function groupsFromJobs(jobs) {
+    const map = new Map();
+    const ungrouped = [];
+    for (const job of jobs) {
+      const pid = String(job.projectId || '');
+      if (!pid) {
+        ungrouped.push(job);
+        continue;
+      }
+      if (!map.has(pid)) {
+        map.set(pid, { id: pid, title: job.projectTitle || '未命名项目', versionCount: 0, latest: null, createdAt: job.createdAt, updatedAt: job.createdAt });
+      }
+      const group = map.get(pid);
+      group.versionCount += 1;
+      group.updatedAt = Math.max(group.updatedAt || 0, Number(job.createdAt) || 0);
+      if (!group.latest || (Number(job.version) || 0) >= (Number(group.latest.version) || 0)) group.latest = job;
+    }
+    const projects = Array.from(map.values()).map((group) => ({
+      id: group.id,
+      title: group.title,
+      createdAt: group.createdAt,
+      updatedAt: group.updatedAt,
+      versionCount: group.versionCount,
+      latest: group.latest ? {
+        jobId: group.latest.id,
+        status: group.latest.status,
+        phase: group.latest.phase,
+        videoUrl: group.latest.videoUrl,
+        seconds: group.latest.seconds,
+        bytes: group.latest.bytes,
+        version: group.latest.version,
+        createdAt: group.latest.createdAt,
+        error: group.latest.error,
+      } : null,
+    }));
+    projects.sort((a, b) => (b.updatedAt - a.updatedAt) || (b.createdAt - a.createdAt));
+    ungrouped.sort((a, b) => (b.createdAt - a.createdAt));
+    return { projects, ungrouped };
+  }
+
+  function createProjectCard() {
+    const card = el('article', 'v2-card v2-project-card');
+    const head = el('div', 'v2-card-head');
+    const title = el('h3', 'v2-card-title');
+    const toggle = el('button', 'v2-chip v2-proj-toggle');
+    toggle.type = 'button';
+    toggle.dataset.act = 'toggle';
+
+    const latest = el('div', 'v2-proj-latest');
+    const status = el('p', 'v2-card-status v2-proj-status');
+    const latestOps = el('div', 'v2-proj-latest-ops');
+    const play = el('button', 'v2-btn v2-sm v2-accent', '播放');
+    play.type = 'button';
+    play.dataset.act = 'play-latest';
+    const download = el('a', 'v2-btn v2-sm', '下载');
+    download.setAttribute('download', '');
+    latestOps.appendChild(play);
+    latestOps.appendChild(download);
+    latest.appendChild(status);
+    latest.appendChild(latestOps);
+
+    const ops = el('div', 'v2-card-actions');
+    const redo = el('button', 'v2-btn v2-sm', '重做');
+    redo.type = 'button';
+    redo.dataset.act = 'redo';
+    const rename = el('button', 'v2-btn v2-sm', '改名');
+    rename.type = 'button';
+    rename.dataset.act = 'rename';
+    const remove = el('button', 'v2-btn v2-sm v2-danger', '删除项目');
+    remove.type = 'button';
+    remove.dataset.act = 'delete';
+    ops.appendChild(redo);
+    ops.appendChild(rename);
+    ops.appendChild(remove);
+
+    const versions = el('div', 'v2-project-versions hidden');
+    const player = el('div', 'v2-card-player v2-project-player hidden');
+
+    head.appendChild(title);
+    head.appendChild(toggle);
+    card.appendChild(head);
+    card.appendChild(latest);
+    card.appendChild(ops);
+    card.appendChild(versions);
+    card.appendChild(player);
+
+    return {
+      root: card,
+      title,
+      toggle,
+      status,
+      latestOps,
+      play,
+      download,
+      ops,
+      redo,
+      rename,
+      remove,
+      versions,
+      player,
+      group: null,
+      expanded: false,
+      loadedCount: -1,
+      loading: false,
+    };
+  }
+
+  function updateProjectCard(node, group) {
+    node.group = group;
+    const ungrouped = group.kind === 'ungrouped';
+    const latest = group.latest || null;
+    node.title.textContent = group.title || '未命名视频';
+    node.root.classList.toggle('v2-project-ungrouped', ungrouped);
+    node.root.dataset.project = group.id || '';
+
+    const count = Number(group.versionCount) || 0;
+    const arrow = node.expanded ? '▴' : '▾';
+    node.toggle.textContent = ungrouped ? `${count} 条旧任务 ${arrow}` : `${count} 个版本 ${arrow}`;
+    node.toggle.setAttribute('aria-expanded', String(node.expanded));
+
+    if (!latest) {
+      node.status.textContent = '还没有版本：在「做视频」选这个项目，提交一版';
+      node.status.className = 'v2-card-status v2-proj-status';
+    } else {
+      node.status.textContent = versionLine(latest, { ungrouped });
+      node.status.className = `v2-card-status v2-proj-status${latest.status === 'failed' ? ' failed' : ''}${latest.status === 'done' ? ' done' : ''}`;
+    }
+
+    const done = Boolean(latest && latest.status === 'done' && latest.videoUrl);
+    node.play.classList.toggle('hidden', !done);
+    node.download.classList.toggle('hidden', !done);
+    if (done) node.download.href = mediaHref({ id: latest.jobId }, false);
+
+    // 旧任务/未分组：能播能下，但不提供「重做」（服务端不会把重做挂回项目）
+    node.redo.classList.toggle('hidden', ungrouped || !latest || !isTerminal(latest));
+    node.rename.classList.toggle('hidden', ungrouped);
+    node.remove.classList.toggle('hidden', ungrouped);
+
+    // 展开中：版本数变了就重拉列表（有新版/REDO 完成时）
+    // 未分组没有详情接口：用任务 id 拼个签名，只有真变了才重画，不然 2 秒一次的轮询
+    // 会把正在播的 <video> 一起冲掉。
+    if (node.expanded) {
+      if (ungrouped) {
+        const signature = state.ungrouped.map((job) => job.jobId || job.id).join(',');
+        if (signature !== node.ungroupedSig) {
+          node.ungroupedSig = signature;
+          renderVersionRows(node, state.ungrouped, { ungrouped: true });
+        }
+      } else if (node.loadedCount !== count && !node.loading) {
+        loadProjectVersions(node);
+      }
+    }
+  }
+
+  function renderProjects(groups) {
+    state.projects = (groups && Array.isArray(groups.projects)) ? groups.projects : [];
+    state.ungrouped = (groups && Array.isArray(groups.ungrouped)) ? groups.ungrouped : [];
+
+    const all = state.projects.map((project) => ({ kind: 'project', ...project }));
+    if (state.ungrouped.length) {
+      all.push({
+        kind: 'ungrouped',
+        id: '',
+        title: '未分组',
+        versionCount: state.ungrouped.length,
+        latest: state.ungrouped[0],
+        createdAt: state.ungrouped[0] ? state.ungrouped[0].createdAt : 0,
+        updatedAt: state.ungrouped[0] ? state.ungrouped[0].createdAt : 0,
+      });
+    }
+
+    const keep = new Set(all.map((group) => group.id || '__ungrouped__'));
+    for (const [key, node] of state.projectCards) {
+      if (!keep.has(key)) {
         node.root.remove();
-        state.cards.delete(id);
+        state.projectCards.delete(key);
       }
     }
 
-    list.forEach((job, index) => {
-      let node = state.cards.get(job.id);
+    all.forEach((group, index) => {
+      const key = group.id || '__ungrouped__';
+      let node = state.projectCards.get(key);
       if (!node) {
-        node = createCard();
-        state.cards.set(job.id, node);
+        node = createProjectCard();
+        state.projectCards.set(key, node);
       }
-      updateCard(node, job);
+      updateProjectCard(node, group);
       const at = els.jobsList.children[index];
       if (at !== node.root) els.jobsList.insertBefore(node.root, at || null);
     });
 
-    els.jobsEmpty.classList.toggle('hidden', list.length > 0);
-    const running = list.filter(isActive).length;
-    els.jobsSummary.textContent = list.length
-      ? `最近 ${list.length} 条${running ? ` · ${running} 条进行中` : ''}`
-      : '最近 50 条';
+    els.jobsEmpty.classList.toggle('hidden', all.length > 0);
+    els.jobsEmpty.textContent = '还没有任务。去「做视频」开一条吧。';
+    const running = all.filter((group) => group.latest && isActive(group.latest)).length;
+    els.jobsSummary.textContent = all.length
+      ? `${all.length} 个项目${running ? ` · ${running} 个在跑` : ''}`
+      : '还没有项目';
+    syncProjectRow();
+  }
+
+  /** 展开某张卡：拉一次详情，按「最新在上」列出所有版本。 */
+  async function loadProjectVersions(node) {
+    const group = node.group;
+    if (!group || !group.id || node.loading) return;
+    node.loading = true;
+    try {
+      const data = await api(`/api/v2/projects/${encodeURIComponent(group.id)}`);
+      const jobs = (Array.isArray(data.jobs) ? data.jobs : []).slice().reverse();
+      renderVersionRows(node, jobs, { ungrouped: false });
+      node.loadedCount = Number(group.versionCount) || jobs.length;
+    } catch (err) {
+      node.versions.textContent = errText(err);
+    } finally {
+      node.loading = false;
+    }
+  }
+
+  function versionRow(job, options) {
+    const opts = options || {};
+    const row = el('div', 'v2-ver-row');
+    const label = el('span', 'v2-ver-label', versionLine(job, opts));
+    const ops = el('span', 'v2-ver-ops');
+    const done = job.status === 'done' && (job.videoUrl || job.jobId || job.id);
+    const play = el('button', 'v2-btn v2-sm', '播放');
+    play.type = 'button';
+    play.dataset.act = 'play-ver';
+    const download = el('a', 'v2-btn v2-sm', '下载');
+    download.setAttribute('download', '');
+    const id = job.jobId || job.id;
+    download.href = mediaHref({ id }, false);
+    play.classList.toggle('hidden', !done);
+    download.classList.toggle('hidden', !done);
+    ops.appendChild(play);
+    ops.appendChild(download);
+    const player = el('div', 'v2-ver-player hidden');
+    row.appendChild(label);
+    row.appendChild(ops);
+    row.appendChild(player);
+    row.dataset.job = id || '';
+    return row;
+  }
+
+  function renderVersionRows(node, jobs, options) {
+    const opts = options || {};
+    node.versions.textContent = '';
+    const list = Array.isArray(jobs) ? jobs : [];
+    if (!list.length) {
+      node.versions.appendChild(el('p', 'v2-hint', '这个项目还没有版本'));
+      return;
+    }
+    for (const job of list) node.versions.appendChild(versionRow(job, opts));
+  }
+
+  /** 展开/收起：第一次展开才发请求，之后靠版本数变化自动刷新。 */
+  function toggleProjectCard(node) {
+    node.expanded = !node.expanded;
+    node.versions.classList.toggle('hidden', !node.expanded);
+    const count = node.group ? Number(node.group.versionCount) || 0 : 0;
+    const arrow = node.expanded ? '▴' : '▾';
+    if (node.group) {
+      node.toggle.textContent = node.group.kind === 'ungrouped'
+        ? `${count} 条旧任务 ${arrow}`
+        : `${count} 个版本 ${arrow}`;
+    }
+    node.toggle.setAttribute('aria-expanded', String(node.expanded));
+    if (!node.expanded) return;
+    if (node.group && node.group.kind === 'ungrouped') {
+      // 记下这次渲染对应的任务集合：下一次轮询签名没变就不会重画，正在播的视频才不会被冲掉
+      node.ungroupedSig = state.ungrouped.map((job) => job.jobId || job.id).join(',');
+      renderVersionRows(node, state.ungrouped, { ungrouped: true });
+      return;
+    }
+    loadProjectVersions(node);
+  }
+
+  /** 卡片里的播放：mp4 直接塞进卡片，旧版本也能看。 */
+  function playInline(container, jobId) {
+    if (!container || !jobId) return;
+    let video = container.querySelector('video');
+    if (!video) {
+      video = document.createElement('video');
+      video.controls = true;
+      video.playsInline = true;
+      video.preload = 'metadata';
+      container.appendChild(video);
+    }
+    const href = mediaHref({ id: jobId }, false);
+    if (video.getAttribute('src') !== href) video.src = href;
+    container.classList.remove('hidden');
+    const played = video.play();
+    if (played && typeof played.catch === 'function') played.catch(() => {});
+    container.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+
+  /* ---------- 做视频页：项目下拉 ---------- */
+
+  /** 从准备提交的内容里猜一个项目名（和服务端 deriveTitle 的优先级一致）。 */
+  function guessProjectTitle(body) {
+    const scenes = Array.isArray(body.scenes) ? body.scenes : [];
+    for (const scene of scenes) {
+      const text = String((scene && scene.text) || '').trim();
+      if (text) return text.slice(0, 60);
+    }
+    const topic = String(body.topic || '').trim();
+    if (topic) return (topic.split(/\n/).map((s) => s.trim()).find(Boolean) || topic).slice(0, 60);
+    const script = String(body.script || '').trim();
+    if (script) {
+      const first = script.split(/[。！？!?\n\r]/).map((s) => s.trim()).find(Boolean);
+      if (first) return first.slice(0, 60);
+    }
+    return '';
+  }
+
+  /** 提交前把项目定下来：选了现有项目就用它，否则先建一个（对应「+ 新建项目」）。 */
+  async function ensureProject(body) {
+    if (state.projectId) return state.projectId;
+    const title = guessProjectTitle(body);
+    const data = await api('/api/v2/projects', { method: 'POST', body: title ? { title } : {} });
+    if (!data.projectId) throw new ApiError('新建项目没返回 id', 502, '');
+    return String(data.projectId);
+  }
+
+  /** 下拉选项：第一项永远是「+ 新建项目」，后面跟现有项目（带版本数）。 */
+  function syncProjectRow() {
+    if (!els.projectSel) return;
+    const signature = state.projects.map((p) => `${p.id}:${p.title}:${p.versionCount}`).join('|');
+    // 一个项目都没有时 signature 是空串：也得建出「+ 新建项目」这一项
+    if (signature !== state.projectSig || !els.projectSel.options.length) {
+      state.projectSig = signature;
+      const current = state.projectId;
+      els.projectSel.textContent = '';
+      const fresh = document.createElement('option');
+      fresh.value = '';
+      fresh.textContent = '+ 新建项目';
+      els.projectSel.appendChild(fresh);
+      for (const project of state.projects) {
+        const option = document.createElement('option');
+        option.value = project.id;
+        option.textContent = `${project.title || '未命名视频'}（${project.versionCount || 0} 版）`;
+        els.projectSel.appendChild(option);
+      }
+      // 正在重做的项目可能不在前 50 条里：补一个选项，别把下拉搞成空的
+      if (state.redoFrom && state.redoProjectId && !state.projects.some((p) => p.id === state.redoProjectId)) {
+        const option = document.createElement('option');
+        option.value = state.redoProjectId;
+        option.textContent = `${state.redoProjectTitle || '原项目'}（重做）`;
+        els.projectSel.appendChild(option);
+      }
+      state.projectId = current;
+    }
+
+    const redo = Boolean(state.redoFrom);
+    els.projectSel.disabled = redo;
+    if (redo) els.projectSel.value = state.redoProjectId || '';
+    else els.projectSel.value = state.projectId || '';
+    // 选中的项目已经被删掉：回到「+ 新建项目」
+    if (!redo && state.projectId && els.projectSel.value !== state.projectId) {
+      state.projectId = '';
+      els.projectSel.value = '';
+    }
+
+    if (!els.projectHint) return;
+    if (redo) {
+      els.projectHint.textContent = state.redoProjectId
+        ? `重做会加到原项目「${state.redoProjectTitle || '上一个'}」的下一个版本`
+        : '这条旧任务没有项目，重做会生成一条「未分组」的新任务';
+      return;
+    }
+    if (state.projectId) {
+      const project = state.projects.find((p) => p.id === state.projectId);
+      const count = project ? project.versionCount : 0;
+      els.projectHint.textContent = `会加到「${project ? project.title : '所选项目'}」，成为 v${count + 1}`;
+      return;
+    }
+    els.projectHint.textContent = '默认新建项目，标题从内容里取';
+  }
+
+  function onProjectSelect() {
+    if (!els.projectSel) return;
+    state.projectId = els.projectSel.value || '';
+    syncProjectRow();
+  }
+
+  /* ---------- 项目卡片操作 ---------- */
+
+  function projectOf(node) {
+    return node && node.group ? node.group : null;
+  }
+
+  async function onRenameProject(node) {
+    const group = projectOf(node);
+    if (!group || !group.id) return;
+    const next = window.prompt('项目新名字', group.title || '');
+    if (next == null) return;
+    const title = String(next).trim();
+    if (!title) return;
+    try {
+      await api(`/api/v2/projects/${encodeURIComponent(group.id)}`, { method: 'POST', body: { title } });
+      toast(`项目改名为「${title}」`);
+      pollJobs();
+    } catch (err) {
+      toast(errText(err));
+    }
+  }
+
+  async function onDeleteProject(node) {
+    const group = projectOf(node);
+    if (!group || !group.id) return;
+    const ok = window.confirm(`删除项目「${group.title}」？它的 ${group.versionCount || 0} 个版本和 mp4 都会一起删掉。`);
+    if (!ok) return;
+    try {
+      const data = await api(`/api/v2/projects/${encodeURIComponent(group.id)}`, { method: 'DELETE' });
+      const mb = (Number(data.freedBytes) || 0) / 1048576;
+      toast(`已删除项目「${group.title}」${data.jobIds && data.jobIds.length ? `（${data.jobIds.length} 个版本）` : ''}，释放 ${mb.toFixed(1)}MB`);
+      node.root.remove();
+      state.projectCards.delete(group.id);
+      if (state.projectId === group.id) state.projectId = '';
+      pollJobs();
+    } catch (err) {
+      if (err instanceof ApiError && err.code === 'PROJECT_BUSY') toast('这个项目还有版本在跑，等它完成再删');
+      else toast(errText(err));
+    }
+  }
+
+  /** 任务页所有点击都走这一处委托：卡片和版本行都能点到。 */
+  function onJobsClick(event) {
+    const button = event.target.closest('[data-act]');
+    if (!button) return;
+    const card = button.closest('.v2-project-card');
+    if (!card) return;
+    const key = card.dataset.project || '__ungrouped__';
+    const node = state.projectCards.get(key);
+    if (!node) return;
+    const act = button.dataset.act;
+    const latest = node.group && node.group.latest;
+
+    if (act === 'toggle') {
+      toggleProjectCard(node);
+      return;
+    }
+    if (act === 'play-latest') {
+      if (latest && latest.jobId) playInline(node.player, latest.jobId);
+      return;
+    }
+    if (act === 'redo') {
+      if (latest && latest.jobId) onRedo({ id: latest.jobId, projectId: node.group.id });
+      return;
+    }
+    if (act === 'rename') {
+      onRenameProject(node);
+      return;
+    }
+    if (act === 'delete') {
+      onDeleteProject(node);
+      return;
+    }
+    if (act === 'play-ver') {
+      const row = button.closest('.v2-ver-row');
+      if (row && row.dataset.job) playInline(row.querySelector('.v2-ver-player'), row.dataset.job);
+    }
   }
 
   function mountCurrent(job) {
@@ -497,12 +996,9 @@
   }
 
   function tickElapsed() {
-    const nodes = [];
-    if (state.current) nodes.push(state.current);
-    for (const node of state.cards.values()) nodes.push(node);
-    for (const node of nodes) {
-      if (!node.job || !isActive(node.job)) continue;
-      node.status.textContent = buildStatusText(node);
+    // 任务页现在是项目卡，状态靠 2 秒轮询刷新；这里只负责「刚提交的那张卡」的秒表
+    if (state.current && state.current.job && isActive(state.current.job)) {
+      state.current.status.textContent = buildStatusText(state.current);
     }
   }
 
@@ -550,15 +1046,29 @@
     if (state.listBusy) return;
     state.listBusy = true;
     try {
-      const data = await api('/api/v2/jobs');
+      // 一次拿两份：任务列表（当前任务/未分组兜底）+ 项目分组（任务页的卡片）
+      const [data, projectData] = await Promise.all([
+        api('/api/v2/jobs'),
+        api('/api/v2/projects').catch((err) => {
+          if (err instanceof ApiError && err.status === 401) throw err;
+          return null; // 老服务端没有项目接口：用任务列表在本地分组
+        }),
+      ]);
       setOnline('online', '在线');
       const jobs = (Array.isArray(data.jobs) ? data.jobs : [])
         .filter((job) => job && job.id)
+        .slice(0, JOBS_LIMIT)
         .map((job) => {
           state.jobs.set(job.id, job);
           return job;
         });
-      renderJobs(jobs);
+      const groups = projectData && Array.isArray(projectData.projects)
+        ? {
+          projects: projectData.projects,
+          ungrouped: Array.isArray(projectData.ungrouped) ? projectData.ungrouped : [],
+        }
+        : groupsFromJobs(jobs);
+      renderProjects(groups);
 
       // 当前任务如果已经在列表里，顺手把卡片刷新一下（不额外发单条请求）
       if (state.currentJobId && !state.timers.poll) {
@@ -566,7 +1076,10 @@
         if (known && state.current) updateCurrent(known);
       }
 
-      if (state.view === 'jobs' && jobs.some(isActive)) ensureListPoll();
+      const active = jobs.some(isActive)
+        || groups.projects.some((project) => project.latest && isActive(project.latest))
+        || groups.ungrouped.some(isActive);
+      if (state.view === 'jobs' && active) ensureListPoll();
       else stopListPoll();
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
@@ -613,6 +1126,8 @@
       stickers: [],
       image: '',
       manim: null,
+      // manim 代码是按哪份 text/hint/tool 生成的；一变就作废（见 sceneCodeKey）
+      manimKey: '',
       status: '',
       note: '',
       dirty: true,
@@ -625,7 +1140,7 @@
       const tool = source.tool === 'manim' || source.tool === 'text' || source.tool === 'sticker'
         ? source.tool
         : 'auto';
-      return {
+      const item = {
         text: String(source.text || ''),
         narration: String(source.narration || ''),
         seconds: Math.min(15, Math.max(1, Number(source.seconds) || 5)),
@@ -640,6 +1155,9 @@
         // 从旧任务载入的分镜先当作「干净」；用户一改就标脏
         dirty: Boolean(source.dirty),
       };
+      // 记下这份代码是按哪份 text/hint/tool 生成的；用户只改旁白时它仍然有效
+      item.manimKey = sceneCodeKey(item);
+      return item;
     });
     renderScenes();
   }
@@ -931,6 +1449,30 @@
     if (row) row.dataset.dirty = '1';
   }
 
+  /**
+   * 一场「画面代码」的身份：和 studio-v2 的代码缓存键同源（text + hint + tool）。
+   * 只放会影响画面的字段；旁白、秒数、表情不参与，所以只改旁白不会让代码作废。
+   */
+  function sceneCodeKey(scene) {
+    if (!scene) return '';
+    return [
+      String(scene.text || '').trim().slice(0, 80),
+      String(scene.hint || '').trim().slice(0, 600),
+      String(scene.tool || 'auto'),
+    ].join('\u0001');
+  }
+
+  /**
+   * 改过 text/hint/tool 就把这一场的 manim 代码丢掉。
+   * 不丢的话重做请求会把旧代码原样带回去，studio-v2 认「标题没变」就沿用旧画面，
+   * 于是出现「旁白换了、画面一模一样」。
+   */
+  function dropSceneCode(scene) {
+    if (!scene) return;
+    scene.manim = null;
+    scene.manimKey = '';
+  }
+
   function renderScenes() {
     const tpl = $('#v2SceneRowTpl');
     if (!tpl) return;
@@ -977,6 +1519,8 @@
     } else if (field === 'text' || field === 'hint' || field === 'narration') {
       scene[field] = target.value;
     }
+    // 画面三要素之一变了：立刻作废这一场的 manim 代码（旁白/秒数不受影响）
+    if (field === 'text' || field === 'hint' || field === 'tool') dropSceneCode(scene);
     markSceneDirty(row, scene);
     sceneCountBadge();
   }
@@ -994,7 +1538,10 @@
           : 'auto',
         stickers: Array.isArray(scene.stickers) ? scene.stickers.slice(0, 1) : [],
         image: String(scene.image || ''),
-        manim: scene.manim && typeof scene.manim === 'object' ? scene.manim : null,
+        // 只有代码和当前 text/hint/tool 对得上才回传：对不上就交给后端重新生成
+        manim: scene.manim && typeof scene.manim === 'object' && scene.manimKey === sceneCodeKey(scene)
+          ? scene.manim
+          : null,
         // 面板自己的脏标记：studio-v2 会忽略未知字段，这里留着方便验收脚本看
         dirty: Boolean(scene.dirty),
       }));
@@ -1052,10 +1599,11 @@
     };
   }
 
-  /** 三个可调项：提交与重做都带上，服务端会再夹一次范围。 */
+  /** 四个可调项：提交与重做都带上，服务端会再夹一次范围。 */
   function tunableBody() {
     return {
       narrationSpeed: Number(state.prefs.narrationSpeed),
+      voicePitch: Number(state.prefs.voicePitch),
       scenePadding: Number(state.prefs.scenePadding),
       stickerDuration: Number(state.prefs.stickerDuration),
     };
@@ -1095,7 +1643,7 @@
       kind = isScript(text) ? 'script' : 'topic';
     }
 
-    // 三个可调项不分新建/重做都带：重做时可以只改语速
+    // 四个可调项不分新建/重做都带：重做时可以只改语速或音高
     Object.assign(body, tunableBody());
 
     // 「跟人设」就省略，让 studio-v2 按人设补；手工选了才带上
@@ -1106,21 +1654,34 @@
 
     state.submitting = true;
     setBusy(true);
+    // 用户显式选过的项目：提交成功后保留，方便接着加下一版；没选（+ 新建项目）就保持新建
+    const explicitProject = state.projectId;
     try {
+      // 项目：重做由服务端沿用原任务的项目；新建时选了现有项目就带上，没选就先建一个
+      if (kind !== 'redo') {
+        const projectId = await ensureProject(body);
+        if (projectId) body.projectId = projectId;
+      }
       const data = await api(path, { method: 'POST', body });
       if (!data.jobId) throw new ApiError('服务没返回任务 id', 502, '');
       const job = placeholderJob(String(data.jobId), body);
       state.currentJobId = job.id;
       mountCurrent(job);
       setOnline('online', '在线');
-      showHint(`已提交 · 任务 ${job.id}`);
+      const projectTitle = String(data.projectTitle || '');
+      const version = Number(data.version) || 0;
+      showHint(`已提交 · 任务 ${job.id}${projectTitle ? ` · 项目「${projectTitle}」v${version}` : ''}`);
+      state.projectId = explicitProject;
       if (kind === 'redo') {
         // 重做已提交，旧分镜不能留着劫持下一次「开始做」
         state.redoFrom = '';
+        state.redoProjectId = '';
+        state.redoProjectTitle = '';
         hideRedoBanner();
         loadScenes([]);
         updateModeHint();
       }
+      syncProjectRow();
       // 提交后 2 秒一次问单条任务，终态停表
       startJobPoll(job.id);
       pollJobs();
@@ -1153,10 +1714,14 @@
         return;
       }
       state.redoFrom = full.id || job.id;
+      // 重做沿用原任务的项目：下拉锁在这个项目上，提交时不带 projectId（服务端自己沿用）
+      state.redoProjectId = String(full.projectId || job.projectId || '');
+      state.redoProjectTitle = String(full.projectTitle || job.projectTitle || '');
       loadScenes(full.scenes);
       els.advanced.open = true;
       showRedoBanner(full);
       switchView('make');
+      syncProjectRow();
       updateModeHint();
       els.advanced.scrollIntoView({ block: 'start', behavior: 'smooth' });
       if (window.innerWidth >= 900) {
@@ -1196,11 +1761,12 @@
     const style = STYLE_OPTIONS.some((option) => option.value === raw.style) ? raw.style : '';
     // 音色 id 由 speak 动态给（voc_xxx），本地只做类型检查，具体是否存在等清单回来再对上
     const voice = typeof raw.voice === 'string' ? raw.voice : '';
-    // 三个可调项：只接受下拉里列出的值，非法/越界回默认
+    // 四个可调项：只接受下拉里列出的值，非法/越界回默认
     const narrationSpeed = pickNumber(raw.narrationSpeed, SPEED_OPTIONS, DEFAULT_PREFS.narrationSpeed);
+    const voicePitch = pickNumber(raw.voicePitch, PITCH_OPTIONS, DEFAULT_PREFS.voicePitch);
     const scenePadding = pickNumber(raw.scenePadding, PADDING_OPTIONS, DEFAULT_PREFS.scenePadding);
     const stickerDuration = pickNumber(raw.stickerDuration, STICKER_OPTIONS, DEFAULT_PREFS.stickerDuration);
-    state.prefs = { style, voice, narrationSpeed, scenePadding, stickerDuration };
+    state.prefs = { style, voice, narrationSpeed, voicePitch, scenePadding, stickerDuration };
   }
 
   /** localStorage 里是任意字符串，只认下拉里的离散值。 */
@@ -1234,6 +1800,7 @@
     fillSelect(els.setStyle, STYLE_OPTIONS, state.prefs.style);
     fillSelect(els.setVoice, voiceChoices(), state.prefs.voice);
     fillSelect(els.setSpeed, SPEED_OPTIONS, state.prefs.narrationSpeed);
+    fillSelect(els.setPitch, PITCH_OPTIONS, state.prefs.voicePitch);
     fillSelect(els.setPadding, PADDING_OPTIONS, state.prefs.scenePadding);
     fillSelect(els.setSticker, STICKER_OPTIONS, state.prefs.stickerDuration);
     updateTunablesHint();
@@ -1243,9 +1810,11 @@
   function updateTunablesHint() {
     if (!els.advTunablesHint) return;
     const speed = Number(state.prefs.narrationSpeed).toFixed(1);
+    const pitch = Number(state.prefs.voicePitch);
+    const pitchText = pitch === 0 ? '原声' : `${pitch > 0 ? '+' : ''}${pitch.toFixed(1)} 半音`;
     const padding = Number(state.prefs.scenePadding).toFixed(1);
     const sticker = Number(state.prefs.stickerDuration).toFixed(1);
-    els.advTunablesHint.textContent = `语速 ${speed}× · 停留 ${padding} 秒 · 表情一轮 ${sticker} 秒（循环播放，在设置页改）`;
+    els.advTunablesHint.textContent = `语速 ${speed}× · 音高 ${pitchText} · 停留 ${padding} 秒 · 表情一轮 ${sticker} 秒（循环播放，在设置页改）`;
   }
 
   function setVoiceHint(text) {
@@ -1303,7 +1872,7 @@
       stopListPoll();
     }
     if (name === 'settings') {
-      // 每次进设置页都确认三行还在：静态 HTML + JS 兜底都走这里
+      // 每次进设置页都确认四行还在：静态 HTML + JS 兜底都走这里
       mountTunableDom();
       applyPrefs();
     }
@@ -1393,6 +1962,7 @@
     els.setStyle.addEventListener('change', () => onPrefChange('style', els.setStyle.value));
     els.setVoice.addEventListener('change', () => onPrefChange('voice', els.setVoice.value));
     bindTunableRow(els.setSpeed, 'narrationSpeed');
+    bindTunableRow(els.setPitch, 'voicePitch');
     bindTunableRow(els.setPadding, 'scenePadding');
     bindTunableRow(els.setSticker, 'stickerDuration');
 
@@ -1427,6 +1997,10 @@
       });
     });
 
+    // 项目下拉 + 任务页项目卡（展开/播放/重做/改名/删除）都走委托
+    if (els.projectSel) els.projectSel.addEventListener('change', onProjectSelect);
+    els.jobsList.addEventListener('click', onJobsClick);
+
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) return;
       if (state.currentJobId && state.timers.poll) pollCurrent();
@@ -1441,6 +2015,9 @@
       statusText: $('#v2StatusText'),
       makeForm: $('#v2MakeForm'),
       topicInput: $('#v2TopicInput'),
+      projectRow: $('#v2ProjectRow'),
+      projectSel: $('#v2ProjectSel'),
+      projectHint: $('#v2ProjectHint'),
       secondsSeg: $('#v2SecondsSeg'),
       startBtn: $('#v2StartBtn'),
       submitHint: $('#v2SubmitHint'),
@@ -1460,6 +2037,7 @@
       setStyle: $('#v2SetStyle'),
       setVoice: $('#v2SetVoice'),
       setSpeed: $('#v2SetSpeed'),
+      setPitch: $('#v2SetPitch'),
       setPadding: $('#v2SetPadding'),
       setSticker: $('#v2SetSticker'),
       advTunablesHint: $('#v2AdvTunablesHint'),
@@ -1480,14 +2058,14 @@
   }
 
   /**
-   * 三个可调项：index.html 里已经是静态三行，这里只做兜底——
+   * 四个可调项：index.html 里已经是静态四行，这里只做兜底——
    * 合并后的 HTML 要是缺了哪一行（或整张设置卡），切到设置页时补出来，
    * 不再依赖 init() 是否跑过。幂等，重复调用不会出现第二份。
    */
   function mountTunableDom() {
     let card = $('#v2SetVoice') ? $('#v2SetVoice').closest('.v2-settings-card') : null;
 
-    // 整张设置卡都没有：直接在设置视图里建一张，保证三行有地方放
+    // 整张设置卡都没有：直接在设置视图里建一张，保证四行有地方放
     if (!card) {
       const view = $('#v2-view-settings');
       if (view) {
@@ -1504,6 +2082,7 @@
     if (card) {
       const rows = [
         { id: 'v2SetSpeed', label: '语速', note: '越快越赶，1.0 最自然' },
+        { id: 'v2SetPitch', label: '音高', note: '半音：+1 更清亮，0 = 原声' },
         { id: 'v2SetPadding', label: '停留', note: '旁白说完后画面多停一会儿，想慢一点就调大' },
         { id: 'v2SetSticker', label: '表情持续', note: '表情播完一轮的时间（循环播放）' },
       ];
@@ -1552,13 +2131,15 @@
     refreshTunableEls();
   }
 
-  /** 重新拿三个下拉的引用（DOM 被重建/兜底创建时用）。 */
+  /** 重新拿四个下拉的引用（DOM 被重建/兜底创建时用）。 */
   function refreshTunableEls() {
     els.setSpeed = $('#v2SetSpeed');
+    els.setPitch = $('#v2SetPitch');
     els.setPadding = $('#v2SetPadding');
     els.setSticker = $('#v2SetSticker');
     els.advTunablesHint = $('#v2AdvTunablesHint');
     bindTunableRow(els.setSpeed, 'narrationSpeed');
+    bindTunableRow(els.setPitch, 'voicePitch');
     bindTunableRow(els.setPadding, 'scenePadding');
     bindTunableRow(els.setSticker, 'stickerDuration');
   }
@@ -1569,13 +2150,37 @@
     select.addEventListener('change', () => onPrefChange(key, Number(select.value)));
   }
 
+  /**
+   * 做视频页的「项目」一行：index.html 里已经有了，这里只做兜底。
+   * 旧缓存页面没有这一行时补在输入框上面，保证项目下拉一定存在。
+   */
+  function mountProjectRow() {
+    if ($('#v2ProjectSel')) return;
+    const form = $('#v2MakeForm');
+    if (!form) return;
+    const row = el('div', 'v2-project-row');
+    row.id = 'v2ProjectRow';
+    row.appendChild(el('span', 'v2-field-label', '项目'));
+    const select = document.createElement('select');
+    select.id = 'v2ProjectSel';
+    select.className = 'v2-project-sel';
+    select.setAttribute('aria-label', '项目');
+    row.appendChild(select);
+    const hint = el('span', 'v2-hint v2-project-hint');
+    hint.id = 'v2ProjectHint';
+    row.appendChild(hint);
+    const input = $('#v2TopicInput');
+    form.insertBefore(row, input || form.firstChild);
+  }
+
   function init() {
     mountTunableDom();
+    mountProjectRow();
     els = collectEls();
     // 表情选择器的节点允许缺失（旧缓存页面），不影响其它功能
     const optional = new Set([
       'stickerModal', 'stickerGrid', 'stickerSearch', 'stickerSummary', 'stickerHint', 'stickerClose',
-      'advTunablesHint', 'voiceHint', 'saveHint',
+      'advTunablesHint', 'voiceHint', 'saveHint', 'projectRow', 'projectSel', 'projectHint',
     ]);
     const missing = Object.keys(els).filter((key) => !els[key] && !optional.has(key));
     if (missing.length) {
@@ -1589,6 +2194,7 @@
     bindEvents();
     renderScenes();
     updateModeHint();
+    syncProjectRow();
     loadStickers();
     loadVoices();
 
@@ -1601,14 +2207,16 @@
   /** 旧面板切到视频 tab、或登录成功时调用；重复调用只做刷新。 */
   function enter() {
     syncToken();
-    // 先补设置页三行：这样即使前面的 init 没跑成，切到视频页也看得到
+    // 先补设置页四行：这样即使前面的 init 没跑成，切到视频页也看得到
     mountTunableDom();
+    mountProjectRow();
     if (!state.initialized) {
       init();
       return;
     }
     if (!els.setSpeed) refreshTunableEls();
     applyPrefs();
+    syncProjectRow();
     if (!state.voicesLoaded) loadVoices();
     if (!state.stickersLoaded) loadStickers();
     pollJobs();
@@ -1624,6 +2232,19 @@
         view: state.view,
         seconds: state.seconds,
         jobs: state.jobs.size,
+        // 项目层：任务页卡片数、每张卡的版本数/展开后渲染了几行
+        projects: state.projects.length,
+        ungrouped: state.ungrouped.length,
+        selectedProject: state.projectId,
+        redoProject: state.redoProjectId,
+        cards: Array.from(state.projectCards.values()).map((node) => ({
+          id: node.group ? node.group.id : '',
+          title: node.group ? node.group.title : '',
+          versions: node.group ? node.group.versionCount : 0,
+          latest: node.group && node.group.latest ? node.group.latest.status : '',
+          expanded: Boolean(node.expanded),
+          rows: node.versions.querySelectorAll('.v2-ver-row').length,
+        })),
         currentJobId: state.currentJobId,
         scenes: state.scenes.length,
         redoFrom: state.redoFrom,
@@ -1631,6 +2252,7 @@
         prefs: { ...state.prefs },
         tunables: {
           speed: state.prefs.narrationSpeed,
+          pitch: state.prefs.voicePitch,
           padding: state.prefs.scenePadding,
           sticker: state.prefs.stickerDuration,
           rows: $$('.v2-set-row').length,
@@ -1641,7 +2263,10 @@
           text: scene.text,
           narration: scene.narration,
           seconds: scene.seconds,
+          hint: scene.hint,
           tool: scene.tool,
+          // 这一场还带不带旧代码：改过 hint/text/tool 后应为 false
+          hasCode: Boolean(scene.manim && scene.manim.code),
           stickers: Array.isArray(scene.stickers) ? scene.stickers.map((s) => String(s.id || '')) : [],
           dirty: Boolean(scene.dirty),
         })),
